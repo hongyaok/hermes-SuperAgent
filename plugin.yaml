@@ -81,7 +81,10 @@ config_schema:
     type: list
     default: []
     label: Model presets
-    description: Models offered in the per-session picker. Empty uses the built-in list.
+    description: >-
+      Named models offered in the composer and picker. Accepts
+      "name=provider:model", plain "model" strings, or {name, model, provider}
+      objects; empty uses the built-in list. At most 12, unique names.
   worker_yolo:
     type: bool
     default: true

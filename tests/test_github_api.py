@@ -550,11 +550,13 @@ def test_models_endpoint_uses_plugin_settings(api, tmp_path):
     )
     api.sa_settings.clear_cache()
     body = api.list_models()
-    assert body == {
-        "default_model": "config-model",
-        "default_provider": "config-provider",
-        "models": ["m-one", "m-two"],
-    }
+    assert body["default_model"] == "config-model"
+    assert body["default_provider"] == "config-provider"
+    assert body["models"] == ["m-one", "m-two"]
+    assert body["presets"] == [
+        {"name": "m-one", "model": "m-one", "provider": ""},
+        {"name": "m-two", "model": "m-two", "provider": ""},
+    ]
 
 
 # -- watch settings ------------------------------------------------------

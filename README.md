@@ -43,6 +43,22 @@ hermes config set plugins.entries.superagent.settings.repo_path "/path/to/your/r
 hermes config set plugins.entries.superagent.settings.mode observe
 ```
 
+The same values are editable without the CLI: the Superagent page's **⚙ Settings** panel writes `<HERMES_HOME>/plugin-data/superagent/settings.json` (default model/provider, named model presets, `max_workers`, `chat_max_turns`, `worker_yolo`). The panel, `GET/POST /settings` and the CLI all read through `sa_settings.py`, so they agree on one merged view.
+
+### Model presets
+
+`model_presets` is a list of named `(model, provider)` pairs. Three spellings are accepted, and the loader normalises all of them to `[{name, model, provider}]`:
+
+```yaml
+model_presets:
+  - fast=opencode-go:qwen/qwen3.8-27b     # name=provider:model
+  - strong=z-ai/glm-5.3-flash             # provider optional
+  - deepseek-v4.1-flash                   # legacy plain string: name = model
+  - {name: local, model: qwen3-8b, provider: ollama}
+```
+
+At most **12** presets are kept, names must be unique (case-insensitive), and every preset needs a `model`. An empty list falls back to the built-in picker list. `GET /models` returns the names plus the flat `models` list, the composer shows one chip per preset before a chat starts, and `POST /chats` accepts `preset: "<name>"` (an explicit `model`/`provider` still wins). `hermes superagent chat --preset <name>` resolves the same catalog from the terminal.
+
 ### All Settings (`plugin.yaml`)
 
 | Setting | Type | Default | Description |
@@ -132,6 +148,12 @@ hermes superagent run T-0001
 # Show full detail and history for one ticket
 hermes superagent show T-0001
 
+# Chat: pick a named preset, or list/inspect the merged settings
+hermes superagent chat "Add a regression test" --preset fast
+hermes superagent models
+hermes superagent settings
+hermes superagent settings --json
+
 # Verify configuration, repo existence, and worker lifecycle availability
 hermes superagent doctor
 ```
@@ -143,9 +165,10 @@ hermes superagent doctor
 | `hermes superagent ask "<request>"` | Record a request as a ticket. |
 | `hermes superagent run <ticket-id>` | Promote an `observed`/`blocked`/`failed` ticket to `queued`. |
 | `hermes superagent show <id>` | A ticket's full detail, or a chat session (`S-…`) with messages and events. |
-| `hermes superagent chat "<prompt>"` | Start a headless chat turn (blocking; `--detach` returns immediately). |
+| `hermes superagent chat "<prompt>"` | Start a headless chat turn (blocking; `--detach` returns immediately). `--preset <name>` resolves a named preset; `--model`/`--provider` still win. |
 | `hermes superagent sessions` / `stop <id>` | List chat sessions / cancel a queued or running turn. |
-| `hermes superagent models` | Default model/provider and the picker presets. |
+| `hermes superagent models` | Default model/provider plus the preset section (`name -> provider: model`). |
+| `hermes superagent settings [--json]` | Print the merged settings (the GitHub token is masked to `set`/`not set`); read-only. |
 | `hermes superagent github [status\|test\|connect\|disconnect\|prs\|poll\|work <n>]` | Connect a repository, manage the watch settings, list open PRs, and start work on one (see [GitHub connect & PR watch](#9-github-connect--pr-watch-v03)). |
 | `hermes superagent doctor` | Configuration, repository and worker-lifecycle checks. |
 
@@ -224,9 +247,11 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 
 | Method | Path | Behaviour |
 | :--- | :--- | :--- |
-| `GET` | `/models` | `{default_model, default_provider, models}` from settings/env. |
+| `GET` | `/models` | `{default_model, default_provider, models, presets}` from settings/env; `presets` is `[{name, model, provider}]` and `models` stays the flat model list. |
+| `GET` | `/settings` | Merged, public settings (`mode`, `repo_path`, defaults, normalised `model_presets`, worker limits, GitHub watch fields) plus `github_token_set`; never the token. |
+| `POST` | `/settings` | Validate and save `mode`, `repo_path`, `default_model`, `default_provider`, `model_presets`, `max_workers` (1–8), `worker_yolo`, `chat_max_turns` (1–500); unknown keys and out-of-range values are `400`. Drops the Runner singleton so the next turn uses the new values. Returns `{ok, settings}`. |
 | `GET` | `/chats?limit=50` | `{db_exists, sessions, counts, running}`; also runs the runaway watchdog before answering. |
-| `POST` | `/chats` | Validate, create and launch a chat. `400` on an empty/oversized prompt or an invalid repo; `200 {ok:false}` when the worker cannot start (the session is stored as `failed`). |
+| `POST` | `/chats` | Validate, create and launch a chat. Optional `preset` selects a named model (explicit `model`/`provider` still win; unknown preset is `400` listing the available names) and records a `preset` event. `400` on an empty/oversized prompt or an invalid repo; `200 {ok:false}` when the worker cannot start (the session is stored as `failed`). |
 | `GET` | `/chats/{id}` | Session with `messages` and `events`; `404` for an unknown id. |
 | `POST` | `/chats/{id}/messages` | Append the user message and resume the Hermes session. `409` while a turn is queued/running; `400` when the stored repo is no longer valid; with no `hermes_session_id` a fresh chat is created and `previous_session_id` is returned. |
 | `POST` | `/chats/{id}/stop` | Cancel a queued/running turn; `409` when nothing is running. |
@@ -294,6 +319,27 @@ hermes superagent github disconnect
 - Bots (`*[bot]`, `github-actions`, `dependabot`) and the agent's own comments are ignored. `github_allowed_users` is an allow-list; empty means **nobody**.
 - `github_watch_mode: observe` records sessions as `observed` and launches nothing. A human promotes one later (the session is a normal chat session with its PR prompt and checkout path).
 - `github_watch_mode: auto` creates the session as `queued` and launches it. With `repo_path` configured, the PR is fetched into that clone (`+refs/pull/<n>/head:refs/superagent/pr-<n>`) and checked out as a detached worktree at `<data_dir>/workspaces/pr-<n>`, so the user's checkout and branch are untouched. If the checkout fails the session launches in `repo_path` with a `github` warning event; with no usable repository the session is marked `failed`.
+
+---
+
+### 10. Settings, presets and first-run onboarding
+
+A new user should be able to choose models and get started without reading the docs.
+
+**Header gear.** The ⚙ button in the Superagent header toggles a full-width **Settings** panel above the chat workspace (the same collapsible pattern as the GitHub panel). It edits:
+
+- **Default model** — the same picker as the composer, plus **Inherit** to clear the pin (the provider is shown, or `auto (chosen by Hermes)`).
+- **Model presets** — rows of `name`, `model`, `provider` with a remove button and **+ Add preset** (12 max); the hint is *"Presets appear in the composer; pick one before starting a chat."*
+- **Max parallel workers** (`1–8`), **Max turns per worker** (`1–500`) and **Run workers unattended (`--yolo`)** with help text.
+- **Save** posts `POST /settings` and invalidates the settings, models and chats queries so the chips and every new session agree; **Refresh** re-reads and **Cancel** closes.
+
+**Composer preset chips.** Before a chat starts, one chip per preset sits above the textarea. Clicking a chip fills the model/provider and highlights it; the normal ModelPicker stays available for an ad-hoc choice (which clears the chip). The selected name is sent as `preset` with `POST /chats`, together with the resolved `model`/`provider`.
+
+**First-run onboarding.** While there are no chat sessions yet, a compact **Get started** card lists three numbered steps: *Pick a model / preset* (opens Settings), *Connect a GitHub repo to watch PRs* (opens the GitHub panel; the hint states that an empty allow-list means nobody can trigger work and the agent ignores its own comments), and *Start a chat below*. Dismissing it writes `onboarded` through `ctx.storage`, so it does not come back.
+
+**GitHub panel.** The allow-list field now carries the helper copy *"Only these users can trigger work; the agent ignores its own comments — add a teammate or a second account."*
+
+**CLI.** `hermes superagent settings [--json]` prints the merged view (token masked to `set`/`not set`); `hermes superagent chat --preset <name>` resolves the same preset catalog and exits `2` with the available names when the preset is unknown. `hermes superagent models` prints `name -> provider: model` for every preset.
 
 ---
 

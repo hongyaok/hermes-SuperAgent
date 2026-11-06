@@ -193,7 +193,17 @@ New `plugin.yaml` settings: `default_model`, `default_provider`,
 6. **CLI polish** — `hermes superagent chat`, `sessions`, `show`, `stop`,
    `models`, all with `--json`; stable exit codes.
 7. **Presets and routing** — named model presets, per-session defaults, cheap
-   model for triage and strong model for implementation.
+   model for triage and strong model for implementation. *(done for presets +
+   defaults: `sa_settings.normalize_presets` accepts
+   `name=provider:model` strings, plain model strings and
+   `{name, model, provider}` objects; `GET/POST /settings` expose and validate
+   the eight panel-editable keys; `GET /models` returns `presets` alongside the
+   flat `models` list; `POST /chats` resolves `preset` (explicit model/provider
+   wins) and records a `preset` event; the desktop page has a ⚙ Settings panel,
+   composer preset chips and a dismissible three-step onboarding card; the CLI
+   has `chat --preset` and a read-only `settings` command. Triage routing —
+   cheap model for assessment, strong model for implementation — remains
+   future work.)*
 8. **Robustness and security** — path checks, prompt/response caps, runaway
    watchdog, rate limits, redaction of tokens in events.
 9. **UX and docs** — onboarding, empty states, README/SPEC refresh, skill
