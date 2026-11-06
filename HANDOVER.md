@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-06
 **Version:** 0.4.0
-**Repo:** this checkout — branch `chore/release-0.4.0`, based on `origin/main` @ `4ee473e`
+**Repo:** `origin/main` @ the v0.4.0 release commit
 **Installed as:** `<HERMES_HOME>/plugins/superagent` (on this Windows machine usually a directory junction to the working clone, so edits are live; if it is a copy, reinstall after editing)
 **Status:** feature-complete through the v0.4 surfaces. **401 tests pass**, `hermes plugins validate .` is clean (manifest, capability probe, declared tools/hooks, security scan and desktop-surface check all pass), and `hermes plugins doctor --ci .` passes manifest/import/registration. The backend is exercised hermetically by the suite; the remaining optional work is a real GitHub repository run and a visual check in the Electron shell.
 
@@ -21,8 +21,7 @@ database, one settings loader and one attention budget:
    live grid shows every parallel worker.
 
 Neither path commits, pushes, merges or opens a pull request. A successful turn
-ends in `review` (or `idle` once its Hermes session can be resumed), with the
-changes left uncommitted in the working tree.
+ends in `review`, with the changes left uncommitted in the working tree.
 
 Ticket lifecycle: `observed → queued → running → review` (plus `failed` /
 `blocked` / `ignored` / `done`). Modes: `off` / `observe` / `auto` (default
