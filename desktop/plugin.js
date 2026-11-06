@@ -1,121 +1,920 @@
 /**
- * Superagent desktop panel plus full page — shows only what needs a human.
+ * Superagent desktop surface — a chat-first workspace over headless chats.
  *
- * Data path: ctx.rest('/tickets'), ctx.rest('/sessions'), POST /ask, POST /run
- * → dashboard/plugin_api.py. Polls every 15s through the app's React Query
- * client (shared cache, so the pane, the page, and the status chip share
- * requests). Mutations invalidate the ticket/session queries on success.
+ * Data path: ctx.rest('/chats'), '/chats/{id}', '/models', POST /chats,
+ * POST /chats/{id}/messages, POST /chats/{id}/stop → dashboard/plugin_api.py.
+ * The list query polls at 2s while a worker runs and 8s when the board is
+ * quiet; the open transcript polls at 1.5s while its own turn is live. Every
+ * mutation invalidates both so the rail, the transcript, and the live grid
+ * agree on the next paint.
  *
- * Plain ESM, loaded uncompiled — UI is jsx() calls, not JSX syntax. Only
- * these imports resolve: @hermes/plugin-sdk, react, react/jsx-runtime.
+ * The ticket pane and the status-bar chip stay (they answer "does a human need
+ * to look at anything?"); the route page is chat-only.
+ *
+ * Plain ESM, loaded uncompiled — UI is jsx()/jsxs() calls, not JSX syntax.
+ * Only @hermes/plugin-sdk, react and react/jsx-runtime resolve here. The SDK is
+ * imported as a namespace: a shell that predates a component (the model
+ * catalog menu, StatusDot) leaves that binding undefined and the page degrades
+ * instead of failing to link.
  */
 
-import { Tip, cn, useQuery, useMutation, useQueryClient, ROUTES_AREA, SIDEBAR_NAV_AREA } from '@hermes/plugin-sdk'
+import * as SDK from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+
+const {
+  Tip, StatusDot, DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
+  ModelCatalogMenu, ModelMenuCloseContext, cn, host,
+  useQuery, useMutation, useQueryClient, ROUTES_AREA, SIDEBAR_NAV_AREA,
+} = SDK
 
 const ID = 'superagent'
-const POLL_MS = 15000
 
-// Set in register(); the data hooks below need it.
-let rest = null
+// Polling budgets. A live worker is worth 2s; a quiet board is not.
+const LIST_POLL_RUNNING = 2000
+const LIST_POLL_QUIET = 8000
+const DETAIL_POLL_RUNNING = 1500
+const DETAIL_POLL_QUIET = 6000
+const TICKET_POLL = 15000
 
+// The live-workers column shows chats that are doing something (or that a
+// human should look at). Idle/cancelled chats stay in the rail only.
+const LIVE_STATUSES = ['running', 'queued', 'review', 'failed']
+const MAX_WORKERS = 8
+
+// Chat statuses plus the ticket statuses the pane still renders.
 const ICONS = {
-  observed: '·',
-  queued: '…',
-  running: '▶',
-  review: '◆',
-  blocked: '!',
-  failed: '×',
-  done: '✓',
-  ignored: '–',
+  observed: '·', queued: '…', running: '▶', review: '◆', blocked: '!',
+  failed: '×', done: '✓', ignored: '–', idle: '·', cancelled: '–',
 }
 
-const RUNNABLE = ['observed', 'blocked', 'failed', 'queued']
+const STATUS_TONES = {
+  running: 'good', queued: 'muted', review: 'warn',
+  failed: 'bad', idle: 'muted', cancelled: 'muted',
+}
+
+// Set in register(); the data hooks below need them.
+let rest = null
+let storage = null
+let openExternal = null
+
+// -- storage (feature-detected: older hosts may not ship ctx.storage) -------
+
+function readStored(key, fallback) {
+  try {
+    if (storage && typeof storage.get === 'function') {
+      const value = storage.get(key, fallback)
+      return typeof value === 'string' ? value : fallback
+    }
+  } catch (error) {
+    // Storage is a nicety; a broken key must never break the page.
+  }
+  return fallback
+}
+
+function writeStored(key, value) {
+  try {
+    if (storage && typeof storage.set === 'function') storage.set(key, value)
+  } catch (error) {
+    // Same: losing a remembered model is not worth an error card.
+  }
+}
+
+// -- formatting helpers -----------------------------------------------------
+
+function clip(text, max) {
+  const value = String(text == null ? '' : text)
+  return value.length <= max ? value : value.slice(0, Math.max(1, max - 1)) + '…'
+}
+
+function isBusy(session) {
+  return !!session && (session.status === 'running' || session.status === 'queued')
+}
+
+/** Relative age of an epoch-seconds timestamp: 'now' / '4m' / '3h' / '2d'. */
+function fmtAge(seconds) {
+  if (!seconds) return ''
+  const delta = Date.now() / 1000 - seconds
+  if (!isFinite(delta)) return ''
+  if (delta < 45) return 'now'
+  if (delta < 3600) return `${Math.max(1, Math.round(delta / 60))}m`
+  if (delta < 86400) return `${Math.round(delta / 3600)}h`
+  return `${Math.round(delta / 86400)}d`
+}
+
+/** Compact duration from milliseconds: '12s' / '3m 04s' / '1h 12m'. */
+function fmtDuration(ms) {
+  if (!ms || !isFinite(ms) || ms < 0) return ''
+  const total = Math.round(ms / 1000)
+  if (total < 60) return `${total}s`
+  const minutes = Math.floor(total / 60)
+  if (minutes < 60) return total % 60 ? `${minutes}m ${total % 60}s` : `${minutes}m`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+/** Elapsed for a live turn, duration for a finished one, age otherwise. */
+function timingLabel(session) {
+  if (!session) return ''
+  if (isBusy(session)) {
+    const start = session.started_at || session.updated_at || session.created_at
+    return start ? fmtDuration(Date.now() - start * 1000) : ''
+  }
+  if (session.duration_ms) return fmtDuration(session.duration_ms)
+  if (session.started_at && session.finished_at) {
+    return fmtDuration((session.finished_at - session.started_at) * 1000)
+  }
+  return fmtAge(session.updated_at || session.created_at)
+}
+
+/** The composer's label: `provider: model`, the model alone, or the default. */
+function modelLabel(model, provider) {
+  const name = String(model || '').trim()
+  const vendor = String(provider || '').trim()
+  if (!name) return 'Default model'
+  return vendor ? `${vendor}: ${name}` : name
+}
+
+/** A session's fixed model, or the lowercase rail copy for "nothing pinned". */
+function sessionModelLabel(session) {
+  if (!session || !String(session.model || '').trim()) return 'default model'
+  return modelLabel(session.model, session.provider)
+}
+
+function firstLine(text) {
+  for (const line of String(text || '').split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed) return trimmed
+  }
+  return ''
+}
+
+function sessionTitle(session) {
+  if (!session) return 'Chat'
+  const title = String(session.title || '').trim()
+  if (title) return title
+  const line = firstLine(session.prompt)
+  return line ? clip(line, 72) : session.id
+}
+
+function openUrl(url) {
+  const target = String(url || '').trim()
+  if (!target) return
+  try {
+    if (typeof openExternal === 'function') return void openExternal(target)
+    if (typeof window !== 'undefined' && typeof window.open === 'function') {
+      window.open(target, '_blank', 'noopener')
+    }
+  } catch (error) {
+    // A blocked popup is not worth an error card.
+  }
+}
+
+function errorText(error) {
+  if (!error) return ''
+  return String((error && error.message) || error)
+}
+
+// -- data hooks -------------------------------------------------------------
 
 function fetchTickets() {
-  if (!rest) return Promise.reject(new Error('backend not ready'))
-  return rest('/tickets')
+  return rest ? rest('/tickets') : Promise.reject(new Error('backend not ready'))
 }
 
-function fetchSessions() {
-  if (!rest) return Promise.reject(new Error('backend not ready'))
-  return rest('/sessions')
+function fetchChats() {
+  return rest ? rest('/chats?limit=50') : Promise.reject(new Error('backend not ready'))
+}
+
+function fetchChat(id) {
+  return rest ? rest(`/chats/${encodeURIComponent(id)}`) : Promise.reject(new Error('backend not ready'))
+}
+
+function fetchModels() {
+  return rest ? rest('/models') : Promise.reject(new Error('backend not ready'))
 }
 
 function useTickets() {
   return useQuery({
-    queryKey: [ID, 'tickets'],
-    queryFn: fetchTickets,
-    refetchInterval: POLL_MS,
-    retry: false,
+    queryKey: [ID, 'tickets'], queryFn: fetchTickets,
+    refetchInterval: TICKET_POLL, retry: false,
   })
 }
 
-function useSessions() {
+function useChats() {
   return useQuery({
-    queryKey: [ID, 'sessions'],
-    queryFn: fetchSessions,
-    refetchInterval: POLL_MS,
-    retry: false,
+    queryKey: [ID, 'chats'], queryFn: fetchChats, retry: false,
+    refetchInterval: (query) => {
+      const data = query.state.data
+      return data && (data.running || 0) > 0 ? LIST_POLL_RUNNING : LIST_POLL_QUIET
+    },
   })
 }
 
-function invalidateSuperagent(client) {
-  client.invalidateQueries({ queryKey: [ID, 'tickets'] })
-  client.invalidateQueries({ queryKey: [ID, 'sessions'] })
+function useChat(id) {
+  return useQuery({
+    queryKey: [ID, 'chat', id], queryFn: () => fetchChat(id), enabled: !!id, retry: false,
+    refetchInterval: (query) =>
+      isBusy(query.state.data && query.state.data.session) ? DETAIL_POLL_RUNNING : DETAIL_POLL_QUIET,
+  })
 }
 
-function TicketRow({ ticket }) {
-  const icon = ICONS[ticket.status] || '?'
-  return jsx('div', {
-    className: 'flex flex-col gap-0.5 rounded px-2 py-1.5 text-xs',
+function useModels() {
+  return useQuery({
+    queryKey: [ID, 'models'], queryFn: fetchModels, staleTime: 60000, retry: false,
+  })
+}
+
+function invalidateChats(client, id) {
+  client.invalidateQueries({ queryKey: [ID, 'chats'] })
+  client.invalidateQueries({ queryKey: [ID, 'chat'] })
+  if (id) client.invalidateQueries({ queryKey: [ID, 'chat', id] })
+}
+
+// -- small shared bits ------------------------------------------------------
+
+function StatusGlyph({ status, pulse }) {
+  return jsx('span', {
+    'aria-hidden': 'true',
+    className: cn('shrink-0 text-(--ui-text-quaternary)',
+      pulse && status === 'running' && 'animate-pulse text-(--ui-text-secondary)'),
+    children: ICONS[status] || '?',
+  })
+}
+
+function ChatDot({ status }) {
+  if (StatusDot) return jsx(StatusDot, { tone: STATUS_TONES[status] || 'muted' })
+  return jsx('span', {
+    'aria-hidden': 'true',
+    className: 'inline-block shrink-0 text-(--ui-text-quaternary)',
+    children: '•',
+  })
+}
+
+function Pill({ children }) {
+  return jsx('span', {
+    className: cn('inline-flex items-center rounded border border-(--ui-stroke-secondary)',
+      'px-1.5 py-0.5 text-[0.6875rem] text-(--ui-text-tertiary)'),
+    children,
+  })
+}
+
+function GhostButton({ children, onClick, disabled, title, className }) {
+  return jsx('button', {
+    type: 'button', onClick, disabled, title,
+    className: cn('rounded px-2 py-1 text-xs text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
+      disabled && 'opacity-50', className),
+    children,
+  })
+}
+
+function ErrorCard({ title, error, onRetry }) {
+  return jsxs('div', {
+    className: 'flex flex-col gap-1.5 rounded border border-(--ui-stroke-secondary) p-2.5 text-xs',
+    children: [
+      jsx('div', { key: 't', className: 'text-(--ui-text-secondary)', children: title || 'Superagent backend unavailable.' }),
+      jsx('div', { key: 'e', className: 'break-words text-(--ui-text-quaternary)', children: errorText(error) || 'unknown error' }),
+      jsx(GhostButton, { key: 'r', className: 'self-start', onClick: onRetry, children: 'Retry' }),
+    ],
+  })
+}
+
+// -- sessions rail ----------------------------------------------------------
+
+function SessionRow({ session, selected, onSelect }) {
+  const age = session.status === 'running' ? timingLabel(session) : fmtAge(session.updated_at || session.created_at)
+  return jsxs('button', {
+    type: 'button',
+    onClick: () => onSelect(session.id),
+    className: cn('flex w-full flex-col gap-0.5 rounded px-2 py-1.5 text-left',
+      selected ? 'bg-(--chrome-action-hover)' : 'hover:bg-(--chrome-action-hover)'),
+    children: [
+      jsxs('div', {
+        key: 'top', className: 'flex min-w-0 items-baseline gap-1.5',
+        children: [
+          jsx(StatusGlyph, { key: 'g', status: session.status, pulse: true }),
+          jsx('span', { key: 't', className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: sessionTitle(session) }),
+        ],
+      }),
+      jsxs('div', {
+        key: 'meta', className: 'flex min-w-0 items-baseline gap-1.5 pl-4 text-[0.6875rem] text-(--ui-text-quaternary)',
+        children: [
+          jsx('span', { key: 'm', className: 'min-w-0 flex-1 truncate', children: sessionModelLabel(session) }),
+          jsx('span', { key: 'a', className: 'shrink-0 tabular-nums', children: age }),
+        ],
+      }),
+    ],
+  })
+}
+
+function SessionsRail({ sessions, selectedId, onSelect }) {
+  return jsxs('div', {
+    className: 'flex min-h-0 w-full flex-col gap-2 md:w-[17rem] md:shrink-0',
     children: [
       jsx('div', {
-        key: 'head',
-        className: 'flex items-baseline gap-1.5',
+        key: 'label', className: 'text-xs font-medium text-(--ui-text-tertiary)',
+        children: sessions.length ? `Chats (${sessions.length})` : 'Chats',
+      }),
+      jsx('div', {
+        key: 'list', className: 'flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-1',
+        children: sessions.length
+          ? sessions.map((session) =>
+              jsx(SessionRow, { key: session.id, session, selected: session.id === selectedId, onSelect }))
+          : jsx('div', { className: 'px-2 py-1 text-xs text-(--ui-text-tertiary)', children: 'No chats yet.' }),
+      }),
+    ],
+  })
+}
+
+// -- transcript -------------------------------------------------------------
+
+/** Prompt bubble first (the opening turn is not a chat_messages row), then
+ *  messages + tool events merged on created_at. */
+function buildTranscript(session) {
+  if (!session) return []
+  const items = [{
+    key: 'prompt', kind: 'message', role: 'user',
+    content: session.prompt || '', created_at: session.created_at || 0,
+  }]
+  for (const message of session.messages || []) {
+    items.push({
+      key: `m${message.id}`, kind: 'message', role: message.role,
+      content: message.content || '', created_at: message.created_at || 0,
+    })
+  }
+  for (const event of session.events || []) {
+    items.push({
+      key: `e${event.id}`, kind: 'event', eventKind: event.kind,
+      detail: event.detail || '', created_at: event.created_at || 0,
+    })
+  }
+  items.sort((a, b) => a.created_at - b.created_at)
+  return items
+}
+
+function Bubble({ role, content }) {
+  const mine = role === 'user'
+  return jsx('div', {
+    className: cn('max-w-[85%] whitespace-pre-wrap break-words rounded px-2.5 py-1.5',
+      'text-xs leading-relaxed text-(--ui-text-secondary)',
+      mine ? 'self-end bg-(--chrome-action-hover)' : 'self-start border border-(--ui-stroke-secondary)'),
+    children: content,
+  })
+}
+
+function EventRow({ item }) {
+  return jsxs('div', {
+    className: 'flex min-w-0 items-baseline gap-1.5 pl-1 text-[0.6875rem] text-(--ui-text-quaternary)',
+    children: [
+      jsx('span', { key: 'b', children: '▸' }),
+      jsx('span', { key: 'k', className: 'shrink-0 font-mono', children: item.eventKind }),
+      jsx('span', { key: 'c', className: 'shrink-0', children: ':' }),
+      item.detail
+        ? jsx('span', { key: 'd', className: 'min-w-0 flex-1 truncate', children: clip(item.detail, 200) })
+        : null,
+    ],
+  })
+}
+
+function Transcript({ session }) {
+  const items = useMemo(() => buildTranscript(session), [session])
+  const boxRef = useRef(null)
+  const stickRef = useRef(true)
+  const sessionId = session && session.id
+  const tail = items.length ? items[items.length - 1].key : 'empty'
+
+  // Switching chats starts at the newest line; polling never moves the box
+  // unless the reader was already at the bottom.
+  useEffect(() => { stickRef.current = true }, [sessionId])
+  useEffect(() => {
+    const el = boxRef.current
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight
+  }, [sessionId, items.length, tail])
+
+  return jsx('div', {
+    ref: boxRef,
+    onScroll: () => {
+      const el = boxRef.current
+      if (!el) return
+      stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96
+    },
+    className: cn('flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded',
+      'border border-(--ui-stroke-secondary) p-3'),
+    children: items.length
+      ? items.map((item) => item.kind === 'event'
+          ? jsx(EventRow, { key: item.key, item })
+          : jsx(Bubble, { key: item.key, role: item.role, content: item.content }))
+      : jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: 'No transcript yet.' }),
+  })
+}
+
+// -- model picker -----------------------------------------------------------
+
+function PresetSelect({ value, models, onChange }) {
+  const presets = (models && models.models) || []
+  const current = value.model || ''
+  const options = current && presets.indexOf(current) === -1 ? [current].concat(presets) : presets
+  return jsxs('select', {
+    value: current,
+    onChange: (event) => onChange({ model: event.target.value, provider: '' }),
+    className: cn('max-w-[14rem] rounded border border-(--ui-stroke-secondary) bg-transparent',
+      'px-1.5 py-1 text-[0.6875rem] text-(--ui-text-secondary)'),
+    children: [
+      jsx('option', { key: 'default', value: '', children: 'Default model' }),
+      ...options.map((name) => jsx('option', { key: name, value: name, children: name })),
+    ],
+  })
+}
+
+/** DropdownMenu + the app's own ModelCatalogMenu driven by a detached
+ *  controller (the kanban pattern): the menu renders, we own what a pick
+ *  means. Falls back to a preset <select> on shells without the catalog. */
+function ModelPicker({ value, models, onChange, disabled }) {
+  const [open, setOpen] = useState(false)
+  if (!DropdownMenu || !DropdownMenuTrigger || !DropdownMenuContent || !ModelCatalogMenu) {
+    return jsx(PresetSelect, { value, models, onChange })
+  }
+  const controller = {
+    allowSpeed: false,
+    applyPreset: (preset, row) => onChange({ model: row.model, provider: row.provider }),
+    current: { effort: '', fast: false, model: value.model, provider: value.provider },
+    presetFor: () => ({}),
+    select: (model, provider) => {
+      onChange({ model, provider })
+      setOpen(false)
+    },
+    setOptions: (patch, row) => {
+      if (patch.effort === undefined) return
+      onChange({ model: row.model, provider: row.provider })
+    },
+  }
+  const menu = jsx(ModelCatalogMenu, {
+    controller, includeMoa: false,
+    request: host && typeof host.request === 'function' ? host.request : undefined,
+  })
+  const body = ModelMenuCloseContext && ModelMenuCloseContext.Provider
+    ? jsx(ModelMenuCloseContext.Provider, { value: () => setOpen(false), children: menu })
+    : menu
+
+  return jsxs(DropdownMenu, {
+    open, onOpenChange: setOpen,
+    children: [
+      jsx(DropdownMenuTrigger, {
+        key: 'trigger', asChild: true,
+        children: jsxs('button', {
+          type: 'button', disabled,
+          className: cn('flex max-w-[14rem] items-center gap-1 rounded border border-(--ui-stroke-secondary)',
+            'px-1.5 py-1 text-[0.6875rem] text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
+            disabled && 'opacity-50'),
+          children: [
+            jsx('span', { key: 'l', className: 'min-w-0 truncate', children: modelLabel(value.model, value.provider) }),
+            jsx('span', { key: 'c', className: 'shrink-0 text-(--ui-text-quaternary)', children: '▾' }),
+          ],
+        }),
+      }),
+      jsx(DropdownMenuContent, { key: 'content', align: 'start', className: 'w-72 p-0', children: body }),
+    ],
+  })
+}
+
+// -- composer ---------------------------------------------------------------
+
+function Composer(props) {
+  const { mode, session, draft, onDraft, onSend, onStop, pending, stopPending, error,
+    model, onModelChange, repo, onRepoChange, models, inputRef } = props
+  const busy = isBusy(session)
+  const canSend = !!String(draft || '').trim() && !pending && !busy
+  const placeholder = mode === 'session'
+    ? (busy ? 'Waiting for this turn to finish…' : 'Reply to this chat…')
+    : 'Describe the work…'
+  const meta = mode === 'session'
+    ? [
+        jsx('span', { key: 'model', className: 'min-w-0 truncate', children: sessionModelLabel(session) }),
+        jsx('span', { key: 'note', className: 'shrink-0', children: 'model fixed for this chat' }),
+      ]
+    : [
+        jsx(ModelPicker, { key: 'picker', value: model, models, disabled: pending, onChange: onModelChange }),
+        jsx('input', {
+          key: 'repo', type: 'text', value: repo, placeholder: 'repo path (optional)',
+          onChange: (event) => onRepoChange(event.target.value),
+          className: cn('min-w-0 flex-1 rounded border border-(--ui-stroke-secondary) bg-transparent',
+            'px-1.5 py-1 text-[0.6875rem] text-(--ui-text-secondary)',
+            'placeholder:text-(--ui-text-quaternary) focus:outline-none'),
+        }),
+        jsx('span', { key: 'hint', className: 'shrink-0', children: 'Enter sends · Shift+Enter newline' }),
+      ]
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1.5',
+    children: [
+      error ? jsx('div', { key: 'err', className: 'truncate text-[0.6875rem] text-(--ui-text-quaternary)', children: error }) : null,
+      jsxs('div', {
+        key: 'row', className: 'flex items-end gap-2',
         children: [
-          jsx('span', {
-            key: 'icon',
-            className: 'text-(--ui-text-quaternary)',
-            children: icon,
+          jsx('textarea', {
+            key: 'input', ref: inputRef, rows: 2, value: draft,
+            disabled: pending || busy, placeholder,
+            onChange: (event) => onDraft(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault()
+                onSend()
+              }
+            },
+            className: cn('min-h-16 min-w-0 flex-1 resize-none rounded border border-(--ui-stroke-secondary)',
+              'bg-transparent px-2 py-1.5 text-xs text-(--ui-text-secondary)',
+              'placeholder:text-(--ui-text-quaternary) focus:outline-none disabled:opacity-60'),
           }),
-          jsx('span', {
-            key: 'id',
-            className: 'font-mono text-(--ui-text-tertiary)',
-            children: ticket.id,
-          }),
-          jsx('span', {
-            key: 'status',
-            className: 'text-(--ui-text-tertiary)',
-            children: ticket.status,
-          }),
-          jsx('span', {
-            key: 'req',
-            className: 'truncate text-(--ui-text-secondary)',
-            children: ticket.request,
+          jsxs('div', {
+            key: 'actions', className: 'flex shrink-0 flex-col gap-1',
+            children: [
+              jsx('button', {
+                key: 'send', type: 'button', disabled: !canSend, onClick: onSend,
+                className: cn('rounded px-3 py-1.5 text-xs text-(--ui-text-secondary)',
+                  'hover:bg-(--chrome-action-hover)', !canSend && 'opacity-50'),
+                children: pending ? (mode === 'session' ? 'Sending…' : 'Starting…') : 'Send',
+              }),
+              busy ? jsx('button', {
+                key: 'stop', type: 'button', disabled: stopPending, onClick: onStop,
+                className: 'rounded px-3 py-1.5 text-xs text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover)',
+                children: stopPending ? 'Stopping…' : 'Stop',
+              }) : null,
+            ],
           }),
         ],
       }),
-      ticket.reason
+      jsxs('div', {
+        key: 'meta', className: 'flex flex-wrap items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+        children: meta,
+      }),
+    ],
+  })
+}
+
+// -- chat center ------------------------------------------------------------
+
+function ChatHeader({ session, onStop, stopPending, tile }) {
+  const canOpen = !!session.hermes_session_id && !!(host && typeof host.openSession === 'function')
+  const canTile = !tile && !!(host && typeof host.openWorkspace === 'function')
+  const meta = [
+    jsx(Pill, { key: 'status', children: session.status }),
+    jsx('span', { key: 'model', className: 'text-(--ui-text-tertiary)', children: sessionModelLabel(session) }),
+  ]
+  if (session.repo) {
+    meta.push(jsx('span', {
+      key: 'repo', className: 'min-w-0 max-w-[18rem] truncate font-mono text-(--ui-text-quaternary)',
+      children: session.repo,
+    }))
+  }
+  if (session.pr_url) {
+    meta.push(jsx('button', {
+      key: 'pr', type: 'button', onClick: () => openUrl(session.pr_url),
+      className: 'shrink-0 text-(--ui-text-secondary) underline',
+      children: session.pr_number ? `PR #${session.pr_number}` : 'Pull request',
+    }))
+  }
+  if (session.error) {
+    meta.push(jsx('span', {
+      key: 'err', className: 'min-w-0 max-w-[22rem] truncate text-(--ui-text-quaternary)',
+      children: clip(session.error, 160),
+    }))
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-wrap items-center justify-between gap-2',
+    children: [
+      jsx('div', { key: 'meta', className: 'flex min-w-0 flex-wrap items-center gap-2 text-[0.6875rem]', children: meta }),
+      jsxs('div', {
+        key: 'actions', className: 'flex shrink-0 items-center gap-1',
+        children: [
+          canTile ? jsx(GhostButton, {
+            key: 'tile', title: 'Open in a workspace tile',
+            onClick: () => openChatTile(session),
+            children: '⧉',
+          }) : null,
+          canOpen ? jsx(GhostButton, {
+            key: 'open',
+            onClick: () => { host.openSession(session.hermes_session_id).catch(() => {}) },
+            children: 'Open in Hermes',
+          }) : null,
+          isBusy(session) && typeof onStop === 'function' ? jsx(GhostButton, {
+            key: 'stop', onClick: onStop, disabled: stopPending,
+            children: stopPending ? 'Stopping…' : 'Stop',
+          }) : null,
+        ],
+      }),
+    ],
+  })
+}
+
+function ChatCenter(props) {
+  const { summary, detail, onStop, stopPending, ...composerProps } = props
+  const session = (detail && detail.data && detail.data.session) || summary
+
+  if (!session) {
+    return jsxs('div', {
+      className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-2',
+      children: [
+        jsx('div', {
+          key: 'empty',
+          className: cn('flex min-h-0 flex-1 items-center justify-center rounded border',
+            'border-(--ui-stroke-secondary) p-4 text-center text-xs text-(--ui-text-tertiary)'),
+          children: 'Start a chat — pick a model and describe the work.',
+        }),
+        jsx(Composer, { key: 'composer', mode: 'new', ...composerProps }),
+      ],
+    })
+  }
+
+  return jsxs('div', {
+    className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-2',
+    children: [
+      jsx(ChatHeader, { key: 'head', session, onStop, stopPending }),
+      detail && detail.isError
+        ? jsx(ErrorCard, {
+            key: 'err', title: `Could not load ${session.id}.`, error: detail.error,
+            onRetry: () => detail.refetch(),
+          })
+        : jsx(Transcript, { key: 'transcript', session }),
+      jsx(Composer, { key: 'composer', mode: 'session', session, ...composerProps }),
+    ],
+  })
+}
+
+/** Read-only transcript in a main-area tile (newer shells). The composer
+ *  stays on the page; older shells never see the ⧉ button. */
+function ChatTile({ sessionId }) {
+  const detail = useChat(sessionId)
+  const session = detail.data && detail.data.session
+  if (!session) {
+    return jsx('div', { className: 'p-4 text-xs text-(--ui-text-tertiary)', children: 'Loading chat…' })
+  }
+  return jsxs('div', {
+    className: 'flex h-full min-h-0 flex-col gap-2 p-3',
+    children: [
+      jsx(ChatHeader, { key: 'head', session, tile: true }),
+      jsx(Transcript, { key: 'transcript', session }),
+    ],
+  })
+}
+
+function openChatTile(session) {
+  try {
+    host.openWorkspace(`superagent-chat-${session.id}`, {
+      title: sessionTitle(session),
+      render: () => jsx(ChatTile, { sessionId: session.id }),
+    })
+  } catch (error) {
+    // Older shells: the button is hidden by the same typeof check.
+  }
+}
+
+// -- live workers -----------------------------------------------------------
+
+function WorkerCard({ session, onSelect }) {
+  const event = String(session.last_event || '').trim()
+  return jsxs('button', {
+    type: 'button',
+    onClick: () => onSelect(session.id),
+    className: cn('flex w-full flex-col gap-1 rounded border border-(--ui-stroke-secondary)',
+      'p-2 text-left text-xs hover:bg-(--chrome-action-hover)'),
+    children: [
+      jsxs('div', {
+        key: 'top', className: 'flex min-w-0 items-center gap-1.5',
+        children: [
+          jsx(ChatDot, { key: 'dot', status: session.status }),
+          jsx('span', { key: 't', className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: sessionTitle(session) }),
+          jsx('span', { key: 's', className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)', children: session.status }),
+        ],
+      }),
+      jsxs('div', {
+        key: 'meta', className: 'flex min-w-0 items-baseline justify-between gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+        children: [
+          jsx('span', { key: 'm', className: 'min-w-0 truncate', children: sessionModelLabel(session) }),
+          jsx('span', { key: 't', className: 'shrink-0 tabular-nums', children: timingLabel(session) }),
+        ],
+      }),
+      event ? jsx('div', {
+        key: 'event',
+        className: 'line-clamp-2 break-words text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
+        children: event,
+      }) : null,
+    ],
+  })
+}
+
+function LiveWorkers({ sessions, onSelect }) {
+  const live = sessions.filter((session) => LIVE_STATUSES.indexOf(session.status) !== -1).slice(0, MAX_WORKERS)
+  return jsxs('div', {
+    className: 'flex min-h-0 w-full flex-col gap-2 md:w-[20rem] md:shrink-0',
+    children: [
+      jsx('div', {
+        key: 'label', className: 'text-xs font-medium text-(--ui-text-tertiary)',
+        children: live.length ? `Live workers (${live.length})` : 'Live workers',
+      }),
+      jsx('div', {
+        key: 'grid', className: 'grid min-h-0 flex-1 grid-cols-1 content-start gap-2 overflow-y-auto pr-1',
+        children: live.length
+          ? live.map((session) => jsx(WorkerCard, { key: session.id, session, onSelect }))
+          : jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: 'Nothing running.' }),
+      }),
+    ],
+  })
+}
+
+// -- page -------------------------------------------------------------------
+
+function SuperagentPage() {
+  const queryClient = useQueryClient()
+  const chatsQuery = useChats()
+  const modelsQuery = useModels()
+  const [selectedId, setSelectedId] = useState(null)
+  const [draft, setDraft] = useState('')
+  const [model, setModel] = useState(() => ({
+    model: readStored('lastModel', ''), provider: readStored('lastProvider', ''),
+  }))
+  const [repo, setRepo] = useState(() => readStored('lastRepo', ''))
+  const detail = useChat(selectedId)
+  const inputRef = useRef(null)
+
+  const data = chatsQuery.data
+  const sessions = useMemo(() => {
+    return ((data && data.sessions) || []).slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))
+  }, [data])
+  const counts = (data && data.counts) || {}
+  const running = (data && data.running) || 0
+  const queued = counts.queued || 0
+  const waiting = (counts.review || 0) + (counts.failed || 0)
+  const selectedSummary = useMemo(
+    () => sessions.find((session) => session.id === selectedId) || null,
+    [sessions, selectedId],
+  )
+  const selectedSession = (detail.data && detail.data.session) || selectedSummary
+
+  const createChat = useMutation({
+    mutationFn: (body) => rest('/chats', { method: 'POST', body }),
+    onSuccess: (result) => {
+      invalidateChats(queryClient)
+      if (result && result.session && result.session.id) setSelectedId(result.session.id)
+    },
+  })
+
+  const sendChat = useMutation({
+    mutationFn: (vars) => rest(`/chats/${encodeURIComponent(vars.id)}/messages`, {
+      method: 'POST', body: { content: vars.content },
+    }),
+    onSuccess: (result) => {
+      invalidateChats(queryClient, selectedId)
+      // A session with nothing to resume is replaced by a fresh chat.
+      if (result && result.session && result.session.id) setSelectedId(result.session.id)
+    },
+  })
+
+  const stopChat = useMutation({
+    mutationFn: (id) => rest(`/chats/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
+    onSuccess: () => invalidateChats(queryClient, selectedId),
+  })
+
+  const pending = createChat.isPending || sendChat.isPending
+  const stopPending = stopChat.isPending
+  const busyTurn = isBusy(selectedSession)
+  const notice = (createChat.data && createChat.data.ok === false && createChat.data.error) ||
+    (sendChat.data && sendChat.data.ok === false && sendChat.data.error) || ''
+  const failure = errorText(createChat.error) || errorText(sendChat.error) ||
+    errorText(stopChat.error) || notice
+
+  const submit = () => {
+    const text = String(draft || '').trim()
+    if (!text || pending || busyTurn) return
+    if (selectedId) {
+      sendChat.mutate({ id: selectedId, content: text }, { onSuccess: () => setDraft('') })
+      return
+    }
+    writeStored('lastModel', model.model)
+    writeStored('lastProvider', model.provider)
+    writeStored('lastRepo', repo)
+    createChat.mutate(
+      { prompt: text, model: model.model, provider: model.provider, repo },
+      { onSuccess: () => setDraft('') },
+    )
+  }
+
+  const select = (id) => {
+    setSelectedId(id)
+    setDraft('')
+  }
+
+  const newChat = () => {
+    setSelectedId(null)
+    setDraft('')
+    setModel({ model: readStored('lastModel', ''), provider: readStored('lastProvider', '') })
+    setRepo(readStored('lastRepo', ''))
+    if (typeof window !== 'undefined') {
+      window.setTimeout(() => { if (inputRef.current) inputRef.current.focus() }, 0)
+    }
+  }
+
+  const refresh = () => {
+    chatsQuery.refetch()
+    modelsQuery.refetch()
+    if (selectedId) detail.refetch()
+  }
+
+  const stop = () => {
+    if (!selectedSession || stopPending) return
+    stopChat.mutate(selectedSession.id)
+  }
+
+  const countLabel = queued
+    ? `${running} running · ${waiting} waiting · ${queued} queued`
+    : `${running} running · ${waiting} waiting`
+
+  return jsxs('div', {
+    className: 'flex h-full min-h-0 flex-col gap-3 overflow-hidden p-4 text-sm',
+    children: [
+      jsxs('div', {
+        key: 'header', className: 'flex flex-wrap items-center justify-between gap-2',
+        children: [
+          jsxs('div', {
+            key: 'title', className: 'flex flex-wrap items-baseline gap-2',
+            children: [
+              jsx('span', { key: 'name', className: 'text-sm font-medium', children: 'Superagent' }),
+              jsx('span', { key: 'counts', className: 'text-xs text-(--ui-text-tertiary)', children: countLabel }),
+            ],
+          }),
+          jsxs('div', {
+            key: 'actions', className: 'flex items-center gap-1',
+            children: [
+              jsx(GhostButton, { key: 'new', onClick: newChat, children: 'New chat' }),
+              jsx(GhostButton, { key: 'refresh', onClick: refresh, children: 'Refresh' }),
+            ],
+          }),
+        ],
+      }),
+      chatsQuery.isError
         ? jsx('div', {
-            key: 'reason',
-            className: 'truncate pl-4 text-(--ui-text-quaternary)',
-            children: ticket.reason,
+            key: 'error', className: 'shrink-0',
+            children: jsx(ErrorCard, {
+              title: 'Superagent backend unavailable. Enable the plugin first.',
+              error: chatsQuery.error, onRetry: () => chatsQuery.refetch(),
+            }),
           })
         : null,
+      jsxs('div', {
+        key: 'body', className: 'flex min-h-0 flex-1 flex-col gap-3 md:flex-row',
+        children: [
+          jsx(SessionsRail, { key: 'rail', sessions, selectedId, onSelect: select }),
+          jsx(ChatCenter, {
+            key: 'center', summary: selectedSummary, detail,
+            draft, onDraft: setDraft, onSend: submit, onStop: stop,
+            pending, stopPending, error: failure,
+            model, onModelChange: setModel, repo, onRepoChange: setRepo,
+            models: modelsQuery.data, inputRef,
+          }),
+          jsx(LiveWorkers, { key: 'workers', sessions, onSelect: select }),
+        ],
+      }),
+    ],
+  })
+}
+
+// -- ticket pane + chip (iteration 1 surface, kept) -------------------------
+
+function TicketRow({ ticket }) {
+  return jsxs('div', {
+    className: 'flex flex-col gap-0.5 rounded px-2 py-1.5 text-xs',
+    children: [
+      jsxs('div', {
+        key: 'head', className: 'flex items-baseline gap-1.5',
+        children: [
+          jsx('span', { key: 'icon', className: 'text-(--ui-text-quaternary)', children: ICONS[ticket.status] || '?' }),
+          jsx('span', { key: 'id', className: 'font-mono text-(--ui-text-tertiary)', children: ticket.id }),
+          jsx('span', { key: 'status', className: 'text-(--ui-text-tertiary)', children: ticket.status }),
+          jsx('span', { key: 'req', className: 'truncate text-(--ui-text-secondary)', children: ticket.request }),
+        ],
+      }),
+      ticket.reason
+        ? jsx('div', { key: 'reason', className: 'truncate pl-4 text-(--ui-text-quaternary)', children: ticket.reason })
+        : null,
+    ],
+  })
+}
+
+function ChatMiniRow({ session }) {
+  return jsxs('div', {
+    className: 'flex min-w-0 items-baseline gap-1.5 px-2 text-xs',
+    children: [
+      jsx(StatusGlyph, { key: 'g', status: session.status, pulse: true }),
+      jsx('span', { key: 't', className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: sessionTitle(session) }),
+      jsx('span', { key: 'a', className: 'shrink-0 text-(--ui-text-quaternary)', children: timingLabel(session) }),
     ],
   })
 }
 
 function SuperagentPane() {
   const { data, isLoading, isError, error, refetch } = useTickets()
+  const chats = useChats()
 
   if (isLoading && !data) {
-    return jsx('div', {
-      className: 'p-3 text-xs text-(--ui-text-tertiary)',
-      children: 'Loading tickets…',
-    })
+    return jsx('div', { className: 'p-3 text-xs text-(--ui-text-tertiary)', children: 'Loading tickets…' })
   }
 
   if (isError) {
@@ -123,22 +922,13 @@ function SuperagentPane() {
       className: 'flex flex-col gap-2 p-3 text-xs',
       children: [
         jsx('div', {
-          key: 'msg',
-          className: 'text-(--ui-text-tertiary)',
+          key: 'msg', className: 'text-(--ui-text-tertiary)',
           children: 'Superagent backend unavailable. Enable the plugin first.',
         }),
-        jsx('div', {
-          key: 'err',
-          className: 'truncate text-(--ui-text-quaternary)',
-          children: String((error && error.message) || error),
-        }),
+        jsx('div', { key: 'err', className: 'truncate text-(--ui-text-quaternary)', children: errorText(error) }),
         jsx('button', {
-          key: 'retry',
-          type: 'button',
-          className: cn(
-            'self-start rounded px-2 py-1',
-            'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
-          ),
+          key: 'retry', type: 'button',
+          className: cn('self-start rounded px-2 py-1', 'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)'),
           onClick: () => refetch(),
           children: 'Retry',
         }),
@@ -146,358 +936,78 @@ function SuperagentPane() {
     })
   }
 
-  if (!data || data.db_exists === false) {
-    return jsx('div', {
-      className: 'p-3 text-xs text-(--ui-text-tertiary)',
-      children: 'No tickets yet. Ask Superagent for work from any chat.',
-    })
-  }
-
-  const attention = data.attention || []
-  const tickets = data.tickets || []
-  const running = data.running || 0
-  const queued = data.queued || 0
+  const attention = (data && data.attention) || []
+  const tickets = (data && data.tickets) || []
+  const chatSessions = (chats.data && chats.data.sessions) || []
+  const chatRunning = (chats.data && chats.data.running) || 0
+  const live = chatSessions.filter((session) => isBusy(session) || session.status === 'review').slice(0, 4)
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-2 overflow-y-auto p-3 text-sm',
     children: [
       jsx('div', {
-        key: 'head',
-        className: 'flex items-center justify-between text-xs text-(--ui-text-tertiary)',
+        key: 'head', className: 'flex items-center justify-between text-xs text-(--ui-text-tertiary)',
         children: [
           jsx('span', {
             key: 'counts',
-            children: `running ${running} · queued ${queued}`,
+            children: `chats ${chatRunning} running · tickets ${(data && data.running) || 0} running`,
           }),
           jsx('button', {
-            key: 'refresh',
-            type: 'button',
+            key: 'refresh', type: 'button',
             className: 'rounded px-1.5 py-0.5 hover:bg-(--chrome-action-hover) hover:text-foreground',
-            onClick: () => refetch(),
+            onClick: () => { refetch(); chats.refetch() },
             children: 'Refresh',
           }),
         ],
       }),
+      live.length
+        ? jsxs('div', {
+            key: 'chats', className: 'flex flex-col gap-1',
+            children: [
+              jsx('div', { key: 'label', className: 'text-xs font-medium text-(--ui-text-tertiary)', children: 'Latest chats' }),
+              ...live.map((session) => jsx(ChatMiniRow, { key: session.id, session })),
+            ],
+          })
+        : null,
       attention.length
         ? jsxs('div', {
-            key: 'needs',
-            className: 'flex flex-col gap-1',
+            key: 'needs', className: 'flex flex-col gap-1',
             children: [
-              jsx('div', {
-                key: 'label',
-                className: 'text-xs font-medium',
-                children: 'Needs you',
-              }),
-              ...attention.map((t) => jsx(TicketRow, { key: t.id, ticket: t })),
+              jsx('div', { key: 'label', className: 'text-xs font-medium', children: 'Needs you' }),
+              ...attention.map((ticket) => jsx(TicketRow, { key: ticket.id, ticket })),
             ],
           })
-        : jsx('div', {
-            key: 'clear',
-            className: 'text-xs text-(--ui-text-tertiary)',
-            children: 'Nothing needs you.',
-          }),
+        : jsx('div', { key: 'clear', className: 'text-xs text-(--ui-text-tertiary)', children: 'Nothing needs you.' }),
       tickets.length
         ? jsxs('div', {
-            key: 'recent',
-            className: 'flex flex-col gap-1',
+            key: 'recent', className: 'flex flex-col gap-1',
             children: [
-              jsx('div', {
-                key: 'label',
-                className: 'text-xs font-medium text-(--ui-text-tertiary)',
-                children: 'Recent',
-              }),
-              ...tickets
-                .slice(0, 12)
-                .map((t) => jsx(TicketRow, { key: t.id, ticket: t })),
+              jsx('div', { key: 'label', className: 'text-xs font-medium text-(--ui-text-tertiary)', children: 'Recent tickets' }),
+              ...tickets.slice(0, 12).map((ticket) => jsx(TicketRow, { key: ticket.id, ticket })),
             ],
           })
         : null,
-    ],
-  })
-}
-
-function SessionCard({ session, onRun, runPending }) {
-  const icon = ICONS[session.status] || '?'
-  const canRun = RUNNABLE.indexOf(session.status) !== -1
-  return jsxs('div', {
-    className: 'flex flex-col gap-1 rounded border border-(--ui-stroke-secondary) p-2 text-xs',
-    children: [
-      jsxs('div', {
-        key: 'head',
-        className: 'flex items-center gap-1.5',
-        children: [
-          jsx('span', {
-            key: 'icon',
-            className: 'text-(--ui-text-quaternary)',
-            children: icon,
-          }),
-          jsx('span', {
-            key: 'id',
-            className: 'font-mono text-(--ui-text-tertiary)',
-            children: session.id,
-          }),
-          jsx('span', {
-            key: 'status',
-            className: 'text-(--ui-text-secondary)',
-            children: session.status,
-          }),
-          session.worker_id
-            ? jsx('span', {
-                key: 'worker',
-                className: 'truncate text-(--ui-text-quaternary)',
-                children: session.worker_id,
-              })
-            : null,
-        ],
-      }),
-      jsx('div', {
-        key: 'req',
-        className: 'truncate text-(--ui-text-secondary)',
-        children: session.request,
-      }),
-      jsxs('div', {
-        key: 'foot',
-        className: 'flex items-center justify-between gap-2',
-        children: [
-          jsx('span', {
-            key: 'meta',
-            className: 'truncate text-(--ui-text-quaternary)',
-            children: session.last_event
-              ? `${session.last_event.kind}: ${(session.last_event.detail || '').slice(0, 80)}`
-              : (session.reason || session.result || ''),
-          }),
-          canRun
-            ? jsx('button', {
-                key: 'run',
-                type: 'button',
-                disabled: runPending,
-                className: cn(
-                  'shrink-0 rounded px-2 py-1',
-                  'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
-                ),
-                onClick: onRun,
-                children: runPending ? 'Queuing…' : 'Run',
-              })
-            : jsx('span', {
-                key: 'state',
-                className: 'shrink-0 text-(--ui-text-quaternary)',
-                children: session.status,
-              }),
-        ],
-      }),
-    ],
-  })
-}
-
-function SuperagentPage() {
-  const ticketsQuery = useTickets()
-  const sessionsQuery = useSessions()
-  const queryClient = useQueryClient()
-  const [draft, setDraft] = useState('')
-
-  const askMutation = useMutation({
-    mutationFn: (text) => rest('/ask', { method: 'POST', body: { request: text, requester: 'desktop' } }),
-    onSuccess: () => invalidateSuperagent(queryClient),
-  })
-  const runMutation = useMutation({
-    mutationFn: (id) => rest('/run', { method: 'POST', body: { ticket_id: id } }),
-    onSuccess: () => invalidateSuperagent(queryClient),
-  })
-
-  const ticketsData = ticketsQuery.data
-  const sessionsData = sessionsQuery.data
-  const tickets = (ticketsData && ticketsData.tickets) || []
-  const sessions = (sessionsData && sessionsData.sessions) || []
-  const running = (ticketsData && ticketsData.running) || 0
-  const queued = (ticketsData && ticketsData.queued) || 0
-  const askPending = askMutation.isPending || askMutation.isLoading
-  const runPendingId = runMutation.isPending || runMutation.isLoading ? runMutation.variables : null
-
-  const refreshAll = () => {
-    ticketsQuery.refetch()
-    sessionsQuery.refetch()
-  }
-
-  const submitDraft = () => {
-    const text = (draft || '').trim()
-    if (!text || askPending) return
-    askMutation.mutate(text, { onSuccess: () => setDraft('') })
-  }
-
-  return jsxs('div', {
-    className: 'flex h-full flex-col gap-3 overflow-y-auto p-4 text-sm',
-    children: [
-      jsxs('div', {
-        key: 'header',
-        className: 'flex items-center justify-between gap-2',
-        children: [
-          jsxs('div', {
-            key: 'title',
-            className: 'flex items-baseline gap-2',
-            children: [
-              jsx('span', {
-                key: 'name',
-                className: 'text-sm font-medium',
-                children: 'Superagent',
-              }),
-              jsx('span', {
-                key: 'counts',
-                className: 'text-xs text-(--ui-text-tertiary)',
-                children: `running ${running} · queued ${queued} · sessions ${sessions.length}`,
-              }),
-            ],
-          }),
-          jsx('button', {
-            key: 'refresh',
-            type: 'button',
-            className: cn(
-              'rounded px-2 py-1 text-xs',
-              'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
-            ),
-            onClick: refreshAll,
-            children: 'Refresh',
-          }),
-        ],
-      }),
-      askMutation.isError
-        ? jsx('div', {
-            key: 'ask-err',
-            className: 'truncate text-xs text-(--ui-text-quaternary)',
-            children: `Ask failed: ${String((askMutation.error && askMutation.error.message) || askMutation.error)}`,
-          })
-        : null,
-      runMutation.isError
-        ? jsx('div', {
-            key: 'run-err',
-            className: 'truncate text-xs text-(--ui-text-quaternary)',
-            children: `Run failed: ${String((runMutation.error && runMutation.error.message) || runMutation.error)}`,
-          })
-        : null,
-      jsxs('div', {
-        key: 'cols',
-        className: 'flex min-h-0 flex-1 flex-col gap-3 md:flex-row',
-        children: [
-          jsxs('div', {
-            key: 'chat',
-            className: 'flex min-w-0 flex-1 flex-col gap-2',
-            children: [
-              jsx('div', {
-                key: 'label',
-                className: 'text-xs font-medium text-(--ui-text-tertiary)',
-                children: 'Chat — ask for work',
-              }),
-              jsxs('div', {
-                key: 'history',
-                className: 'flex min-h-24 flex-col gap-1 overflow-y-auto rounded border border-(--ui-stroke-secondary) p-2',
-                children: tickets.length
-                  ? tickets.slice(0, 20).map((t) =>
-                      jsx(TicketRow, { key: t.id, ticket: t }),
-                    )
-                  : [
-                      jsx('div', {
-                        key: 'empty',
-                        className: 'p-2 text-xs text-(--ui-text-tertiary)',
-                        children: 'No tickets yet — type work below to queue it.',
-                      }),
-                    ],
-              }),
-              jsxs('form', {
-                key: 'form',
-                className: 'flex gap-2',
-                onSubmit: (e) => {
-                  e.preventDefault()
-                  submitDraft()
-                },
-                children: [
-                  jsx('input', {
-                    key: 'input',
-                    type: 'text',
-                    value: draft,
-                    placeholder: 'Ask Superagent for work…',
-                    onChange: (e) => setDraft(e.target.value),
-                    className: 'min-w-0 flex-1 rounded border border-(--ui-stroke-secondary) bg-transparent px-2 py-1.5 text-sm text-(--ui-text-secondary)',
-                  }),
-                  jsx('button', {
-                    key: 'send',
-                    type: 'submit',
-                    disabled: askPending || !(draft || '').trim(),
-                    className: cn(
-                      'shrink-0 rounded px-3 py-1.5 text-xs',
-                      'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
-                    ),
-                    onClick: submitDraft,
-                    children: askPending ? 'Sending…' : 'Send',
-                  }),
-                ],
-              }),
-            ],
-          }),
-          jsxs('div', {
-            key: 'sessions',
-            className: 'flex min-w-0 flex-1 flex-col gap-2',
-            children: [
-              jsx('div', {
-                key: 'label',
-                className: 'text-xs font-medium text-(--ui-text-tertiary)',
-                children: `Sessions${sessions.length ? ` (${sessions.length})` : ''}`,
-              }),
-              sessionsQuery.isLoading && !sessionsData
-                ? jsx('div', {
-                    key: 'loading',
-                    className: 'p-2 text-xs text-(--ui-text-tertiary)',
-                    children: 'Loading sessions…',
-                  })
-                : null,
-              sessionsQuery.isError
-                ? jsx('div', {
-                    key: 'err',
-                    className: 'p-2 text-xs text-(--ui-text-tertiary)',
-                    children: 'Sessions unavailable — is the plugin backend enabled?',
-                  })
-                : null,
-              sessionsData && sessionsData.db_exists === false
-                ? jsx('div', {
-                    key: 'empty',
-                    className: 'p-2 text-xs text-(--ui-text-tertiary)',
-                    children: 'No sessions yet.',
-                  })
-                : null,
-              jsxs('div', {
-                key: 'grid',
-                className: 'grid grid-cols-1 gap-2 overflow-y-auto',
-                children: sessions.map((s) =>
-                  jsx(SessionCard, {
-                    key: s.id,
-                    session: s,
-                    runPending: runPendingId === s.id,
-                    onRun: () => {
-                      if (runPendingId) return
-                      runMutation.mutate(s.id)
-                    },
-                  }),
-                ),
-              }),
-            ],
-          }),
-        ],
-      }),
     ],
   })
 }
 
 function SuperagentChip() {
-  const { data } = useTickets()
-  const count = (data && data.attention && data.attention.length) || 0
-  const label = count > 0 ? `◆ ${count}` : 'superagent'
+  const tickets = useTickets()
+  const chats = useChats()
+  const attention = (tickets.data && tickets.data.attention && tickets.data.attention.length) || 0
+  const running = (chats.data && chats.data.running) || 0
+  const count = running || attention
+  const label = running ? `▶ ${running}` : attention > 0 ? `◆ ${attention}` : 'superagent'
+  const tip = running
+    ? `${running} Superagent chat${running === 1 ? '' : 's'} running`
+    : attention > 0
+      ? `${attention} ticket(s) need a human`
+      : 'Superagent: nothing needs you'
   return jsx(Tip, {
-    label: count > 0 ? `${count} ticket(s) need a human` : 'Superagent: nothing needs you',
+    label: tip,
     children: jsx('span', {
-      className: cn(
-        'inline-flex h-full items-center px-1.5 text-[0.6875rem]',
-        count > 0
-          ? 'text-foreground'
-          : 'text-(--ui-text-tertiary)',
-      ),
+      className: cn('inline-flex h-full items-center px-1.5 text-[0.6875rem]',
+        count > 0 ? 'text-foreground' : 'text-(--ui-text-tertiary)'),
       children: label,
     }),
   })
@@ -508,6 +1018,8 @@ export default {
   name: 'Superagent',
   register(ctx) {
     rest = ctx.rest
+    storage = ctx.storage && typeof ctx.storage.get === 'function' ? ctx.storage : null
+    openExternal = ctx.os && typeof ctx.os.openExternal === 'function' ? ctx.os.openExternal : null
     ctx.register({
       id: 'pane',
       area: 'panes',
