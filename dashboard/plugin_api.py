@@ -16,6 +16,11 @@ GitHub (v0.3) lives under /github: connect a repository, test the token, poll
 pull requests, and start work on one. The token is stored by the shared
 settings loader and never appears in a response.
 
+Settings and model presets live under /settings and /models: GET /settings is
+the public merged view (token-free), POST /settings validates and saves the
+desktop-editable keys, and both /models and POST /chats resolve the same
+normalised preset catalog (explicit model/provider > named preset > defaults).
+
 Imported by the gateway on its own, outside the plugin package, so this
 module is self-contained: stdlib sqlite3 only, no relative imports except the
 optional package import below.
@@ -68,6 +73,39 @@ MODEL_PRESETS = [
     "qwen/qwen3.8-27b",
     "z-ai/glm-5.3-flash",
 ]
+
+# Settings the panel may change. Everything else (the GitHub token in
+# particular) is written by its own endpoint or read-only here.
+SETTINGS_MODES = ("off", "observe", "auto")
+SETTINGS_KEYS = (
+    "mode",
+    "repo_path",
+    "default_model",
+    "default_provider",
+    "model_presets",
+    "max_workers",
+    "worker_yolo",
+    "chat_max_turns",
+    "github_repo",
+    "github_agent_login",
+    "github_allowed_users",
+    "github_watch_mode",
+    "github_watch_new_prs",
+    "github_poll_seconds",
+)
+SETTINGS_EDITABLE = (
+    "mode",
+    "repo_path",
+    "default_model",
+    "default_provider",
+    "model_presets",
+    "max_workers",
+    "worker_yolo",
+    "chat_max_turns",
+)
+MIN_WORKERS, MAX_WORKERS_SETTING = 1, 8
+MIN_CHAT_TURNS, MAX_CHAT_TURNS = 1, 500
+SETTINGS_STRING_LIMIT = 200
 
 # One Runner per database path, created on first use so repeated requests reuse
 # the same worker threads and semaphore. Tests patch `_get_runner`.
@@ -317,6 +355,18 @@ def _get_runner() -> Any:
             )
             _RUNNERS[key] = runner
         return runner
+
+
+def _reset_runner() -> None:
+    """Drop the Runner singleton so the next turn reads the new settings.
+
+    A running turn keeps its own process and thread; the next launch (or the
+    next resumed turn) builds a Runner with the saved worker cap, yolo flag,
+    model defaults and turn limit.
+    """
+    key = str(_db_path())
+    with _RUNNERS_LOCK:
+        _RUNNERS.pop(key, None)
 
 
 def _get_watcher() -> Any:
@@ -597,14 +647,155 @@ def tick(body: dict | None = None) -> dict[str, Any]:
 # GET /chats for status, tokens and the last event.
 
 
+# -- settings --------------------------------------------------------------
+#
+# One small, validated surface over the shared settings loader. GET never
+# returns the GitHub token (only `github_token_set`); POST accepts the eight
+# keys the desktop panel edits and rejects everything else, so a typo is a 400
+# instead of a silently ignored write.
+
+
+def _preset_catalog(settings: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """Normalised presets, or the built-in picker list when none are configured."""
+    data = settings if settings is not None else sa_settings.load_settings()
+    presets = sa_settings.normalize_presets(data.get("model_presets") or [])
+    if not presets:
+        presets = [{"name": name, "model": name, "provider": ""} for name in MODEL_PRESETS]
+    return presets
+
+
+def _settings_payload() -> dict[str, Any]:
+    """The public, panel-safe view of the merged settings."""
+    public = sa_settings.public_settings()
+    payload = {key: public.get(key, sa_settings.DEFAULTS.get(key)) for key in SETTINGS_KEYS}
+    payload["model_presets"] = sa_settings.normalize_presets(payload.get("model_presets"))
+    payload["github_token_set"] = bool(public.get("github_token_set"))
+    return payload
+
+
+def _settings_int(value: Any, field: str, low: int, high: int) -> int:
+    if isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"{field} must be an integer")
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field} must be an integer") from None
+    if number < low or number > high:
+        raise HTTPException(
+            status_code=400, detail=f"{field} must be between {low} and {high}"
+        )
+    return number
+
+
+def _settings_bool(value: Any, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value if value is not None else "").strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off"):
+        return False
+    raise HTTPException(status_code=400, detail=f"{field} must be true or false")
+
+
+def _settings_patch(data: Any) -> dict[str, Any]:
+    """Validate the editable settings keys; returns only what was supplied."""
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="settings must be an object")
+    unknown = sorted(set(data) - set(SETTINGS_EDITABLE))
+    if unknown:
+        raise HTTPException(
+            status_code=400, detail=f"unknown setting(s): {', '.join(unknown)}"
+        )
+
+    patch: dict[str, Any] = {}
+    if "mode" in data:
+        mode = str(data.get("mode") or "").strip().lower()
+        if mode not in SETTINGS_MODES:
+            raise HTTPException(status_code=400, detail="mode must be 'off', 'observe' or 'auto'")
+        patch["mode"] = mode
+    for key in ("default_model", "default_provider"):
+        if key not in data:
+            continue
+        value = data.get(key)
+        if value is not None and not isinstance(value, str):
+            raise HTTPException(status_code=400, detail=f"{key} must be a string")
+        text = str(value or "").strip()
+        if len(text) > SETTINGS_STRING_LIMIT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{key} is too long (max {SETTINGS_STRING_LIMIT} chars)",
+            )
+        patch[key] = text
+    if "model_presets" in data:
+        raw = data.get("model_presets")
+        if raw is not None and not isinstance(raw, (list, tuple)):
+            raise HTTPException(status_code=400, detail="model_presets must be a list")
+        try:
+            patch["model_presets"] = sa_settings.normalize_presets(raw, strict=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if "max_workers" in data:
+        patch["max_workers"] = _settings_int(
+            data.get("max_workers"), "max_workers", MIN_WORKERS, MAX_WORKERS_SETTING
+        )
+    if "worker_yolo" in data:
+        patch["worker_yolo"] = _settings_bool(data.get("worker_yolo"), "worker_yolo")
+    if "chat_max_turns" in data:
+        patch["chat_max_turns"] = _settings_int(
+            data.get("chat_max_turns"), "chat_max_turns", MIN_CHAT_TURNS, MAX_CHAT_TURNS
+        )
+    if "repo_path" in data:
+        value = data.get("repo_path")
+        if value is not None and not isinstance(value, str):
+            raise HTTPException(status_code=400, detail="repo_path must be a string")
+        raw = str(value or "").strip()
+        if raw:
+            try:
+                raw = sa_runner.resolve_repo_path(raw, root=_repo_root())
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        patch["repo_path"] = raw
+    return patch
+
+
+@router.get("/settings")
+def get_settings() -> dict[str, Any]:
+    """Merged runtime settings, token-free."""
+    return _settings_payload()
+
+
+@router.post("/settings")
+def update_settings(body: dict | None = None) -> dict[str, Any]:
+    """Save the editable settings and rebuild the Runner with them."""
+    patch = _settings_patch(body)
+    if patch:
+        try:
+            sa_settings.save_settings(patch)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=_scrub(str(exc))) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=_scrub(str(exc))) from exc
+        _reset_runner()
+    return {"ok": True, "settings": _settings_payload()}
+
+
 @router.get("/models")
 def list_models() -> dict[str, Any]:
     settings = sa_settings.load_settings()
-    presets = [str(name) for name in settings.get("model_presets") or []] or list(MODEL_PRESETS)
+    presets = _preset_catalog(settings)
+    # `models` stays the historical flat list of model ids; `presets` is the
+    # named view the composer chips and the settings editor use.
+    models = list(dict.fromkeys(preset["model"] for preset in presets))
     return {
         "default_model": str(settings.get("default_model") or ""),
         "default_provider": str(settings.get("default_provider") or ""),
-        "models": presets,
+        "models": models,
+        "presets": presets,
     }
 
 
@@ -647,8 +838,31 @@ def create_chat(body: dict) -> dict[str, Any]:
             status_code=400, detail=f"prompt is too long (max {MAX_PROMPT_CHARS} chars)"
         )
     prompt = _scrub(raw_prompt)
-    model = _scrub(str(data.get("model") or os.environ.get("SUPERAGENT_DEFAULT_MODEL", "") or "").strip())
-    provider = _scrub(str(data.get("provider") or os.environ.get("SUPERAGENT_DEFAULT_PROVIDER", "") or "").strip())
+    settings = sa_settings.load_settings()
+    preset_name = _scrub(str(data.get("preset") or "").strip())
+    preset: dict[str, str] | None = None
+    if preset_name:
+        presets = _preset_catalog(settings)
+        preset = next((item for item in presets if item["name"] == preset_name), None)
+        if preset is None:
+            available = ", ".join(item["name"] for item in presets) or "(none configured)"
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown preset '{preset_name}'; available: {available}",
+            )
+    explicit_model = str(data.get("model") or "").strip()
+    explicit_provider = str(data.get("provider") or "").strip()
+    # Resolution order per field: explicit request > named preset > settings.
+    model = _scrub(
+        explicit_model
+        or str((preset or {}).get("model") or "")
+        or str(settings.get("default_model") or "")
+    ).strip()
+    provider = _scrub(
+        explicit_provider
+        or str((preset or {}).get("provider") or "")
+        or str(settings.get("default_provider") or "")
+    ).strip()
     repo = _validated_repo(str(data.get("repo") or os.environ.get("SUPERAGENT_REPO", "") or "").strip())
     title = _scrub(str(data.get("title") or "").strip())
     source = str(data.get("source") or "desktop").strip() or "desktop"
@@ -663,6 +877,9 @@ def create_chat(body: dict) -> dict[str, Any]:
         source=source[:40],
     )
     session_id = session["id"]
+    if preset is not None:
+        label = f"{provider}: {model}" if provider and model else (model or provider or "default")
+        store.add_event(session_id, "preset", f"{preset_name} -> {label}")
     try:
         _get_runner().launch_turn(session_id, prompt, model=model, provider=provider, repo=repo)
     except Exception as exc:  # missing binary, bad repo, ...

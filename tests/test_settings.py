@@ -189,3 +189,84 @@ def test_a_broken_config_file_is_not_fatal(home):
     (home / "config.yaml").write_text("plugins: [unclosed", encoding="utf-8")
     sa_settings.clear_cache()
     assert sa_settings.load_settings()["mode"] == "observe"
+
+
+# -- model presets ---------------------------------------------------------
+
+
+def test_normalize_presets_accepts_legacy_plain_strings():
+    presets = sa_settings.normalize_presets(["qwen/qwen3.8-27b", "z-ai/glm-5.3-flash"])
+    assert presets == [
+        {"name": "qwen/qwen3.8-27b", "model": "qwen/qwen3.8-27b", "provider": ""},
+        {"name": "z-ai/glm-5.3-flash", "model": "z-ai/glm-5.3-flash", "provider": ""},
+    ]
+
+
+def test_normalize_presets_parses_named_strings():
+    presets = sa_settings.normalize_presets(
+        ["fast=opencode-go:qwen/qwen3.8-27b", "cheap=qwen3-local"]
+    )
+    assert presets == [
+        {"name": "fast", "model": "qwen/qwen3.8-27b", "provider": "opencode-go"},
+        {"name": "cheap", "model": "qwen3-local", "provider": ""},
+    ]
+
+
+def test_normalize_presets_accepts_objects_and_derives_missing_names():
+    presets = sa_settings.normalize_presets(
+        [
+            {"name": "strong", "model": "z-ai/glm-5.3-flash", "provider": "opencode-go"},
+            {"model": "deepseek-v4.1-flash"},
+        ]
+    )
+    assert presets == [
+        {"name": "strong", "model": "z-ai/glm-5.3-flash", "provider": "opencode-go"},
+        {"name": "deepseek-v4.1-flash", "model": "deepseek-v4.1-flash", "provider": ""},
+    ]
+
+
+def test_normalize_presets_is_lenient_by_default():
+    presets = sa_settings.normalize_presets(
+        ["Fast=opencode-go:one", "fast=two", {"model": ""}, "", None]
+    )
+    # Duplicates keep the first spelling, unusable entries are dropped.
+    assert presets == [{"name": "Fast", "model": "one", "provider": "opencode-go"}]
+
+
+def test_normalize_presets_strict_rejects_bad_input():
+    with pytest.raises(ValueError, match="duplicate"):
+        sa_settings.normalize_presets(["fast=one", "FAST=two"], strict=True)
+    with pytest.raises(ValueError, match="model"):
+        sa_settings.normalize_presets([{"name": "empty"}], strict=True)
+    with pytest.raises(ValueError, match="list"):
+        sa_settings.normalize_presets(42, strict=True)
+    with pytest.raises(ValueError, match="at most"):
+        sa_settings.normalize_presets([f"m{index}" for index in range(13)], strict=True)
+
+
+def test_load_settings_normalizes_legacy_presets(home):
+    write_config(home, {"model_presets": ["one-model", "two-model"]})
+    assert sa_settings.load_settings()["model_presets"] == [
+        {"name": "one-model", "model": "one-model", "provider": ""},
+        {"name": "two-model", "model": "two-model", "provider": ""},
+    ]
+
+
+def test_load_settings_normalizes_named_presets_from_env(home, monkeypatch):
+    monkeypatch.setenv("SUPERAGENT_MODEL_PRESETS", "fast=opencode-go:one-model, two-model")
+    assert sa_settings.load_settings()["model_presets"] == [
+        {"name": "fast", "model": "one-model", "provider": "opencode-go"},
+        {"name": "two-model", "model": "two-model", "provider": ""},
+    ]
+
+
+def test_save_settings_normalizes_presets(home):
+    sa_settings.save_settings({"model_presets": ["fast=opencode-go:one-model"]})
+    assert sa_settings.load_settings()["model_presets"] == [
+        {"name": "fast", "model": "one-model", "provider": "opencode-go"}
+    ]
+    # The file itself is normalised too, so every reader sees the same shape.
+    data = json.loads(sa_settings.settings_path().read_text(encoding="utf-8"))
+    assert data["model_presets"] == [
+        {"name": "fast", "model": "one-model", "provider": "opencode-go"}
+    ]

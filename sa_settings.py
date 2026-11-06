@@ -69,6 +69,12 @@ ENV_VARS: dict[str, str] = {
 
 CACHE_SECONDS = 5.0
 
+# A preset is a named (model, provider) pair. Twelve is enough for a picker
+# and keeps a hand-edited settings file from turning into a model catalog.
+MAX_MODEL_PRESETS = 12
+PRESET_NAME_LIMIT = 80
+PRESET_VALUE_LIMIT = 200
+
 _SETTINGS_FILE = "settings.json"
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _PLACEHOLDER_RE = re.compile(r"^\$\{[^}]+\}$")
@@ -146,8 +152,93 @@ def _as_list(value: Any) -> list[str]:
     return []
 
 
+def normalize_presets(value: Any, *, strict: bool = False) -> list[dict[str, str]]:
+    """Normalise any supported preset shape to ``[{name, model, provider}]``.
+
+    Accepted inputs (settings.json, config.yaml and the HTTP API all share
+    this function):
+
+    * legacy plain model strings — ``["qwen/qwen3.8-27b"]`` (the name is
+      derived from the model, so old files keep working);
+    * compact named strings — ``["fast=opencode-go:qwen/qwen3.8-27b"]``,
+      where the provider is optional (``"fast=qwen"``);
+    * objects — ``[{"name": "fast", "model": "qwen", "provider": "x"}]``.
+
+    ``strict=True`` is the validation mode used by ``POST /settings``: an
+    empty model, a duplicate name or more than :data:`MAX_MODEL_PRESETS`
+    entries raises ``ValueError``. The loader uses the lenient mode so a
+    hand-edited file degrades instead of taking the whole config down.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items: list[Any] = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        if strict:
+            raise ValueError("model_presets must be a list")
+        return []
+
+    presets: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        name = ""
+        model = ""
+        provider = ""
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            model = str(item.get("model") or "").strip()
+            provider = str(item.get("provider") or "").strip()
+        elif isinstance(item, str):
+            text = item.strip()
+            if not text:
+                continue
+            head, separator, spec = text.partition("=")
+            if separator:
+                name = head.strip()
+                vendor, colon, rest = spec.strip().partition(":")
+                if colon:
+                    provider = vendor.strip()
+                    model = rest.strip()
+                else:
+                    model = spec.strip()
+            else:
+                model = text
+        else:
+            if strict:
+                raise ValueError("each model preset must be a string or an object")
+            continue
+
+        if not model:
+            if strict:
+                raise ValueError("each model preset needs a model")
+            continue
+        if not name:
+            name = model  # legacy plain model strings: name == model
+        if strict:
+            if len(name) > PRESET_NAME_LIMIT:
+                raise ValueError(f"preset name is too long (max {PRESET_NAME_LIMIT} chars)")
+            if len(model) > PRESET_VALUE_LIMIT or len(provider) > PRESET_VALUE_LIMIT:
+                raise ValueError(f"preset model/provider is too long (max {PRESET_VALUE_LIMIT} chars)")
+        key = name.lower()
+        if key in seen:
+            if strict:
+                raise ValueError(f"duplicate preset name: {name}")
+            continue
+        if len(presets) >= MAX_MODEL_PRESETS:
+            if strict:
+                raise ValueError(f"at most {MAX_MODEL_PRESETS} model presets are allowed")
+            break
+        seen.add(key)
+        presets.append({"name": name, "model": model, "provider": provider})
+    return presets
+
+
 def _coerce(key: str, value: Any, fallback: Any) -> Any:
     """Coerce one value to the type of its default; bad input keeps ``fallback``."""
+    if key == "model_presets":
+        return normalize_presets(value)
     default = DEFAULTS.get(key)
     if isinstance(default, bool):
         return _as_bool(value, bool(fallback))
@@ -257,11 +348,14 @@ def clear_cache() -> None:
 
 
 def _copy(settings: dict[str, Any]) -> dict[str, Any]:
-    """A shallow copy with fresh lists, so a caller cannot mutate the cache."""
+    """A shallow copy with fresh lists (and preset objects), so callers cannot
+    mutate the cache."""
     copy = dict(settings)
     for key, value in copy.items():
         if isinstance(value, list):
-            copy[key] = list(value)
+            copy[key] = [
+                dict(item) if isinstance(item, dict) else item for item in value
+            ]
     return copy
 
 
@@ -281,6 +375,9 @@ def load_settings() -> dict[str, Any]:
     _merge_into(merged, _config_settings())
     _merge_into(merged, _json_settings())
     _merge_into(merged, _env_settings())
+    # One normalisation at the end: whatever layer won, callers always get
+    # [{name, model, provider}] (legacy plain strings included).
+    merged["model_presets"] = normalize_presets(merged.get("model_presets"))
     _finalize_token(merged)
 
     with _cache_lock:

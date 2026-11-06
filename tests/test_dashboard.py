@@ -390,3 +390,239 @@ def test_set_chat_model_accepts_a_provider_only_change(chat_api):
     assert body["session"]["model"] == ""  # clearing the pin is explicit
     assert body["session"]["provider"] == "opencode-go"
 
+
+# -- settings + model presets (v0.4) ---------------------------------------
+
+
+@pytest.fixture
+def settings_api(tmp_path, monkeypatch):
+    """A chat API whose settings live in a throwaway Hermes home."""
+    module = load_api()
+    db = tmp_path / "superagent.db"
+    runner = FakeRunner(store=module.sa_chats.ChatStore(db))
+    monkeypatch.setattr(module, "_db_path", lambda: db)
+    monkeypatch.setattr(module, "_get_runner", lambda: runner)
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setattr(module.sa_settings, "_hermes_home", lambda: home)
+    monkeypatch.setattr(module.sa_settings, "config_path", lambda: home / "config.yaml")
+    for name in module.sa_settings.ENV_VARS.values():
+        monkeypatch.delenv(name, raising=False)
+    module.sa_settings.clear_cache()
+    yield module, runner
+    module.sa_settings.clear_cache()
+
+
+def test_get_settings_returns_the_public_surface(settings_api):
+    api, _ = settings_api
+    body = api.get_settings()
+    for key in (
+        "mode",
+        "repo_path",
+        "default_model",
+        "default_provider",
+        "model_presets",
+        "max_workers",
+        "worker_yolo",
+        "chat_max_turns",
+        "github_repo",
+        "github_agent_login",
+        "github_allowed_users",
+        "github_watch_mode",
+        "github_watch_new_prs",
+        "github_poll_seconds",
+        "github_token_set",
+    ):
+        assert key in body
+    assert body["mode"] == "observe"
+    assert body["max_workers"] == 2
+    assert body["github_token_set"] is False
+    assert "github_token" not in body
+
+
+def test_get_settings_never_returns_the_token(settings_api):
+    api, _ = settings_api
+    api.sa_settings.save_settings({"github_token": "ghp_secret", "github_repo": "owner/name"})
+    body = api.get_settings()
+    assert body["github_token_set"] is True
+    assert body["github_repo"] == "owner/name"
+    assert "ghp_secret" not in api.json.dumps(body)
+
+
+def test_post_settings_saves_every_editable_key(settings_api, tmp_path):
+    api, _ = settings_api
+    repo = tmp_path / "clone"
+    repo.mkdir()
+    saved = api.update_settings(
+        {
+            "mode": "auto",
+            "repo_path": str(repo),
+            "default_model": "qwen/qwen3.8-27b",
+            "default_provider": "opencode-go",
+            "model_presets": [
+                "fast=opencode-go:qwen/qwen3.8-27b",
+                {"name": "strong", "model": "z-ai/glm-5.3-flash", "provider": "opencode-go"},
+            ],
+            "max_workers": 4,
+            "worker_yolo": False,
+            "chat_max_turns": 30,
+        }
+    )
+    assert saved["ok"] is True
+    settings = saved["settings"]
+    assert settings["mode"] == "auto"
+    assert settings["repo_path"] == str(repo.resolve())
+    assert settings["default_model"] == "qwen/qwen3.8-27b"
+    assert settings["default_provider"] == "opencode-go"
+    assert settings["model_presets"] == [
+        {"name": "fast", "model": "qwen/qwen3.8-27b", "provider": "opencode-go"},
+        {"name": "strong", "model": "z-ai/glm-5.3-flash", "provider": "opencode-go"},
+    ]
+    assert settings["max_workers"] == 4
+    assert settings["worker_yolo"] is False
+    assert settings["chat_max_turns"] == 30
+
+    # A second GET reads the same file back.
+    assert api.get_settings()["model_presets"] == settings["model_presets"]
+
+
+def test_post_settings_accepts_a_partial_patch(settings_api):
+    api, _ = settings_api
+    api.update_settings({"mode": "auto", "max_workers": 3})
+    api.update_settings({"chat_max_turns": 12})
+    body = api.get_settings()
+    assert body["mode"] == "auto"
+    assert body["max_workers"] == 3
+    assert body["chat_max_turns"] == 12
+
+
+def test_post_settings_resets_the_runner_singleton(settings_api):
+    api, _ = settings_api
+    key = str(api._db_path())
+    api._RUNNERS[key] = object()
+    api.update_settings({"max_workers": 5})
+    assert key not in api._RUNNERS
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"mode": "later"},
+        {"default_model": "x" * 201},
+        {"default_provider": 12},
+        {"model_presets": "fast=one"},
+        {"model_presets": ["fast=one", "FAST=two"]},
+        {"model_presets": [{"name": "empty"}]},
+        {"model_presets": [f"m{index}" for index in range(13)]},
+        {"max_workers": 0},
+        {"max_workers": 9},
+        {"max_workers": True},
+        {"worker_yolo": "maybe"},
+        {"chat_max_turns": 0},
+        {"chat_max_turns": 501},
+        {"unknown_setting": 1},
+        {"repo_path": 42},
+    ],
+)
+def test_post_settings_rejects_invalid_values(settings_api, patch):
+    api, _ = settings_api
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        api.update_settings(patch)
+    assert excinfo.value.status_code == 400
+    # Nothing was written.
+    assert api.get_settings()["mode"] == "observe"
+
+
+def test_post_settings_rejects_a_missing_repo_path(settings_api, tmp_path):
+    api, _ = settings_api
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        api.update_settings({"repo_path": str(tmp_path / "nope")})
+    assert excinfo.value.status_code == 400
+    assert "does not exist" in excinfo.value.detail
+
+
+def test_models_reports_named_presets_and_the_flat_list(settings_api):
+    api, _ = settings_api
+    api.update_settings(
+        {
+            "default_model": "one",
+            "default_provider": "prov",
+            "model_presets": ["fast=prov:one", {"name": "strong", "model": "two"}],
+        }
+    )
+    body = api.list_models()
+    assert body["default_model"] == "one"
+    assert body["default_provider"] == "prov"
+    assert body["models"] == ["one", "two"]
+    assert body["presets"] == [
+        {"name": "fast", "model": "one", "provider": "prov"},
+        {"name": "strong", "model": "two", "provider": ""},
+    ]
+
+
+def test_models_falls_back_to_the_builtin_list(settings_api):
+    api, _ = settings_api
+    body = api.list_models()
+    assert body["models"] == list(api.MODEL_PRESETS)
+    assert [preset["name"] for preset in body["presets"]] == list(api.MODEL_PRESETS)
+
+
+def test_create_chat_resolves_a_named_preset(settings_api):
+    api, runner = settings_api
+    api.update_settings({"model_presets": ["fast=opencode-go:qwen/qwen3.8-27b"]})
+
+    body = api.create_chat({"prompt": "Use the fast preset", "preset": "fast"})
+    assert body["ok"] is True
+    session = body["session"]
+    assert session["model"] == "qwen/qwen3.8-27b"
+    assert session["provider"] == "opencode-go"
+    assert runner.launches[-1]["model"] == "qwen/qwen3.8-27b"
+    assert runner.launches[-1]["provider"] == "opencode-go"
+
+    detail = api.get_chat(session["id"])["session"]
+    kinds = [event["kind"] for event in detail["events"]]
+    assert kinds == ["created", "preset", "launched"]
+    assert "fast" in detail["events"][1]["detail"]
+
+
+def test_create_chat_explicit_model_beats_the_preset(settings_api):
+    api, runner = settings_api
+    api.update_settings({"model_presets": ["fast=opencode-go:qwen/qwen3.8-27b"]})
+
+    body = api.create_chat(
+        {
+            "prompt": "override",
+            "preset": "fast",
+            "model": "explicit-model",
+            "provider": "explicit-provider",
+        }
+    )
+    assert body["session"]["model"] == "explicit-model"
+    assert body["session"]["provider"] == "explicit-provider"
+    assert runner.launches[-1]["model"] == "explicit-model"
+
+
+def test_create_chat_unknown_preset_lists_the_available_names(settings_api):
+    api, _ = settings_api
+    api.update_settings({"model_presets": ["fast=one", "strong=two"]})
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        api.create_chat({"prompt": "work", "preset": "missing"})
+    assert excinfo.value.status_code == 400
+    assert "missing" in excinfo.value.detail
+    assert "fast" in excinfo.value.detail and "strong" in excinfo.value.detail
+
+
+def test_create_chat_without_a_preset_uses_the_saved_defaults(settings_api):
+    api, _ = settings_api
+    api.update_settings({"default_model": "saved-model", "default_provider": "saved-provider"})
+
+    body = api.create_chat({"prompt": "defaults"})
+    assert body["session"]["model"] == "saved-model"
+    assert body["session"]["provider"] == "saved-provider"
+

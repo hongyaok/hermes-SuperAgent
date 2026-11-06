@@ -1,13 +1,14 @@
 /**
  * Superagent desktop surface — a chat-first workspace over headless chats.
  *
- * Data path: ctx.rest('/chats'), '/chats/{id}', '/models', POST /chats,
- * POST /chats/{id}/messages, POST /chats/{id}/model, POST /chats/{id}/stop →
- * dashboard/plugin_api.py. The list query polls at 2s while a worker runs and
- * 8s when the board is quiet; the open transcript polls at 1.5s while its own
- * turn is live. Every mutation invalidates both so the rail, the transcript,
- * and the live grid agree on the next paint. The per-card elapsed timer ticks
- * on local state only — it must never add a request to those budgets.
+ * Data path: ctx.rest('/chats'), '/chats/{id}', '/models', '/settings',
+ * POST /chats, POST /chats/{id}/messages, POST /chats/{id}/model,
+ * POST /chats/{id}/stop, POST /settings → dashboard/plugin_api.py. The list
+ * query polls at 2s while a worker runs and 8s when the board is quiet; the
+ * open transcript polls at 1.5s while its own turn is live. Every mutation
+ * invalidates both so the rail, the transcript, and the live grid agree on
+ * the next paint. The per-card elapsed timer ticks on local state only — it
+ * must never add a request to those budgets.
  *
  * The ticket pane and the status-bar chip stay (they answer "does a human need
  * to look at anything?"); the route page is chat-only.
@@ -249,6 +250,10 @@ function fetchModels() {
   return rest ? rest('/models') : Promise.reject(new Error('backend not ready'))
 }
 
+function fetchSettings() {
+  return rest ? rest('/settings') : Promise.reject(new Error('backend not ready'))
+}
+
 function fetchGithubStatus() {
   return rest ? rest('/github/status') : Promise.reject(new Error('backend not ready'))
 }
@@ -285,6 +290,14 @@ function useChat(id) {
 function useModels() {
   return useQuery({
     queryKey: [ID, 'models'], queryFn: fetchModels, staleTime: 60000, retry: false,
+  })
+}
+
+/** Merged settings, fetched only while the settings panel is open. */
+function useSettings(enabled) {
+  return useQuery({
+    queryKey: [ID, 'settings'], queryFn: fetchSettings, enabled, retry: false,
+    staleTime: 5000,
   })
 }
 
@@ -430,9 +443,13 @@ function splitList(text) {
     .filter(Boolean)
 }
 
-function GhostButton({ children, onClick, disabled, title, className }) {
+function GhostButton({
+  children, onClick, disabled, title, className,
+  'aria-label': ariaLabel, 'aria-expanded': ariaExpanded,
+}) {
   return jsx('button', {
     type: 'button', onClick, disabled, title,
+    'aria-label': ariaLabel, 'aria-expanded': ariaExpanded,
     className: cn('rounded px-2 py-1 text-xs text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
       disabled && 'opacity-50', className),
     children,
@@ -734,12 +751,351 @@ function SessionModelControl({ session, models, onChange, pending }) {
   })
 }
 
+// -- settings panel ---------------------------------------------------------
+
+const MAX_PRESET_ROWS = 12
+const SETTINGS_HINT = 'Presets appear in the composer; pick one before starting a chat.'
+
+function blankPreset() {
+  return { name: '', model: '', provider: '' }
+}
+
+function presetRowsFrom(settings) {
+  const rows = settings && Array.isArray(settings.model_presets) ? settings.model_presets : []
+  return rows.map((preset) => ({
+    name: String((preset && preset.name) || ''),
+    model: String((preset && preset.model) || ''),
+    provider: String((preset && preset.provider) || ''),
+  }))
+}
+
+/** Full-width settings surface: defaults, named presets and worker limits.
+ *
+ * Everything is local state until Save; the effect below reseeds from the
+ * server whenever the saved values change (including after a save), so a
+ * Cancel/close never leaves stale text behind on the next open.
+ */
+function SettingsPanel({ settings, models, loading, error, onRetry, onClose }) {
+  const queryClient = useQueryClient()
+  const [model, setModel] = useState(() => ({
+    model: (settings && settings.default_model) || '',
+    provider: (settings && settings.default_provider) || '',
+  }))
+  const [rows, setRows] = useState(() => presetRowsFrom(settings))
+  const [maxWorkers, setMaxWorkers] = useState(() => Number(settings && settings.max_workers) || 2)
+  const [maxTurns, setMaxTurns] = useState(() => Number(settings && settings.chat_max_turns) || 120)
+  const [yolo, setYolo] = useState(() => !(settings && settings.worker_yolo === false))
+  const [notice, setNotice] = useState('')
+
+  const signature = useMemo(() => JSON.stringify({
+    model: (settings && settings.default_model) || '',
+    provider: (settings && settings.default_provider) || '',
+    presets: presetRowsFrom(settings),
+    workers: Number(settings && settings.max_workers) || 2,
+    turns: Number(settings && settings.chat_max_turns) || 120,
+    yolo: !(settings && settings.worker_yolo === false),
+  }), [settings])
+
+  useEffect(() => {
+    if (!settings) return
+    setModel({
+      model: settings.default_model || '',
+      provider: settings.default_provider || '',
+    })
+    setRows(presetRowsFrom(settings))
+    setMaxWorkers(Number(settings.max_workers) || 2)
+    setMaxTurns(Number(settings.chat_max_turns) || 120)
+    setYolo(settings.worker_yolo !== false)
+  }, [signature]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const edited = () => setNotice('')
+
+  const updateRow = (index, key, value) => {
+    edited()
+    setRows((current) => current.map((row, position) => (
+      position === index ? { ...row, [key]: value } : row
+    )))
+  }
+
+  const save = useMutation({
+    mutationFn: () => rest('/settings', {
+      method: 'POST',
+      body: {
+        default_model: String(model.model || '').trim(),
+        default_provider: String(model.provider || '').trim(),
+        model_presets: rows
+          .map((row) => ({
+            name: String(row.name || '').trim(),
+            model: String(row.model || '').trim(),
+            provider: String(row.provider || '').trim(),
+          }))
+          .filter((row) => !!row.model),
+        max_workers: Number(maxWorkers) || 1,
+        chat_max_turns: Number(maxTurns) || 1,
+        worker_yolo: !!yolo,
+      },
+    }),
+    onSuccess: (result) => {
+      if (result && result.ok === false) {
+        setNotice(String(result.error || result.detail || 'could not save settings'))
+        return
+      }
+      setNotice('Saved.')
+      queryClient.invalidateQueries({ queryKey: [ID, 'settings'] })
+      queryClient.invalidateQueries({ queryKey: [ID, 'models'] })
+      invalidateChats(queryClient)
+    },
+  })
+
+  const failure = notice && notice !== 'Saved.'
+    ? notice
+    : (errorText(save.error) || errorText(error))
+  const saved = notice === 'Saved.'
+
+  return jsxs('section', {
+    'aria-label': 'Settings',
+    className: cn('flex shrink-0 flex-col gap-2 overflow-y-auto rounded border',
+      'border-(--ui-stroke-secondary) p-3 max-h-[26rem]'),
+    children: [
+      jsxs('div', {
+        key: 'head', className: 'flex flex-wrap items-baseline justify-between gap-2',
+        children: [
+          jsxs('div', {
+            key: 'title', className: 'flex min-w-0 items-baseline gap-2',
+            children: [
+              jsx('span', { key: 'l', className: 'text-xs font-medium text-(--ui-text-secondary)', children: 'Settings' }),
+              jsx('span', {
+                key: 'h', className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-quaternary)',
+                children: 'defaults apply to new chats and worker launches',
+              }),
+            ],
+          }),
+          jsxs('div', {
+            key: 'actions', className: 'flex shrink-0 items-center gap-1',
+            children: [
+              jsx(GhostButton, {
+                key: 'save', disabled: save.isPending || loading, onClick: () => save.mutate(),
+                children: save.isPending ? 'Saving…' : 'Save',
+              }),
+              jsx(GhostButton, {
+                key: 'refresh', disabled: loading,
+                onClick: () => { setNotice(''); onRetry() },
+                children: 'Refresh',
+              }),
+              jsx(GhostButton, { key: 'cancel', onClick: onClose, children: 'Cancel' }),
+            ],
+          }),
+        ],
+      }),
+      saved || failure
+        ? jsx('div', {
+            key: 'notice',
+            className: cn('truncate text-[0.6875rem]', saved ? 'text-(--ui-text-tertiary)' : 'text-(--ui-text-quaternary)'),
+            title: failure || 'Saved.',
+            children: saved ? 'Saved.' : failure,
+          })
+        : null,
+      loading && !settings
+        ? jsx('div', { key: 'loading', className: 'px-1 py-2 text-xs text-(--ui-text-tertiary)', children: 'Loading settings…' })
+        : jsxs('div', {
+            key: 'columns', className: 'flex min-h-0 flex-col gap-3 md:flex-row',
+            children: [
+              jsxs('div', {
+                key: 'defaults', className: 'flex min-w-0 flex-col gap-2 md:w-[22rem] md:shrink-0',
+                children: [
+                  jsx('div', {
+                    key: 'label', className: 'text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
+                    children: 'Default model',
+                  }),
+                  jsxs('div', {
+                    key: 'picker', className: 'flex flex-wrap items-center gap-1',
+                    children: [
+                      jsx(ModelPicker, {
+                        value: model, models, disabled: save.isPending,
+                        onChange: (next) => {
+                          edited()
+                          setModel({ model: next.model || '', provider: next.provider || '' })
+                        },
+                      }),
+                      model.model
+                        ? jsx(GhostButton, {
+                            key: 'clear', title: 'Clear the default (let Hermes choose)',
+                            onClick: () => { edited(); setModel({ model: '', provider: '' }) },
+                            children: 'Inherit',
+                          })
+                        : null,
+                    ],
+                  }),
+                  jsxs('div', {
+                    key: 'provider', className: 'flex flex-wrap items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+                    children: [
+                      jsx('span', { key: 'p', children: model.provider ? `provider: ${model.provider}` : 'provider: auto (chosen by Hermes)' }),
+                      jsx('span', { key: 'n', children: 'No default means the CLI picks.' }),
+                    ],
+                  }),
+                  jsxs('label', {
+                    key: 'workers', className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+                    children: [
+                      jsx('span', { key: 'l', className: 'min-w-0 flex-1', children: 'Max parallel workers' }),
+                      jsx('input', {
+                        key: 'i', type: 'number', min: 1, max: 8, value: maxWorkers,
+                        'aria-label': 'Max parallel workers',
+                        onChange: (event) => { edited(); setMaxWorkers(event.target.value) },
+                        className: 'w-16 rounded border border-(--ui-stroke-secondary) bg-transparent px-1.5 py-1 text-[0.6875rem] text-(--ui-text-secondary) focus:outline-none',
+                      }),
+                    ],
+                  }),
+                  jsxs('label', {
+                    key: 'turns', className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+                    children: [
+                      jsx('span', { key: 'l', className: 'min-w-0 flex-1', children: 'Max turns per worker' }),
+                      jsx('input', {
+                        key: 'i', type: 'number', min: 1, max: 500, value: maxTurns,
+                        'aria-label': 'Max turns per worker',
+                        onChange: (event) => { edited(); setMaxTurns(event.target.value) },
+                        className: 'w-16 rounded border border-(--ui-stroke-secondary) bg-transparent px-1.5 py-1 text-[0.6875rem] text-(--ui-text-secondary) focus:outline-none',
+                      }),
+                    ],
+                  }),
+                  jsxs('label', {
+                    key: 'yolo', className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-tertiary)',
+                    children: [
+                      jsx('input', {
+                        key: 'i', type: 'checkbox', checked: !!yolo,
+                        'aria-label': 'Run workers unattended',
+                        onChange: (event) => { edited(); setYolo(!!event.target.checked) },
+                        className: 'accent-(--ui-accent)',
+                      }),
+                      jsx('span', { key: 'l', className: 'min-w-0 flex-1', children: 'Run workers unattended (--yolo)' }),
+                    ],
+                  }),
+                  jsx('div', {
+                    key: 'yolo-help', className: 'text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
+                    children: 'Skips approval prompts inside a turn; workers still never commit, push or merge. 1–8 workers, 1–500 turns.',
+                  }),
+                ],
+              }),
+              jsxs('div', {
+                key: 'presets', className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-1',
+                children: [
+                  jsxs('div', {
+                    key: 'label', className: 'flex items-baseline justify-between gap-2',
+                    children: [
+                      jsx('span', {
+                        key: 'l', className: 'text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
+                        children: 'Model presets',
+                      }),
+                      jsx('span', {
+                        key: 'n', className: 'text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
+                        children: `${rows.length}/${MAX_PRESET_ROWS}`,
+                      }),
+                    ],
+                  }),
+                  jsx('div', {
+                    key: 'hint', className: 'text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
+                    children: SETTINGS_HINT,
+                  }),
+                  rows.length
+                    ? jsx('div', {
+                        key: 'rows', className: 'flex min-h-0 flex-col gap-1 overflow-y-auto pr-1',
+                        children: rows.map((row, index) => jsxs('div', {
+                          key: `preset-${index}`, className: 'flex min-w-0 items-center gap-1',
+                          children: [
+                            jsx('input', {
+                              key: 'name', type: 'text', value: row.name, placeholder: 'name',
+                              'aria-label': `Preset ${index + 1} name`, autoComplete: 'off',
+                              onChange: (event) => updateRow(index, 'name', event.target.value),
+                              className: cn(GITHUB_FIELD, 'w-24 shrink-0'),
+                            }),
+                            jsx('input', {
+                              key: 'model', type: 'text', value: row.model, placeholder: 'model',
+                              'aria-label': `Preset ${index + 1} model`, autoComplete: 'off',
+                              onChange: (event) => updateRow(index, 'model', event.target.value),
+                              className: cn(GITHUB_FIELD, 'min-w-0 flex-1'),
+                            }),
+                            jsx('input', {
+                              key: 'provider', type: 'text', value: row.provider, placeholder: 'provider',
+                              'aria-label': `Preset ${index + 1} provider`, autoComplete: 'off',
+                              onChange: (event) => updateRow(index, 'provider', event.target.value),
+                              className: cn(GITHUB_FIELD, 'w-28 shrink-0'),
+                            }),
+                            jsx(GhostButton, {
+                              key: 'remove', className: 'shrink-0', title: 'Remove this preset',
+                              onClick: () => {
+                                edited()
+                                setRows((current) => current.filter((_, position) => position !== index))
+                              },
+                              children: '×',
+                            }),
+                          ],
+                        })),
+                      })
+                    : jsx('div', {
+                        key: 'empty', className: 'px-1 py-2 text-xs text-(--ui-text-tertiary)',
+                        children: 'No presets yet — the built-in picker list is used.',
+                      }),
+                  jsx('div', {
+                    key: 'add', className: 'flex items-center gap-2',
+                    children: jsx(GhostButton, {
+                      disabled: rows.length >= MAX_PRESET_ROWS,
+                      onClick: () => { edited(); setRows((current) => current.concat([blankPreset()])) },
+                      children: '+ Add preset',
+                    }),
+                  }),
+                ],
+              }),
+            ],
+          }),
+    ],
+  })
+}
+
 // -- composer ---------------------------------------------------------------
+
+/** Named preset chips above the composer. Picking one fills the model and
+ *  leaves the ModelPicker available for an ad-hoc choice. */
+function PresetChips({ presets, active, disabled, onPick }) {
+  const list = Array.isArray(presets) ? presets : []
+  if (!list.length) return null
+  return jsxs('div', {
+    role: 'group', 'aria-label': 'Model presets',
+    className: 'flex flex-wrap items-center gap-1',
+    children: [
+      jsx('span', { key: 'l', className: 'shrink-0 pr-0.5', children: 'Preset' }),
+      ...list.map((preset) => {
+        const name = String(preset.name || '')
+        const selected = name === active
+        return jsx('button', {
+          key: name,
+          type: 'button',
+          'aria-pressed': selected,
+          disabled,
+          title: presetLabelText(preset),
+          onClick: () => onPick(preset),
+          className: cn('rounded border px-1.5 py-0.5 text-[0.6875rem]',
+            selected
+              ? 'border-(--ui-stroke-secondary) bg-(--chrome-action-hover) text-(--ui-text-secondary)'
+              : 'border-transparent text-(--ui-text-quaternary) hover:border-(--ui-stroke-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)',
+            disabled && 'opacity-50'),
+          children: name,
+        })
+      }),
+    ],
+  })
+}
+
+/** `provider: model` for a preset (mirrors the backend's label). */
+function presetLabelText(preset) {
+  const name = String((preset && preset.model) || '')
+  const provider = String((preset && preset.provider) || '')
+  if (provider && name) return `${provider}: ${name}`
+  return name || provider
+}
 
 function Composer(props) {
   const { mode, session, draft, onDraft, onSend, onStop, pending, stopPending, error,
     model, onModelChange, repo, onRepoChange, models, inputRef,
-    onSessionModel, modelPending } = props
+    onSessionModel, modelPending, presets, presetName, onPreset } = props
   const busy = isBusy(session)
   const canSend = !!String(draft || '').trim() && !pending && !busy
   const placeholder = mode === 'session'
@@ -767,6 +1123,11 @@ function Composer(props) {
     className: 'flex flex-col gap-1.5',
     children: [
       error ? jsx('div', { key: 'err', className: 'truncate text-[0.6875rem] text-(--ui-text-quaternary)', children: error }) : null,
+      mode === 'new'
+        ? jsx(PresetChips, {
+            key: 'presets', presets, active: presetName, disabled: pending, onPick: onPreset,
+          })
+        : null,
       jsxs('div', {
         key: 'row', className: 'flex items-end gap-2',
         children: [
@@ -1234,6 +1595,10 @@ function GithubPanel({ status, prs, prsLoading, onSelectSession }) {
                 onChange: (event) => setAllowed(event.target.value),
                 className: GITHUB_FIELD,
               }),
+              jsx('div', {
+                key: 'allowed-help', className: 'text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
+                children: 'Only these users can trigger work; the agent ignores its own comments — add a teammate or a second account.',
+              }),
               jsxs('div', {
                 key: 'mode', className: 'flex items-center gap-1 text-[0.6875rem] text-(--ui-text-quaternary)',
                 children: [
@@ -1309,6 +1674,78 @@ function GithubPanel({ status, prs, prsLoading, onSelectSession }) {
   })
 }
 
+// -- onboarding -------------------------------------------------------------
+
+const ONBOARDING_STEPS = [
+  {
+    title: 'Pick a model / preset',
+    hint: 'Set a default in Settings, or tap a preset chip before your first chat.',
+    action: 'Open settings',
+    key: 'settings',
+  },
+  {
+    title: 'Connect a GitHub repo to watch PRs',
+    hint: 'An empty allow-list means nobody can trigger work, and the agent ignores its own comments.',
+    action: 'Open GitHub',
+    key: 'github',
+  },
+  {
+    title: 'Start a chat below',
+    hint: 'Describe the work, pick a repo if you want one, then press Enter.',
+    action: '',
+    key: 'chat',
+  },
+]
+
+/** Compact first-run card: three numbered steps, dismissible for good. */
+function OnboardingCard({ onSettings, onGithub, onStart, onDismiss }) {
+  const actions = { settings: onSettings, github: onGithub, chat: onStart }
+  return jsxs('section', {
+    'aria-label': 'Getting started',
+    className: cn('flex shrink-0 flex-col gap-1.5 rounded border border-(--ui-stroke-secondary)',
+      'bg-transparent p-2.5 text-xs'),
+    children: [
+      jsxs('div', {
+        key: 'head', className: 'flex items-baseline justify-between gap-2',
+        children: [
+          jsx('span', { key: 't', className: 'font-medium text-(--ui-text-secondary)', children: 'Get started' }),
+          jsx(GhostButton, {
+            key: 'dismiss', className: 'shrink-0 px-1 py-0', title: 'Dismiss getting started',
+            'aria-label': 'Dismiss getting started', onClick: onDismiss, children: '×',
+          }),
+        ],
+      }),
+      ...ONBOARDING_STEPS.map((step, index) => jsxs('div', {
+        key: step.key, className: 'flex min-w-0 items-start gap-2',
+        children: [
+          jsx('span', {
+            key: 'n',
+            className: cn('mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full',
+              'border border-(--ui-stroke-secondary) text-[0.625rem] tabular-nums text-(--ui-text-tertiary)'),
+            children: String(index + 1),
+          }),
+          jsxs('div', {
+            key: 'body', className: 'flex min-w-0 flex-1 flex-col gap-0.5',
+            children: [
+              jsx('span', { key: 't', className: 'text-(--ui-text-secondary)', children: step.title }),
+              jsx('span', {
+                key: 'h', className: 'text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
+                children: step.hint,
+              }),
+            ],
+          }),
+          step.action
+            ? jsx(GhostButton, {
+                key: 'a', className: 'shrink-0 self-center', onClick: actions[step.key],
+                children: step.action,
+              })
+            : null,
+        ],
+      })),
+    ],
+  })
+}
+
 // -- page -------------------------------------------------------------------
 
 function SuperagentPage() {
@@ -1322,7 +1759,11 @@ function SuperagentPage() {
   }))
   const [repo, setRepo] = useState(() => readStored('lastRepo', ''))
   const [githubOpen, setGithubOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [presetName, setPresetName] = useState('')
+  const [onboarded, setOnboarded] = useState(() => readStored('onboarded', '') === '1')
   const detail = useChat(selectedId)
+  const settingsQuery = useSettings(settingsOpen)
   const inputRef = useRef(null)
 
   const data = chatsQuery.data
@@ -1407,7 +1848,10 @@ function SuperagentPage() {
     writeStored('lastProvider', model.provider)
     writeStored('lastRepo', repo)
     createChat.mutate(
-      { prompt: text, model: model.model, provider: model.provider, repo },
+      {
+        prompt: text, model: model.model, provider: model.provider, repo,
+        preset: presetName || undefined,
+      },
       { onSuccess: () => setDraft('') },
     )
   }
@@ -1417,15 +1861,42 @@ function SuperagentPage() {
     setDraft('')
   }
 
-  const newChat = () => {
-    setSelectedId(null)
-    setDraft('')
-    setModel({ model: readStored('lastModel', ''), provider: readStored('lastProvider', '') })
-    setRepo(readStored('lastRepo', ''))
+  const pickPreset = (preset) => {
+    if (!preset) return
+    setPresetName(String(preset.name || ''))
+    setModel({
+      model: String(preset.model || ''),
+      provider: String(preset.provider || ''),
+    })
+  }
+
+  const changeModel = (next) => {
+    // An ad-hoc pick is no longer the named preset; the chip clears.
+    setPresetName('')
+    setModel(next)
+  }
+
+  const dismissOnboarding = () => {
+    setOnboarded(true)
+    writeStored('onboarded', '1')
+  }
+
+  const startChat = () => {
     if (typeof window !== 'undefined') {
       window.setTimeout(() => { if (inputRef.current) inputRef.current.focus() }, 0)
     }
   }
+
+  const newChat = () => {
+    setSelectedId(null)
+    setDraft('')
+    setPresetName('')
+    setModel({ model: readStored('lastModel', ''), provider: readStored('lastProvider', '') })
+    setRepo(readStored('lastRepo', ''))
+    startChat()
+  }
+
+  const presetList = (modelsQuery.data && modelsQuery.data.presets) || []
 
   const refresh = () => {
     chatsQuery.refetch()
@@ -1462,6 +1933,13 @@ function SuperagentPage() {
           jsxs('div', {
             key: 'actions', className: 'flex items-center gap-1',
             children: [
+              jsx(GhostButton, {
+                key: 'settings',
+                title: 'Settings: default model, presets and worker limits',
+                'aria-label': 'Settings', 'aria-expanded': !!settingsOpen,
+                onClick: () => setSettingsOpen((value) => !value),
+                children: '⚙',
+              }),
               jsx(GithubButton, {
                 key: 'github', open: githubOpen, status: githubQuery.data,
                 onClick: () => setGithubOpen((value) => !value),
@@ -1488,6 +1966,23 @@ function SuperagentPage() {
             onSelectSession: select,
           })
         : null,
+      settingsOpen
+        ? jsx(SettingsPanel, {
+            key: 'settings-panel', settings: settingsQuery.data, models: modelsQuery.data,
+            loading: settingsQuery.isLoading, error: settingsQuery.error,
+            onRetry: () => settingsQuery.refetch(),
+            onClose: () => setSettingsOpen(false),
+          })
+        : null,
+      !chatsQuery.isLoading && !onboarded && sessions.length === 0
+        ? jsx(OnboardingCard, {
+            key: 'onboarding',
+            onSettings: () => setSettingsOpen(true),
+            onGithub: () => setGithubOpen(true),
+            onStart: startChat,
+            onDismiss: dismissOnboarding,
+          })
+        : null,
       jsxs('div', {
         key: 'body', className: 'flex min-h-0 flex-1 flex-col gap-3 md:flex-row',
         children: [
@@ -1496,9 +1991,10 @@ function SuperagentPage() {
             key: 'center', summary: selectedSummary, detail,
             draft, onDraft: setDraft, onSend: submit, onStop: stop,
             pending, stopPending, error: failure,
-            model, onModelChange: setModel, repo, onRepoChange: setRepo,
+            model, onModelChange: changeModel, repo, onRepoChange: setRepo,
             models: modelsQuery.data, inputRef,
             onSessionModel: changeSessionModel, modelPending: setChatModel.isPending,
+            presets: presetList, presetName, onPreset: pickPreset,
           }),
           jsx(LiveWorkers, { key: 'workers', sessions, onSelect: select }),
         ],

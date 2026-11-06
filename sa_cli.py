@@ -50,7 +50,7 @@ _RUNNERS_LOCK = threading.Lock()
 USAGE = (
     "usage: hermes superagent "
     "<status|tick|ask <request>|run <ticket-id>|show <ticket-id|session-id>|"
-    "chat <prompt>|sessions|stop <session-id>|models|"
+    "chat <prompt>|sessions|stop <session-id>|models|settings|"
     "github <status|test|connect|disconnect|prs|poll|work <number>>|doctor> [--json]"
 )
 
@@ -167,12 +167,8 @@ def _config(ctx: Any, key: str, default: Any) -> Any:
         return default
 
 
-def _as_list(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [part.strip() for part in value.split(",") if part.strip()]
-    if isinstance(value, (list, tuple)):
-        return [str(part).strip() for part in value if str(part).strip()]
-    return []
+def _default_presets() -> list[dict[str, str]]:
+    return [{"name": name, "model": name, "provider": ""} for name in DEFAULT_MODEL_PRESETS]
 
 
 def models_payload(ctx: Any) -> dict:
@@ -181,12 +177,44 @@ def models_payload(ctx: Any) -> dict:
     provider = _env("SUPERAGENT_DEFAULT_PROVIDER") or str(
         _config(ctx, "default_provider", "") or ""
     ).strip()
-    presets = _env_list("SUPERAGENT_MODEL_PRESETS", DEFAULT_MODEL_PRESETS)
-    if not os.environ.get("SUPERAGENT_MODEL_PRESETS"):
-        configured = _as_list(_config(ctx, "model_presets", []))
-        if configured:
-            presets = configured
-    return {"default_model": model, "default_provider": provider, "models": presets}
+    presets: list[dict[str, str]] = []
+    env_presets = os.environ.get("SUPERAGENT_MODEL_PRESETS")
+    if env_presets:
+        presets = sa_settings.normalize_presets(env_presets)
+    if not presets:
+        configured = _config(ctx, "model_presets", [])
+        presets = sa_settings.normalize_presets(configured) if configured else []
+    if not presets:
+        # The desktop settings panel writes settings.json; `models` and
+        # `chat --preset` must see the same catalog the panel shows.
+        try:
+            presets = sa_settings.normalize_presets(
+                sa_settings.load_settings().get("model_presets")
+            )
+        except Exception:
+            presets = []
+    if not presets:
+        presets = _default_presets()
+    return {
+        "default_model": model,
+        "default_provider": provider,
+        "models": list(dict.fromkeys(preset["model"] for preset in presets)),
+        "presets": presets,
+    }
+
+
+def preset_label(preset: dict) -> str:
+    """`provider: model` for one preset (or just the model)."""
+    name = str((preset or {}).get("model") or "")
+    provider = str((preset or {}).get("provider") or "")
+    return f"{provider}: {name}" if provider and name else (name or provider)
+
+
+def find_preset(presets: list[dict], name: str) -> dict | None:
+    for preset in presets:
+        if str((preset or {}).get("name") or "") == name:
+            return preset
+    return None
 
 
 def render_models(data: dict) -> str:
@@ -196,12 +224,71 @@ def render_models(data: dict) -> str:
         "",
         "presets:",
     ]
-    presets = data.get("models") or []
+    presets = data.get("presets") or [
+        {"name": name, "model": name, "provider": ""} for name in data.get("models") or []
+    ]
     if presets:
-        lines.extend(f"  - {name}" for name in presets)
+        for preset in presets:
+            name = str(preset.get("name") or "")
+            label = preset_label(preset)
+            lines.append(f"  - {name} -> {label}")
     else:
         lines.append("  (none)")
     return "\n".join(lines)
+
+
+def render_settings(data: dict) -> str:
+    """Human view of the merged settings; the token is only ever `set`/`unset`."""
+    def line(label: str, value: Any, empty: str = "(unset)") -> str:
+        if isinstance(value, (list, tuple)):
+            text = ", ".join(str(item) for item in value) if value else "(none)"
+        else:
+            text = "" if value is None else str(value).strip()
+            text = text or empty
+        return f"  {label:<20} {text}"
+
+    presets = data.get("model_presets") or []
+    lines = ["Superagent settings"]
+    for key, label in (
+        ("mode", "mode"),
+        ("repo_path", "repo path"),
+        ("default_model", "default model"),
+        ("default_provider", "default provider"),
+        ("max_workers", "max workers"),
+        ("worker_yolo", "worker yolo"),
+        ("chat_max_turns", "chat max turns"),
+        ("github_repo", "GitHub repo"),
+        ("github_agent_login", "GitHub agent login"),
+        ("github_allowed_users", "GitHub allowed"),
+        ("github_watch_mode", "GitHub watch mode"),
+        ("github_watch_new_prs", "GitHub new PRs"),
+        ("github_poll_seconds", "GitHub poll (s)"),
+    ):
+        lines.append(line(label, data.get(key)))
+    lines.append(line("GitHub token", "set (value never shown)" if data.get("github_token_set") else "not set"))
+    if presets:
+        lines.append("  model presets:")
+        for preset in presets:
+            name = str(preset.get("name") or "")
+            label = preset_label(preset)
+            lines.append(f"    - {name} -> {label}")
+    else:
+        lines.append("  model presets:      (none; built-in picker list is used)")
+    return "\n".join(lines)
+
+
+def run_settings(want_json: bool) -> int:
+    """`hermes superagent settings`: print merged settings, never the token."""
+    try:
+        data = sa_settings.public_settings()
+    except Exception as exc:
+        print(f"error: settings failed: {exc}")
+        return 1
+    if want_json:
+        print(json.dumps(data, indent=2, default=str))
+    else:
+        print(render_settings(data))
+    return 0
 
 
 # -- GitHub CLI ------------------------------------------------------------
@@ -597,8 +684,27 @@ def _launch_chat(args: argparse.Namespace, ctx: Any, engine: Any, want_json: boo
         return 2
 
     defaults = models_payload(ctx)
-    model = (getattr(args, "model", "") or "").strip() or defaults["default_model"]
-    provider = (getattr(args, "provider", "") or "").strip() or defaults["default_provider"]
+    preset_name = (getattr(args, "preset", "") or "").strip()
+    preset = None
+    if preset_name:
+        preset = find_preset(defaults.get("presets") or [], preset_name)
+        if preset is None:
+            available = ", ".join(
+                str(item.get("name") or "") for item in defaults.get("presets") or []
+            ) or "(none configured)"
+            print(f"error: unknown preset '{preset_name}'. Available: {available}")
+            return 2
+    # Explicit flags win, then the named preset, then the configured default.
+    model = (
+        (getattr(args, "model", "") or "").strip()
+        or str((preset or {}).get("model") or "")
+        or defaults["default_model"]
+    )
+    provider = (
+        (getattr(args, "provider", "") or "").strip()
+        or str((preset or {}).get("provider") or "")
+        or defaults["default_provider"]
+    )
     repo = (
         (getattr(args, "repo", "") or "").strip()
         or _env("SUPERAGENT_REPO")
@@ -612,6 +718,9 @@ def _launch_chat(args: argparse.Namespace, ctx: Any, engine: Any, want_json: boo
             prompt, title=title, model=model, provider=provider, repo=repo, source="cli"
         )
         session_id = session["id"]
+        if preset is not None:
+            label = preset_label(preset)
+            store.add_event(session_id, "preset", f"{preset_name} -> {label}")
     except Exception as exc:
         print(f"error: chat failed: {exc}")
         return 1
@@ -1114,6 +1223,9 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
     chat_p.add_argument("prompt", nargs="+", help="What the worker should do")
     chat_p.add_argument("--model", default="", help="Model override for this session")
     chat_p.add_argument("--provider", default="", help="Provider override for this session")
+    chat_p.add_argument(
+        "--preset", default="", help="Named model preset (see `hermes superagent models`)"
+    )
     chat_p.add_argument("--repo", default="", help="Repository the worker may edit")
     chat_p.add_argument("--title", default="", help="Session title (default: first prompt line)")
     chat_p.add_argument(
@@ -1130,6 +1242,8 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
     _add_json_flag(stop_p)
     models_p = subs.add_parser("models", help="Show the default model, provider and presets")
     _add_json_flag(models_p)
+    settings_p = subs.add_parser("settings", help="Show merged settings (read-only)")
+    _add_json_flag(settings_p)
     github_p = subs.add_parser(
         "github", help="Connect GitHub and work on pull requests from the terminal"
     )
@@ -1164,6 +1278,10 @@ def run(args: argparse.Namespace, ctx: Any) -> int:
         data = models_payload(ctx)
         print(json.dumps(data, indent=2) if want_json else render_models(data))
         return 0
+
+    # `settings` is read-only and likewise needs no ticket engine.
+    if command == "settings":
+        return run_settings(want_json)
 
     # `github` talks to sa_settings/sa_github/GitHubWatcher directly: it needs
     # no ticket engine (and no HTTP layer), so it also works before anyone has

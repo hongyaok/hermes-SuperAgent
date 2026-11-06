@@ -507,7 +507,14 @@ def test_models_json_shape(sa, monkeypatch, capsys):
     rc = sa.sa_cli.run(_args(superagent_command="models", json=True), object())
     data = json.loads(capsys.readouterr().out)
     assert rc == 0
-    assert data == {"default_model": "m1", "default_provider": "p1", "models": ["a", "b"]}
+    assert data["default_model"] == "m1"
+    assert data["default_provider"] == "p1"
+    assert data["models"] == ["a", "b"]
+    # Presets keep the historical flat list working but add the named view.
+    assert data["presets"] == [
+        {"name": "a", "model": "a", "provider": ""},
+        {"name": "b", "model": "b", "provider": ""},
+    ]
 
 
 def test_chat_session_commands_accept_json_in_both_positions(sa):
@@ -620,3 +627,145 @@ def test_chat_detach_returns_without_waiting(
     assert runner.launched[0]["block"] is False
     assert "queued" in out
     assert "follow:" in out  # detached output is the short header, not a transcript
+
+
+# -- model presets + settings command (v0.4) -------------------------------
+
+
+@pytest.fixture
+def cli_settings_home(sa, tmp_path, monkeypatch):
+    """Point the CLI's settings loader at a throwaway Hermes home."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setattr(sa.sa_settings, "_hermes_home", lambda: home)
+    monkeypatch.setattr(sa.sa_settings, "config_path", lambda: home / "config.yaml")
+    for name in sa.sa_settings.ENV_VARS.values():
+        monkeypatch.delenv(name, raising=False)
+    sa.sa_settings.clear_cache()
+    yield home
+    sa.sa_settings.clear_cache()
+
+
+def test_models_text_lists_named_presets(sa, monkeypatch, capsys, cli_settings_home):
+    sa.sa_settings.save_settings(
+        {"model_presets": ["fast=opencode-go:qwen/qwen3.8-27b", {"name": "strong", "model": "glm"}]}
+    )
+
+    rc = sa.sa_cli.run(_args(superagent_command="models"), object())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "fast -> opencode-go: qwen/qwen3.8-27b" in out
+    assert "strong -> glm" in out
+
+
+def test_chat_preset_resolves_model_and_provider(
+    sa, store, fake_executor, monkeypatch, capsys, cli_settings_home
+):
+    sa.sa_settings.save_settings({"model_presets": ["fast=opencode-go:qwen/qwen3.8-27b"]})
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    runner = _patch_runner(sa, monkeypatch, FakeRunner())
+
+    rc = sa.sa_cli.run(_chat_args(prompt=["Fix", "it"], preset="fast"), object())
+    assert rc == 0
+    capsys.readouterr()
+    call = runner.launched[0]
+    assert call["model"] == "qwen/qwen3.8-27b"
+    assert call["provider"] == "opencode-go"
+    session = sa.sa_chats.ChatStore(store.path).get_session(call["session_id"])
+    assert session["model"] == "qwen/qwen3.8-27b"
+    assert session["provider"] == "opencode-go"
+    assert "preset" in [event["kind"] for event in session["events"]]
+
+
+def test_chat_preset_keeps_explicit_flags_wins(
+    sa, store, fake_executor, monkeypatch, capsys, cli_settings_home
+):
+    sa.sa_settings.save_settings({"model_presets": ["fast=opencode-go:qwen/qwen3.8-27b"]})
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    runner = _patch_runner(sa, monkeypatch, FakeRunner())
+
+    rc = sa.sa_cli.run(
+        _chat_args(
+            prompt=["Fix", "it"], preset="fast", model="explicit", provider="explicit-provider"
+        ),
+        object(),
+    )
+    assert rc == 0
+    capsys.readouterr()
+    call = runner.launched[0]
+    assert call["model"] == "explicit"
+    assert call["provider"] == "explicit-provider"
+
+
+def test_chat_unknown_preset_exits_2_with_available_names(
+    sa, store, fake_executor, monkeypatch, capsys, cli_settings_home
+):
+    sa.sa_settings.save_settings({"model_presets": ["fast=one", "strong=two"]})
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    runner = _patch_runner(sa, monkeypatch, FakeRunner())
+
+    rc = sa.sa_cli.run(_chat_args(prompt=["Fix", "it"], preset="missing"), object())
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "unknown preset 'missing'" in out
+    assert "fast" in out and "strong" in out
+    assert runner.launched == []
+    assert sa.sa_chats.ChatStore(store.path).list_sessions()["sessions"] == []
+
+
+def test_settings_text_prints_merged_values_and_masks_the_token(
+    sa, capsys, cli_settings_home
+):
+    sa.sa_settings.save_settings(
+        {
+            "mode": "auto",
+            "github_token": "ghp_secret_value",
+            "github_repo": "owner/name",
+            "model_presets": ["fast=opencode-go:qwen/qwen3.8-27b"],
+        }
+    )
+
+    rc = sa.sa_cli.run(_args(superagent_command="settings"), object())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Superagent settings" in out
+    assert "mode" in out and "auto" in out
+    assert "owner/name" in out
+    assert "fast -> opencode-go: qwen/qwen3.8-27b" in out
+    assert "ghp_secret_value" not in out
+    assert "GitHub token" in out and "set (value never shown)" in out
+
+
+def test_settings_json_never_includes_the_token(sa, capsys, cli_settings_home):
+    sa.sa_settings.save_settings({"github_token": "ghp_secret_value"})
+
+    rc = sa.sa_cli.run(_args(superagent_command="settings", json=True), object())
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert rc == 0
+    assert data["github_token_set"] is True
+    assert "github_token" not in data
+    assert "ghp_secret_value" not in out
+    assert data["max_workers"] == 2
+
+
+def test_settings_command_needs_no_engine(sa, monkeypatch, capsys, cli_settings_home):
+    def boom(ctx):
+        raise RuntimeError("engine should not start")
+
+    monkeypatch.setattr(sa.sa_cli.sa_engine, "build_engine", boom)
+    rc = sa.sa_cli.run(_args(superagent_command="settings"), object())
+    assert rc == 0
+    assert "Superagent settings" in capsys.readouterr().out
+
+
+def test_parser_registers_preset_and_settings(sa):
+    parser = argparse.ArgumentParser(prog="hermes superagent")
+    sa.sa_cli.setup_cli(parser)
+    ns = parser.parse_args(["chat", "hello", "--preset", "fast"])
+    assert ns.preset == "fast"
+    ns = parser.parse_args(["settings", "--json"])
+    assert ns.superagent_command == "settings" and ns.json is True
