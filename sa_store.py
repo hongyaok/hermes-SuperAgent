@@ -141,18 +141,28 @@ class Store:
             row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
-    def list(self, status: Optional[str] = None, limit: int = 50) -> list[dict]:
+    def list_tickets(self, status: Optional[str] = None, limit: int = 50) -> list[dict]:
+        """Read-only sessions helper: list tickets, optionally filtered by status.
+
+        ``status`` accepts a single status or a comma-separated set
+        (e.g. ``\"queued,running\"``). No schema change; pure SELECT.
+        """
         query = "SELECT * FROM tickets"
         params: list[Any] = []
         if status:
-            placeholders = ", ".join("?" for _ in status.split(","))
-            query += f" WHERE status IN ({placeholders})"
-            params.extend(status.split(","))
+            statuses = [s.strip() for s in status.split(",") if s.strip()]
+            if statuses:
+                placeholders = ", ".join("?" for _ in statuses)
+                query += f" WHERE status IN ({placeholders})"
+                params.extend(statuses)
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def list(self, status: Optional[str] = None, limit: int = 50) -> list[dict]:
+        return self.list_tickets(status=status, limit=limit)
 
     def count_by_status(self) -> dict[str, int]:
         with self._connect() as conn:
@@ -168,13 +178,17 @@ class Store:
                 (ticket_id, kind, detail, time.time()),
             )
 
-    def events(self, ticket_id: str, limit: int = 20) -> list[dict]:
+    def get_events(self, ticket_id: str, limit: int = 20) -> list[dict]:
+        """Read-only sessions helper: fetch the audit trail for one ticket."""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM events WHERE ticket_id = ? ORDER BY id DESC LIMIT ?",
                 (ticket_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def events(self, ticket_id: str, limit: int = 20) -> list[dict]:
+        return self.get_events(ticket_id, limit=limit)
 
     # -- key/value state -------------------------------------------------
 

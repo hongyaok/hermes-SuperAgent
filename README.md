@@ -87,6 +87,12 @@ hermes superagent ask "Add unit tests for token expiration edge cases"
 # Poll sources and record new tickets (does not launch workers from CLI)
 hermes superagent tick
 
+# Approve a ticket (moves to queued; worker starts on the next agent turn)
+hermes superagent run T-0001
+
+# Show full detail and history for one ticket
+hermes superagent show T-0001
+
 # Verify configuration, repo existence, and worker lifecycle availability
 hermes superagent doctor
 ```
@@ -119,7 +125,23 @@ The plugin ships a unified desktop extension (`desktop/plugin.js`) and a read-on
 - `GET /api/plugins/superagent/tickets?limit=30` — status counts, `"Needs you"` attention list, and recent tickets.
 - `GET /api/plugins/superagent/tickets/{ticket_id}` — full ticket details and event log.
 
+The desktop side shows two views over the same data:
+
+- **Attention tab** — `observed` / `blocked` / `review` / `failed` tickets that need a human decision.
+- **Sessions tab** — the full sessions list (`Engine.sessions()`), with status, requester, request/result previews, event count, timestamps and elapsed time, plus `running` / `queued` counts. Selecting a row calls the ticket-detail view (`Engine.get_ticket_detail()` / `GET /tickets/{id}`).
+
 Enable the desktop view under **Desktop -> Settings -> Plugins -> Superagent** (then reload desktop plugins) to see the status bar chip and attention panel.
+
+### 6. Sessions Enrichment API (`Engine.sessions` / `get_ticket_detail`)
+
+For programmatic and UI use, the engine exposes a read-only sessions layer (no behavior change to `ask` / `tick` / `promote`):
+
+```python
+engine.sessions(limit=50, status=None)   # {"sessions": [...], "counts": {...}, "running": N, "queued": N}
+engine.get_ticket_detail("T-0001")       # full ticket dict + "events" list; raises KeyError when missing
+```
+
+Each session row contains `id`, `status`, `source`, `requester`, `request` (160-char preview), `reason`, `error`, `handle`, `result_preview` (200-char preview), `event_count`, `created_at` / `updated_at` / `started_at`, and `elapsed_secs` (now minus `started_at`, falling back to `created_at`). The store helpers behind it (`Store.list_tickets(status, limit)`, `Store.get_events(ticket_id)`, `Store.count_by_status()`) are pure `SELECT`s with no schema change.
 
 ---
 
