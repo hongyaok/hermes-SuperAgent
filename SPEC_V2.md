@@ -1,4 +1,4 @@
-# Superagent v0.2 — chat sessions and headless workers
+# Superagent v0.2/v0.3 — chat sessions, headless workers and GitHub PR watch
 
 Superagent 0.1 treated every request as a ticket: a rule-based router decided
 whether work was worth doing, and a Hermes subagent did it. v0.2 keeps that
@@ -32,6 +32,7 @@ additive tables next to the ticket tables:
 | `chat_sessions` | id, title, prompt, status, model, provider, repo, hermes_session_id, source, github_repo, pr_number, pr_url, pid, tokens, duration_ms, error, last_event, timestamps |
 | `chat_messages` | one row per user/assistant message (content capped at 20 000 chars) |
 | `chat_events`   | audit trail: created, queued, started, tool, tool_error, result, review, failed, cancelled (detail capped at 2 000 chars) |
+| `gh_seen`       | GitHub dedupe keys (`key`, `seen_at`): comment ids, PR head SHAs, per-repo baselines |
 
 Ids are readable and sequential (`S-0001`) and allocated from the existing
 `state` table under `chat_seq` inside `BEGIN IMMEDIATE`. Titles come from the
@@ -39,7 +40,8 @@ first line of the prompt (80 chars) unless one is supplied.
 
 Statuses: `queued` (waiting for a worker slot), `running`, `review` (a turn
 finished; a human should look at the work), `idle` (turn finished, waiting for
-the next message), `failed`, `cancelled`.
+the next message), `observed` (a recorded GitHub request nobody launched yet),
+`failed`, `cancelled`.
 
 ## Runner (`sa_runner.py`)
 
@@ -88,13 +90,77 @@ The Runner is a lazy module-level singleton keyed by database path
 (`_get_runner()`), so repeated requests share one semaphore and one set of
 threads. Tests patch `_db_path` and `_get_runner`.
 
+## GitHub watch (v0.3)
+
+Three modules add a GitHub path without touching the ticket schema:
+
+- **`sa_settings.py`** — one loader for the dashboard and the CLI. Layers:
+  `DEFAULTS` (mirroring `plugin.yaml`) < `plugins.entries.superagent.settings`
+  in the Hermes `config.yaml` < `<data_dir>/settings.json` (written by the
+  connect form) < environment. The merged result is cached for 5 s keyed by
+  both file mtimes and the environment. `save_settings()` merges a patch into
+  `settings.json` with a temp file + `os.replace` and chmod 600 where supported;
+  unknown keys are rejected. An empty or `${...}` token falls back to
+  `SUPERAGENT_GITHUB_TOKEN`; the token is never returned by `public_settings()`
+  or an HTTP route.
+- **`sa_github.py`** — stdlib `urllib` REST client bound to one repository:
+  `me`, `repo_info`, `list_open_prs`, `get_pr`, `list_comments` (issue +
+  review comments merged, oldest first), `post_comment`. `GitHubError` carries
+  the HTTP status and never the token. `is_trigger()` accepts `@<login>`,
+  `@superagent`, `/superagent`, or a `superagent:` line; `is_bot()` knows the
+  `[bot]` suffix plus `github-actions`/`dependabot`.
+  `prepare_pr_checkout()` fetches `+refs/pull/<n>/head:refs/superagent/pr-<n>`
+  into the local clone with a one-shot `http.extraHeader` credential, then
+  creates a detached `git worktree add --detach <workspace>/pr-<n>`; the git
+  call is injectable for tests. `build_pr_prompt()` writes the PR context, the
+  triggering comment, the checkout path, the `git diff origin/<base>...HEAD`
+  hint, the no-commit rules and the 200-word summary request.
+- **`sa_watcher.py`** — `GitHubWatcher(store, runner, settings_getter,
+  client_factory)`. `poll_once()` fetches the open PRs, reads every PR's
+  comments, and acts only on unseen items. The first successful poll for a
+  repository is a **baseline**: it marks every comment and PR head seen without
+  creating sessions. Later, an unseen comment from an allowed human that
+  triggers is marked seen and becomes a session; a new PR head becomes one
+  review session per SHA when `github_watch_new_prs` is on. In `observe` mode
+  sessions are `observed`; in `auto` mode they are `queued`, the PR checkout is
+  prepared when `repo_path` is set, and the runner is launched with the
+  checkout (falling back to `repo_path`, or failing the session). A single
+  daemon thread polls every `github_poll_seconds`; `start_background()` is
+  idempotent and `last_poll` is mirrored to `state['gh_last_poll:<repo>']`.
+  Dedupe keys: `gh_baseline:<repo>`, `gh_comment:<repo>:<kind>:<id>`,
+  `gh_head:<repo>:<n>:<sha>`.
+
+HTTP surface (`dashboard/plugin_api.py`):
+
+| method | path | behaviour |
+|--------|------|-----------|
+| GET    | `/github/status` | watcher status; lazily starts the poller |
+| POST   | `/github/test` | `{repo?, token?}` -> masked `{login, full_name, default_branch, private, open_pr_count}` |
+| POST   | `/github/connect` | `{repo, token?}` -> validate, save, reset the baseline, return status |
+| POST   | `/github/disconnect` | clear repo + token, stop polling |
+| POST   | `/github/poll` | one pass: `{configured, polled, created, errors}` |
+| GET    | `/github/prs` | `{configured, prs}` |
+| POST   | `/github/prs/{number}/work` | `{request?}` -> create + launch a session for that PR |
+
+`_get_runner()` and `/models` read `load_settings()`, so plugin-config
+`default_model`, `default_provider`, `max_workers`, `worker_yolo` and
+`chat_max_turns` apply; environment variables still win. The runner's allowed
+roots include `<data_dir>/workspaces` so a GitHub checkout can be passed to
+`--in` and resumed from the chat panel.
+
 ## Settings and environment
 
 New `plugin.yaml` settings: `default_model`, `default_provider`,
-`model_presets`, `worker_yolo`, `chat_max_turns`. Environment overrides with
-the same meaning: `SUPERAGENT_DEFAULT_MODEL`, `SUPERAGENT_DEFAULT_PROVIDER`,
+`model_presets`, `worker_yolo`, `chat_max_turns`, and for GitHub
+`github_watch_mode`, `github_watch_new_prs`, `github_poll_seconds`,
+`github_pr_limit`. Environment overrides with the same meaning:
+`SUPERAGENT_DEFAULT_MODEL`, `SUPERAGENT_DEFAULT_PROVIDER`,
 `SUPERAGENT_MODEL_PRESETS`, `SUPERAGENT_WORKER_YOLO`,
-`SUPERAGENT_CHAT_MAX_TURNS`, plus `SUPERAGENT_HERMES_BIN`,
+`SUPERAGENT_CHAT_MAX_TURNS`, `SUPERAGENT_GITHUB_WATCH_MODE`,
+`SUPERAGENT_GITHUB_WATCH_NEW_PRS`, `SUPERAGENT_GITHUB_POLL_SECONDS`,
+`SUPERAGENT_GITHUB_PR_LIMIT`, `SUPERAGENT_GITHUB_REPO`,
+`SUPERAGENT_GITHUB_TOKEN`, `SUPERAGENT_GITHUB_AGENT_LOGIN`,
+`SUPERAGENT_GITHUB_ALLOWED_USERS`, plus `SUPERAGENT_HERMES_BIN`,
 `SUPERAGENT_CHAT_SOURCE`, `SUPERAGENT_WORKER_TOOLSETS`, `SUPERAGENT_REPO`,
 `SUPERAGENT_MAX_WORKERS`.
 
@@ -110,7 +176,9 @@ the same meaning: `SUPERAGENT_DEFAULT_MODEL`, `SUPERAGENT_DEFAULT_PROVIDER`,
    per-card 3-event feed with 1s client timers, All/Live/Review rail filter,
    in-chat model switch via `POST /chats/{id}/model`)*
 4. **GitHub backend** — connect a repo (token + allowed users), watch pull
-   requests and checks, store `github_repo`/`pr_number`/`pr_url` on sessions.
+   requests and comments, store `github_repo`/`pr_number`/`pr_url` on sessions,
+   and check a PR out as an isolated worktree. *(done: `sa_settings.py`,
+   `sa_github.py`, `sa_watcher.py`, `/github/*`)*
 5. **GitHub UI + CLI** — connect/pin a repo from the panel, `/superagent pr`
    and a CLI subcommand to open the PR for a reviewed session.
 6. **CLI polish** — `hermes superagent chat`, `sessions`, `show`, `stop`,
@@ -126,7 +194,8 @@ the same meaning: `SUPERAGENT_DEFAULT_MODEL`, `SUPERAGENT_DEFAULT_PROVIDER`,
 
 ## Guardrails
 
-- stdlib only: `sqlite3`, `subprocess`, `json`, `threading`.
+- stdlib only: `sqlite3`, `subprocess`, `json`, `threading`, `urllib`
+  (PyYAML is an optional import used only to read `config.yaml`).
 - No runtime state in the repository; the database stays in the plugin data
   directory.
 - Existing ticket endpoints and tables are unchanged; the chat schema is

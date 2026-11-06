@@ -12,6 +12,10 @@ POST /chats/{id}/model swaps the model for future turns, and
 POST /chats/{id}/stop cancels it. They are kept in their own namespace so the
 existing ticket grid and this release's desktop UI keep working unchanged.
 
+GitHub (v0.3) lives under /github: connect a repository, test the token, poll
+pull requests, and start work on one. The token is stored by the shared
+settings loader and never appears in a response.
+
 Imported by the gateway on its own, outside the plugin package, so this
 module is self-contained: stdlib sqlite3 only, no relative imports except the
 optional package import below.
@@ -36,15 +40,18 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 try:  # loaded as part of the plugin package
-    from .. import sa_assessor, sa_chats, sa_runner
+    from .. import sa_assessor, sa_chats, sa_github, sa_runner, sa_settings, sa_watcher
 except ImportError:  # loaded standalone by the gateway / pytest
     import sa_assessor  # type: ignore[no-redef]
     import sa_chats  # type: ignore[no-redef]
+    import sa_github  # type: ignore[no-redef]
     import sa_runner  # type: ignore[no-redef]
+    import sa_settings  # type: ignore[no-redef]
+    import sa_watcher  # type: ignore[no-redef]
 
 router = APIRouter()
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # Server-side caps (mirrored in sa_runner so the runner enforces them too).
 MAX_PROMPT_CHARS = sa_runner.MAX_PROMPT_CHARS
@@ -65,6 +72,11 @@ MODEL_PRESETS = [
 # the same worker threads and semaphore. Tests patch `_get_runner`.
 _RUNNERS: dict[str, Any] = {}
 _RUNNERS_LOCK = threading.Lock()
+# One GitHub watcher per database path (same reasoning); tests patch
+# `_get_watcher`. Kept separate from _RUNNERS so a disconnect can drop the
+# watcher without losing the worker pool.
+_WATCHERS: dict[str, Any] = {}
+_WATCHERS_LOCK = threading.Lock()
 
 _TICKET_COLUMNS = (
     "id", "source", "source_ref", "repo", "issue_number", "requester",
@@ -116,13 +128,8 @@ _TICK_LAUNCH_NOTE = "workers are launched only from a Hermes agent turn (chat or
 
 
 def _db_path() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-
-        home = Path(get_hermes_home())
-    except Exception:
-        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "plugin-data" / "superagent" / "superagent.db"
+    """Plugin database path, shared with the CLI (see sa_settings.data_dir)."""
+    return sa_settings.data_dir() / "superagent.db"
 
 
 def _connect_ro(path: Path) -> sqlite3.Connection:
@@ -171,13 +178,6 @@ def _check_session_id(session_id: str) -> str:
 # -- chat helpers --------------------------------------------------------
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if not raw or not raw.strip():
@@ -214,13 +214,57 @@ def _scrub_event(text: Any) -> str:
     return _scrub(text)[:MAX_EVENT_CHARS]
 
 
+def _scrub_github(text: Any) -> str:
+    """Scrub credentials plus the configured GitHub token, whatever its shape.
+
+    `redact_secrets` knows the documented token prefixes; a self-hosted token
+    or an unusual value is only known to the settings, so it is replaced
+    explicitly before an error reaches an HTTP response.
+    """
+    value = _scrub_event(text)
+    try:
+        token = str(sa_settings.load_settings().get("github_token") or "")
+    except Exception:
+        token = ""
+    return value.replace(token, "[redacted]") if token else value
+
+
 def _repo_root() -> str:
-    """The configured root every chat repo must stay inside."""
-    return (
-        os.environ.get("SUPERAGENT_REPO_ROOT")
-        or os.environ.get("SUPERAGENT_REPO")
-        or ""
+    """The configured root(s) a chat repo must stay inside.
+
+    `SUPERAGENT_REPO_ROOT` (or `SUPERAGENT_REPO`) is the primary root, and the
+    plugin's PR workspaces are always allowed alongside it: a GitHub session is
+    checked out below `<data_dir>/workspaces` and can be resumed from the chat
+    panel. With no root configured, containment stays off, exactly as before.
+    """
+    repo = (
+        os.environ.get("SUPERAGENT_REPO_ROOT") or os.environ.get("SUPERAGENT_REPO") or ""
     ).strip()
+    if not repo:
+        return ""
+    try:
+        workspaces = str(sa_settings.data_dir() / "workspaces")
+    except Exception:
+        workspaces = ""
+    return os.pathsep.join(dict.fromkeys(part for part in (repo, workspaces) if part))
+
+
+def _runner_root(repo: str) -> str:
+    """Allowed roots for the shared Runner: the clone plus PR workspaces.
+
+    With no configured clone there is no containment root at all (the previous
+    behaviour): the runner falls back to its own default, which is also empty.
+    """
+    primary = (
+        os.environ.get("SUPERAGENT_REPO_ROOT") or repo or os.environ.get("SUPERAGENT_REPO") or ""
+    ).strip()
+    if not primary:
+        return ""
+    try:
+        workspaces = str(sa_settings.data_dir() / "workspaces")
+    except Exception:
+        workspaces = ""
+    return os.pathsep.join(dict.fromkeys(part for part in (primary, workspaces) if part))
 
 
 def _validated_repo(repo: str) -> str:
@@ -253,22 +297,50 @@ def _get_runner() -> Any:
     with _RUNNERS_LOCK:
         runner = _RUNNERS.get(key)
         if runner is None:
+            settings = sa_settings.load_settings()
+            repo = str(settings.get("repo_path") or "")
             runner = sa_runner.Runner(
                 _chat_store(),
                 hermes_bin=os.environ.get("SUPERAGENT_HERMES_BIN") or None,
-                max_workers=_env_int("SUPERAGENT_MAX_WORKERS", 2),
+                max_workers=int(settings.get("max_workers") or 2),
                 toolsets=tuple(_env_list("SUPERAGENT_WORKER_TOOLSETS", ["file", "terminal"])),
-                yolo=_env_bool("SUPERAGENT_WORKER_YOLO", True),
-                model=os.environ.get("SUPERAGENT_DEFAULT_MODEL", ""),
-                provider=os.environ.get("SUPERAGENT_DEFAULT_PROVIDER", ""),
-                repo=os.environ.get("SUPERAGENT_REPO", ""),
-                max_turns=_env_int("SUPERAGENT_CHAT_MAX_TURNS", 120),
+                yolo=bool(settings.get("worker_yolo", True)),
+                model=str(settings.get("default_model") or ""),
+                provider=str(settings.get("default_provider") or ""),
+                repo=repo,
+                repo_root=_runner_root(repo),
+                max_turns=int(settings.get("chat_max_turns") or 120),
                 turn_timeout_seconds=_env_int(
                     "SUPERAGENT_TURN_TIMEOUT_SECONDS", sa_runner.DEFAULT_TURN_TIMEOUT_SECONDS
                 ),
             )
             _RUNNERS[key] = runner
         return runner
+
+
+def _get_watcher() -> Any:
+    """Lazy GitHubWatcher singleton keyed by database path (patched in tests)."""
+    key = str(_db_path())
+    with _WATCHERS_LOCK:
+        watcher = _WATCHERS.get(key)
+        if watcher is None:
+            watcher = sa_watcher.GitHubWatcher(
+                _chat_store(), _get_runner(), sa_settings.load_settings
+            )
+            _WATCHERS[key] = watcher
+        return watcher
+
+
+def _reset_watcher() -> None:
+    """Drop the watcher (and stop its thread) after connect/disconnect."""
+    key = str(_db_path())
+    with _WATCHERS_LOCK:
+        watcher = _WATCHERS.pop(key, None)
+    if watcher is not None:
+        try:
+            watcher.stop_background()
+        except Exception:
+            pass
 
 
 def _reap_turns() -> list[dict]:
@@ -526,10 +598,11 @@ def tick(body: dict | None = None) -> dict[str, Any]:
 
 @router.get("/models")
 def list_models() -> dict[str, Any]:
-    presets = _env_list("SUPERAGENT_MODEL_PRESETS", MODEL_PRESETS)
+    settings = sa_settings.load_settings()
+    presets = [str(name) for name in settings.get("model_presets") or []] or list(MODEL_PRESETS)
     return {
-        "default_model": os.environ.get("SUPERAGENT_DEFAULT_MODEL", "") or "",
-        "default_provider": os.environ.get("SUPERAGENT_DEFAULT_PROVIDER", "") or "",
+        "default_model": str(settings.get("default_model") or ""),
+        "default_provider": str(settings.get("default_provider") or ""),
         "models": presets,
     }
 
@@ -744,5 +817,237 @@ def stop_chat(session_id: str) -> dict[str, Any]:
         "ok": True,
         "stopped": stopped,
         "session": store.get_session(session_id, message_limit=0),
+    }
+
+
+# -- GitHub (v0.3) -------------------------------------------------------
+#
+# Connect a repository, poll its pull requests and comments, and start work on
+# a PR. The watcher owns the polling loop and the dedupe state; these handlers
+# only validate input, persist settings and answer with JSON. The token is
+# read from settings and never copied into a response or an event.
+
+
+def _github_settings() -> dict[str, Any]:
+    return sa_settings.load_settings()
+
+
+def _github_identity(client: Any) -> tuple[str, dict[str, Any]]:
+    """Authenticated login + repository info; any failure is a 400."""
+    try:
+        login = str((client.me() or {}).get("login") or "")
+        info = client.repo_info()
+    except sa_github.GitHubError as exc:
+        raise HTTPException(status_code=400, detail=_scrub(str(exc))) from exc
+    return login, info
+
+
+def _clear_repo_baseline(repo: str) -> None:
+    """Forget dedupe state for one repo, so a reconnect starts a new baseline."""
+    if not repo:
+        return
+    try:
+        store = _chat_store()
+        for prefix in (
+            f"gh_baseline:{repo}",
+            f"gh_comment:{repo}:",
+            f"gh_head:{repo}:",
+        ):
+            store.clear_seen(prefix)
+    except Exception:
+        pass
+
+
+@router.get("/github/status")
+def github_status() -> dict[str, Any]:
+    watcher = _get_watcher()
+    try:
+        watcher.start_background()
+    except Exception:
+        pass  # status must answer even when the thread cannot start
+    return watcher.status()
+
+
+@router.post("/github/test")
+def github_test(body: dict | None = None) -> dict[str, Any]:
+    """Check a token + repository without saving anything."""
+    data = body or {}
+    settings = _github_settings()
+    repo = str(data.get("repo") or settings.get("github_repo") or "").strip()
+    token = str(data.get("token") or settings.get("github_token") or "").strip()
+    if not sa_settings.valid_repo_name(repo):
+        raise HTTPException(status_code=400, detail="repository must be owner/name")
+    if not token:
+        raise HTTPException(status_code=400, detail="a GitHub token is required")
+    client = sa_github.GitHubClient(token, repo)
+    login, info = _github_identity(client)
+    try:
+        open_pr_count = len(client.list_open_prs(limit=100))
+    except sa_github.GitHubError:
+        open_pr_count = int(info.get("open_issues") or 0)
+    return {
+        "ok": True,
+        "login": login,
+        "full_name": info.get("full_name") or repo,
+        "default_branch": info.get("default_branch") or "",
+        "private": bool(info.get("private")),
+        "open_pr_count": open_pr_count,
+    }
+
+
+@router.post("/github/connect")
+def github_connect(body: dict) -> dict[str, Any]:
+    """Validate a repository/token pair, save it, and start watching."""
+    data = body or {}
+    repo = str(data.get("repo") or "").strip()
+    if not sa_settings.valid_repo_name(repo):
+        raise HTTPException(status_code=400, detail="repository must be owner/name")
+    settings = _github_settings()
+    supplied_token = str(data.get("token") or "").strip()
+    token = supplied_token or str(settings.get("github_token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="a GitHub token is required")
+
+    client = sa_github.GitHubClient(token, repo)
+    login, info = _github_identity(client)
+
+    patch: dict[str, Any] = {"github_repo": repo}
+    if supplied_token:
+        patch["github_token"] = supplied_token
+    if login:
+        patch["github_agent_login"] = login
+    try:
+        sa_settings.save_settings(patch)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=_scrub(str(exc))) from exc
+
+    _clear_repo_baseline(repo)
+    _reset_watcher()
+    watcher = _get_watcher()
+    try:
+        watcher.start_background()
+    except Exception:
+        pass
+    status = watcher.status()
+    result = dict(status)
+    result.update(
+        {
+            "ok": True,
+            "login": status.get("login") or login,
+            "full_name": info.get("full_name") or repo,
+        }
+    )
+    return result
+
+
+@router.post("/github/disconnect")
+def github_disconnect() -> dict[str, Any]:
+    """Forget the repository and token and stop polling."""
+    try:
+        sa_settings.save_settings({"github_repo": "", "github_token": ""})
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=_scrub(str(exc))) from exc
+    _reset_watcher()
+    return {"ok": True}
+
+
+@router.post("/github/poll")
+def github_poll() -> dict[str, Any]:
+    """Run one polling pass now (the UI's 'Check now' button and tests)."""
+    try:
+        summary = _get_watcher().poll_once()
+    except Exception as exc:
+        message = _scrub_github(str(exc)) or "poll failed"
+        return {"configured": False, "polled": 0, "created": [], "errors": [message]}
+    return {
+        "configured": bool(summary.get("configured")),
+        "polled": int(summary.get("polled") or 0),
+        "created": list(summary.get("created") or []),
+        "errors": [_scrub_github(str(item)) for item in (summary.get("errors") or [])],
+    }
+
+
+@router.get("/github/prs")
+def github_prs() -> dict[str, Any]:
+    try:
+        status = _get_watcher().status()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=_scrub(str(exc))) from exc
+    return {"configured": bool(status.get("configured")), "prs": status.get("open_prs") or []}
+
+
+@router.post("/github/prs/{number}/work")
+def github_pr_work(number: int, body: dict | None = None) -> dict[str, Any]:
+    """Start a worker on one PR immediately (an explicit human action)."""
+    if number <= 0:
+        raise HTTPException(status_code=400, detail="invalid pull request number")
+    settings = _github_settings()
+    repo = str(settings.get("github_repo") or "").strip()
+    token = str(settings.get("github_token") or "").strip()
+    if not repo or not token:
+        raise HTTPException(status_code=400, detail="GitHub is not connected")
+    client = sa_github.GitHubClient(token, repo)
+    try:
+        pr = client.get_pr(number)
+    except sa_github.GitHubError as exc:
+        code = 404 if exc.status == 404 else 400
+        detail = f"pull request #{number} was not found" if code == 404 else _scrub(str(exc))
+        raise HTTPException(status_code=code, detail=detail) from exc
+
+    repo_path = str(settings.get("repo_path") or "").strip()
+    checkout = ""
+    warning = ""
+    if repo_path:
+        workspace = str(sa_settings.data_dir() / "workspaces")
+        try:
+            info = sa_github.prepare_pr_checkout(repo_path, repo, number, workspace, token)
+            checkout = str(info.get("path") or "")
+        except sa_github.GitHubError as exc:
+            warning = _scrub(str(exc))
+
+    request_text = _scrub(str((body or {}).get("request") or "").strip())
+    comment = {"author": "you", "body": request_text} if request_text else None
+    prompt = sa_github.build_pr_prompt(pr, comment=comment, checkout=checkout)
+    session_repo = checkout
+    if not session_repo and repo_path and Path(repo_path).expanduser().is_dir():
+        session_repo = repo_path
+    store = _chat_store()
+    session = store.create_session(
+        prompt,
+        title=f"PR #{number}: {pr.get('title') or ''}".strip(),
+        model=str(settings.get("default_model") or ""),
+        provider=str(settings.get("default_provider") or ""),
+        repo=session_repo,
+        source="github_pr",
+        github_repo=repo,
+        pr_number=number,
+        pr_url=str(pr.get("html_url") or ""),
+        status=sa_chats.QUEUED,
+    )
+    session_id = str(session["id"])
+    store.add_event(session_id, "github", f"manual work on PR #{number}")
+    if warning:
+        store.add_event(session_id, "github", f"checkout failed: {warning}")
+
+    target = session_repo
+    try:
+        _get_runner().launch_turn(
+            session_id,
+            prompt,
+            model=str(settings.get("default_model") or "") or None,
+            provider=str(settings.get("default_provider") or "") or None,
+            repo=target,
+        )
+    except Exception as exc:
+        failed = _fail_session(store, session_id, str(exc) or exc.__class__.__name__)
+        failed["checkout"] = checkout
+        failed["warning"] = warning
+        return failed
+    return {
+        "ok": True,
+        "launched": True,
+        "session": store.get_session(session_id, message_limit=0),
+        "checkout": checkout,
+        "warning": warning,
     }
 

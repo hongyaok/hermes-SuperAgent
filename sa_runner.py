@@ -54,8 +54,11 @@ def resolve_repo_path(repo: str, *, root: str = "") -> str:
     """Validate a worker repository path and return its resolved form.
 
     Rejects paths that do not exist, are not directories, contain ``..``, or
-    resolve (through a symlink) outside ``root``. The returned string is what
-    may be passed to subprocess argv/cwd; callers must never use the raw input.
+    resolve (through a symlink) outside every allowed root. ``root`` may hold
+    several ``os.pathsep``-separated roots (the configured clone plus the
+    plugin's PR workspaces), and an empty root disables containment. The
+    returned string is what may be passed to subprocess argv/cwd; callers must
+    never use the raw input.
     """
     raw = (repo or "").strip()
     if not raw:
@@ -73,12 +76,16 @@ def resolve_repo_path(repo: str, *, root: str = "") -> str:
     if not resolved.is_dir():
         raise RepoPathError(f"repository path is not a directory: {raw}")
 
-    if root:
-        root_path = Path(os.path.expanduser((root or "").strip())).resolve(strict=False)
-        if resolved != root_path and root_path not in resolved.parents:
-            raise RepoPathError(
-                f"repository path escapes the configured root {root}: {raw}"
-            )
+    parts = root if isinstance(root, (list, tuple)) else str(root or "").split(os.pathsep)
+    roots = []
+    for part in parts:
+        text = str(part or "").strip()
+        if text:
+            roots.append(Path(os.path.expanduser(text)).resolve(strict=False))
+    if roots and not any(resolved == allowed or allowed in resolved.parents for allowed in roots):
+        raise RepoPathError(
+            f"repository path escapes the configured root {os.pathsep.join(str(r) for r in roots)}: {raw}"
+        )
     return str(resolved)
 
 
