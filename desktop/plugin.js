@@ -15,6 +15,12 @@
  * The ticket pane and the status-bar chip stay (they answer "does a human need
  * to look at anything?"); the route page is chat-only.
  *
+ * The transcript renders assistant answers through the app's own Markdown
+ * surface (feature-detected; older shells keep pre-wrap), folds runs of audit
+ * events into a collapsible Activity block, and stamps messages and events in
+ * local HH:MM. Bubbles are memoized on primitive props so a 1.5s poll does not
+ * re-typeset every answer on the page.
+ *
  * Plain ESM, loaded uncompiled — UI is jsx()/jsxs() calls, not JSX syntax.
  * Only @hermes/plugin-sdk, react and react/jsx-runtime resolve here. The SDK is
  * imported as a namespace: a shell that predates a component (the model
@@ -24,12 +30,15 @@
 
 import * as SDK from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 
 const {
   Tip, StatusDot, DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
   ModelCatalogMenu, ModelMenuCloseContext, cn, host,
   useQuery, useMutation, useQueryClient, ROUTES_AREA, SIDEBAR_NAV_AREA,
+  // Transcript niceties. Optional: a shell that predates them leaves the
+  // binding undefined and every use below is feature-detected.
+  MessageTextContent, CopyButton, DisclosureCaret,
 } = SDK
 
 const ID = 'superagent'
@@ -117,6 +126,18 @@ function fmtIsoAge(value) {
   const stamp = Date.parse(String(value || ''))
   if (!isFinite(stamp)) return ''
   return fmtAge(stamp / 1000)
+}
+
+/** Wall-clock HH:MM (24h) for one epoch-seconds stamp.
+ *
+ * Deliberately not toLocaleTimeString: the transcript is a fixed-width column
+ * and a locale that appends AM/PM or a non-Latin digit set would jitter it.
+ * Local getters, so the clock matches the user's wall clock. */
+function fmtClock(seconds) {
+  const stamp = Number(seconds)
+  if (!isFinite(stamp) || stamp <= 0) return ''
+  const date = new Date(stamp * 1000)
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
 }
 
 /** Compact duration from milliseconds: '12s' / '3m 04s' / '1h 12m'. */
@@ -632,11 +653,17 @@ function SessionsRail({ sessions, selectedId, onSelect }) {
  *  messages + tool events merged on created_at. */
 function buildTranscript(session) {
   if (!session) return []
-  const items = [{
-    key: 'prompt', kind: 'message', role: 'user',
-    content: session.prompt || '', created_at: session.created_at || 0,
-  }]
+  const items = []
+  // An empty turn is not a bubble: a blank prompt would otherwise paint an
+  // empty card and hide the "No transcript yet" state.
+  if (String(session.prompt || '').trim()) {
+    items.push({
+      key: 'prompt', kind: 'message', role: 'user',
+      content: session.prompt || '', created_at: session.created_at || 0,
+    })
+  }
   for (const message of session.messages || []) {
+    if (!String(message.content || '').trim()) continue
     items.push({
       key: `m${message.id}`, kind: 'message', role: message.role,
       content: message.content || '', created_at: message.created_at || 0,
@@ -652,59 +679,298 @@ function buildTranscript(session) {
   return items
 }
 
-function Bubble({ role, content }) {
-  const mine = role === 'user'
-  return jsx('div', {
-    className: cn('max-w-[85%] whitespace-pre-wrap break-words rounded px-2.5 py-1.5',
-      'text-xs leading-relaxed text-(--ui-text-secondary)',
-      mine ? 'self-end bg-(--chrome-action-hover)' : 'self-start border border-(--ui-stroke-secondary)'),
-    children: content,
+/** Fold runs of consecutive audit events into one Activity block.
+ *
+ * Messages break a run, so the event stream still reads in wall-clock order:
+ * tool, tool, assistant answer, tool, tool. A single event also becomes an
+ * Activity block — a lone "bash: ls" line outside the fold would look like a
+ * different kind of thing from the same line inside it. */
+function groupTranscript(items) {
+  const blocks = []
+  let run = null
+  for (const item of items) {
+    if (item.kind !== 'event') {
+      run = null
+      blocks.push({ key: item.key, kind: 'message', role: item.role, content: item.content, created_at: item.created_at })
+      continue
+    }
+    if (!run) {
+      run = { key: `a${item.key}`, kind: 'activity', events: [], created_at: item.created_at }
+      blocks.push(run)
+    }
+    run.events.push(item)
+  }
+  return blocks
+}
+
+/** 'Assistant' / 'User' — capitalized role, never the raw enum. */
+function roleLabel(role) {
+  const value = String(role || '').trim()
+  if (!value) return 'Assistant'
+  return value.charAt(0).toUpperCase() + value.slice(1)
+}
+
+/** Assistant text: the app's own Markdown pipeline when this shell ships it.
+ *  Older shells keep the plain pre-wrap rendering (no lost content). */
+function MessageBody({ text }) {
+  const value = String(text == null ? '' : text)
+  if (!value) return null
+  if (MessageTextContent) return jsx(MessageTextContent, { text: value })
+  return jsx('div', { className: 'whitespace-pre-wrap break-words', children: value })
+}
+
+/** Disclosure glyph: the chrome caret when exported, a text twin otherwise. */
+function Caret({ open }) {
+  if (DisclosureCaret) return jsx(DisclosureCaret, { open })
+  return jsx('span', { 'aria-hidden': 'true', className: 'shrink-0', children: open ? '▾' : '▸' })
+}
+
+/** One-line `kind: detail` summary for a collapsed Activity block. */
+function eventSummary(event) {
+  const kind = String((event && event.eventKind) || '').trim()
+  const detail = String((event && event.detail) || '').replace(/\s+/g, ' ').trim()
+  if (!detail) return kind
+  return clip(`${kind}: ${detail}`, 160)
+}
+
+/** Per-answer header: who said it, when, and a copy affordance.
+ *  The timestamp is the message's own created_at, not the poll time. */
+function MessageMeta({ role, createdAt, content }) {
+  const clock = fmtClock(createdAt)
+  return jsxs('div', {
+    className: 'flex min-w-0 items-center gap-1.5 text-[0.6875rem] text-(--ui-text-quaternary)',
+    children: [
+      jsx('span', { key: 'r', className: 'font-medium text-(--ui-text-tertiary)', children: roleLabel(role) }),
+      clock ? jsx('span', { key: 't', className: 'tabular-nums', children: clock }) : null,
+      CopyButton
+        ? jsx(CopyButton, { key: 'c', text: String(content == null ? '' : content), appearance: 'icon', label: 'Copy message' })
+        : null,
+    ],
   })
 }
 
+const Bubble = memo(function Bubble({ role, content, createdAt }) {
+  const mine = role === 'user'
+  const body = String(content == null ? '' : content)
+  const clock = fmtClock(createdAt)
+  // User turns stay verbatim: Markdown in a prompt is the user's text, not a
+  // document to typeset. Only the assistant answer renders as Markdown.
+  if (mine) {
+    return jsxs('div', {
+      className: 'flex max-w-[85%] min-w-0 flex-col items-end gap-0.5 self-end',
+      children: [
+        jsx('div', {
+          key: 'b',
+          className: cn('min-w-0 rounded bg-(--chrome-action-hover) px-2.5 py-1.5',
+            'whitespace-pre-wrap break-words text-xs leading-relaxed text-(--ui-text-secondary)'),
+          children: body,
+        }),
+        clock
+          ? jsx('span', {
+              key: 't', className: 'text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
+              children: clock,
+            })
+          : null,
+      ],
+    })
+  }
+  return jsxs('div', {
+    className: 'flex w-full max-w-[85%] min-w-0 flex-col gap-1 self-start',
+    children: [
+      jsx(MessageMeta, { key: 'h', role, createdAt, content: body }),
+      jsx('div', {
+        key: 'b',
+        className: cn('min-w-0 max-w-full overflow-hidden rounded border border-(--ui-stroke-secondary)',
+          'px-2.5 py-1.5 text-xs leading-relaxed text-(--ui-text-secondary)'),
+        children: jsx(MessageBody, { text: body }),
+      }),
+    ],
+  })
+})
+
+/** One audit line: `kind: detail`, monospace, dim, stamped HH:MM. */
 function EventRow({ item }) {
+  const detail = String(item.detail || '')
+  const clock = fmtClock(item.created_at)
   return jsxs('div', {
     className: 'flex min-w-0 items-baseline gap-1.5 pl-1 text-[0.6875rem] text-(--ui-text-quaternary)',
     children: [
-      jsx('span', { key: 'b', children: '▸' }),
       jsx('span', { key: 'k', className: 'shrink-0 font-mono', children: item.eventKind }),
       jsx('span', { key: 'c', className: 'shrink-0', children: ':' }),
-      item.detail
-        ? jsx('span', { key: 'd', className: 'min-w-0 flex-1 truncate', children: clip(item.detail, 200) })
+      detail
+        ? jsx('span', {
+            key: 'd', title: detail,
+            className: 'min-w-0 flex-1 truncate font-mono',
+            children: clip(detail.replace(/\s+/g, ' '), 160),
+          })
         : null,
+      clock ? jsx('span', { key: 't', className: 'shrink-0 tabular-nums', children: clock }) : null,
+    ],
+  })
+}
+
+/** A run of audit events, collapsible. Live turns open by default (the work
+ *  is what you are watching); a finished turn collapses to its last line so
+ *  the answer is not buried under tool noise. */
+function Activity({ events, running, sessionId }) {
+  const [open, setOpen] = useState(!!running)
+  const wasRunning = useRef(!!running)
+  const latest = events[events.length - 1]
+  const clock = fmtClock(latest && latest.created_at)
+  const count = events.length
+
+  // A poll can flip the status while the block stays mounted; follow it, but
+  // never override a click made while the status is unchanged.
+  useEffect(() => {
+    if (wasRunning.current === !!running) return
+    wasRunning.current = !!running
+    setOpen(!!running)
+  }, [running])
+
+  return jsxs('div', {
+    className: 'flex w-full min-w-0 flex-col gap-0.5',
+    children: [
+      jsxs('button', {
+        key: 'head',
+        type: 'button',
+        'aria-expanded': open,
+        'aria-label': `Activity, ${count} ${count === 1 ? 'step' : 'steps'}`,
+        onClick: () => setOpen((value) => !value),
+        className: cn('flex w-full min-w-0 items-center gap-1.5 self-start rounded px-1 py-0.5',
+          'text-[0.6875rem] text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover)'),
+        children: [
+          jsx(Caret, { key: 'caret', open }),
+          jsx('span', {
+            key: 'label', className: 'shrink-0 font-medium',
+            children: `Activity · ${count} ${count === 1 ? 'step' : 'steps'}`,
+          }),
+          open || !latest
+            ? null
+            : jsx('span', {
+                key: 'summary',
+                className: 'min-w-0 flex-1 truncate text-left text-(--ui-text-quaternary)',
+                children: eventSummary(latest),
+              }),
+          clock
+            ? jsx('span', { key: 'clock', className: 'ml-auto shrink-0 pl-2 tabular-nums text-(--ui-text-quaternary)', children: clock })
+            : null,
+        ],
+      }),
+      open
+        ? jsx('div', {
+            key: 'body',
+            className: 'flex flex-col gap-0.5',
+            children: events.map((event) => jsx(EventRow, { key: `${sessionId}:${event.key}`, item: event })),
+          })
+        : null,
+    ],
+  })
+}
+
+/** Skeleton-ish placeholder while a live turn has not produced an answer yet. */
+function WaitingCard({ session }) {
+  return jsxs('div', {
+    className: 'flex max-w-[85%] min-w-0 flex-col gap-1.5 self-start rounded border border-(--ui-stroke-secondary) p-2.5',
+    children: [
+      jsxs('div', {
+        key: 'meta',
+        className: 'flex min-w-0 items-center gap-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
+        children: [
+          jsx('span', { key: 's', className: 'font-medium', children: session.status || 'running' }),
+          jsx('span', { key: 'd', children: '·' }),
+          jsx('span', { key: 'm', className: 'min-w-0 truncate', children: sessionModelLabel(session) }),
+        ],
+      }),
+      jsx('div', {
+        key: 't', className: 'text-xs text-(--ui-text-secondary)',
+        children: 'Waiting for the first response…',
+      }),
+      jsxs('div', {
+        key: 'sk', className: 'flex flex-col gap-1 pt-0.5', 'aria-hidden': 'true',
+        children: [
+          jsx('span', { key: 'a', className: 'h-1.5 w-40 animate-pulse rounded bg-(--chrome-action-hover)' }),
+          jsx('span', { key: 'b', className: 'h-1.5 w-28 animate-pulse rounded bg-(--chrome-action-hover)' }),
+          jsx('span', { key: 'c', className: 'h-1.5 w-32 animate-pulse rounded bg-(--chrome-action-hover)' }),
+        ],
+      }),
     ],
   })
 }
 
 function Transcript({ session }) {
   const items = useMemo(() => buildTranscript(session), [session])
+  const blocks = useMemo(() => groupTranscript(items), [items])
   const boxRef = useRef(null)
   const stickRef = useRef(true)
-  const sessionId = session && session.id
+  const [away, setAway] = useState(false)
+  const sessionId = (session && session.id) || ''
   const tail = items.length ? items[items.length - 1].key : 'empty'
+  const running = isBusy(session)
+  const hasAnswer = items.some((item) => item.kind === 'message' && item.role !== 'user')
+  const waiting = !!session && !hasAnswer && (session.status === 'queued' || session.status === 'running')
 
   // Switching chats starts at the newest line; polling never moves the box
   // unless the reader was already at the bottom.
-  useEffect(() => { stickRef.current = true }, [sessionId])
+  useEffect(() => { stickRef.current = true; setAway(false) }, [sessionId])
   useEffect(() => {
     const el = boxRef.current
     if (el && stickRef.current) el.scrollTop = el.scrollHeight
   }, [sessionId, items.length, tail])
 
-  return jsx('div', {
-    ref: boxRef,
-    onScroll: () => {
-      const el = boxRef.current
-      if (!el) return
-      stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96
-    },
-    className: cn('flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded',
-      'border border-(--ui-stroke-secondary) p-3'),
-    children: items.length
-      ? items.map((item) => item.kind === 'event'
-          ? jsx(EventRow, { key: item.key, item })
-          : jsx(Bubble, { key: item.key, role: item.role, content: item.content }))
-      : jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: 'No transcript yet.' }),
+  const scrollToLatest = () => {
+    stickRef.current = true
+    setAway(false)
+    const el = boxRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }
+
+  const body = blocks.length
+    ? blocks.map((block) => (block.kind === 'activity'
+        ? jsx(Activity, {
+            key: `${sessionId}:${block.key}`, events: block.events, running, sessionId,
+          })
+        : jsx(Bubble, {
+            key: `${sessionId}:${block.key}`, role: block.role, content: block.content,
+            createdAt: block.created_at,
+          })))
+    : []
+
+  if (waiting) body.push(jsx(WaitingCard, { key: 'waiting', session }))
+  if (!body.length) {
+    body.push(jsx('div', {
+      key: 'empty', className: 'text-xs text-(--ui-text-tertiary)', children: 'No transcript yet.',
+    }))
+  }
+
+  return jsxs('div', {
+    className: 'relative flex min-h-0 flex-1 flex-col',
+    children: [
+      jsx('div', {
+        key: 'scroll',
+        ref: boxRef,
+        onScroll: () => {
+          const el = boxRef.current
+          if (!el) return
+          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 96
+          stickRef.current = atBottom
+          setAway(!atBottom)
+        },
+        className: cn('flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded',
+          'border border-(--ui-stroke-secondary) p-3'),
+        children: body,
+      }),
+      away
+        ? jsx('button', {
+            key: 'jump',
+            type: 'button',
+            onClick: scrollToLatest,
+            className: cn('absolute bottom-3 right-3 inline-flex items-center gap-1 rounded-full border',
+              'border-(--ui-stroke-secondary) bg-background px-2.5 py-1 text-[0.6875rem]',
+              'text-(--ui-text-secondary) shadow-sm hover:bg-(--chrome-action-hover)'),
+            children: '↓ Jump to latest',
+          })
+        : null,
+    ],
   })
 }
 
