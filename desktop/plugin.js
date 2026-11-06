@@ -8,9 +8,14 @@
  * query polls at 2s while a worker runs and 8s when the board is quiet; the
  * open transcript polls at 1.5s while its own turn is live. The diff panel is
  * lazy (only while open) and refetches at 4s only while the turn is running.
- * Every mutation invalidates both so the rail, the transcript, and the live
- * grid agree on the next paint. The per-card elapsed timer ticks on local
+ * Every mutation invalidates both so the rail, the transcript, and the worker
+ * strip agree on the next paint. The per-card elapsed timer ticks on local
  * state only — it must never add a request to those budgets.
+ *
+ * Layout: one 44px header row, then a 16rem session rail beside a chat column.
+ * Live workers are a collapsible strip inside the chat column (under the
+ * transcript, above the composer), and GitHub/Settings are mutually exclusive
+ * overlay drawers — neither can reflow or resize the conversation.
  *
  * The ticket pane and the status-bar chip stay (they answer "does a human need
  * to look at anything?"); the route page is chat-only.
@@ -106,6 +111,15 @@ function clip(text, max) {
   return value.length <= max ? value : value.slice(0, Math.max(1, max - 1)) + '…'
 }
 
+/** Middle-out clip for paths: keeps the drive/root and the segment that names
+ *  the repo, which is the part a reader is actually looking for. */
+function clipMiddle(text, max) {
+  const value = String(text == null ? '' : text)
+  if (value.length <= max) return value
+  const keep = Math.max(1, Math.floor((max - 1) / 2))
+  return `${value.slice(0, keep)}…${value.slice(-keep)}`
+}
+
 function isBusy(session) {
   return !!session && (session.status === 'running' || session.status === 'queued')
 }
@@ -157,15 +171,6 @@ function fmtSeconds(seconds) {
   const minutes = Math.floor(total / 60)
   if (minutes < 60) return total % 60 ? `${minutes}m ${total % 60}s` : `${minutes}m`
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
-}
-
-/** Token count for a finished card: '812 tok' / '4.2k tok' / '1.3M tok'. */
-function fmtTokens(tokens) {
-  const n = Number(tokens)
-  if (!isFinite(n) || n <= 0) return ''
-  if (n < 1000) return `${Math.round(n)} tok`
-  if (n < 1000000) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k tok`
-  return `${(n / 1000000).toFixed(1)}M tok`
 }
 
 /** Seconds the current turn has been alive, recomputed against `nowMs`.
@@ -429,14 +434,6 @@ function ChatDot({ status }) {
   })
 }
 
-function Pill({ children }) {
-  return jsx('span', {
-    className: cn('inline-flex items-center rounded border border-(--ui-stroke-secondary)',
-      'px-1.5 py-0.5 text-[0.6875rem] text-(--ui-text-tertiary)'),
-    children,
-  })
-}
-
 /** `#123` chip that opens the pull request in the browser.
  *
  * A span (role=link), not a button: the rail rows and worker cards are
@@ -478,29 +475,40 @@ function GithubDot({ configured }) {
   })
 }
 
-function GithubButton({ open, status, onClick }) {
+// One 28px square icon button for the header. The tooltip carries the label:
+// the chrome has room for one primary action (New chat) and two glyphs.
+const HEADER_ICON = cn(
+  'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded',
+  'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)',
+)
+
+function HeaderIconButton({ label, tip, active, onClick, buttonRef, children }) {
+  return jsx(Tip, {
+    label: tip || label,
+    children: jsx('button', {
+      type: 'button',
+      ref: buttonRef,
+      onClick,
+      title: tip || label,
+      'aria-label': label,
+      'aria-expanded': !!active,
+      className: cn(HEADER_ICON, active && 'bg-(--chrome-action-hover) text-(--ui-text-secondary)'),
+      children,
+    }),
+  })
+}
+
+/** GitHub as a glyph: its status dot is the whole affordance, the tip names
+ *  the repo. Keeps the header to a single 44px line. */
+function GithubHeaderButton({ open, status, onClick, buttonRef }) {
   const configured = !!(status && status.configured)
   const repo = configured ? String(status.repo || '') : ''
-  const short = repo ? repo.split('/').filter(Boolean).pop() : ''
-  return jsxs('button', {
-    type: 'button',
-    onClick,
-    'aria-expanded': !!open,
-    'aria-label': 'GitHub connection',
-    className: cn('flex items-center gap-1 rounded px-2 py-1 text-xs',
-      'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
-      open && 'bg-(--chrome-action-hover)'),
-    children: [
-      jsx(GithubDot, { key: 'dot', configured }),
-      jsx('span', { key: 'label', children: 'GitHub' }),
-      short
-        ? jsx('span', {
-            key: 'repo', className: 'max-w-[7rem] truncate text-(--ui-text-quaternary)',
-            title: repo, children: short,
-          })
-        : null,
-      jsx('span', { key: 'chevron', className: 'text-(--ui-text-quaternary)', children: '▾' }),
-    ],
+  const tip = configured
+    ? `GitHub: ${repo || 'connected'} — connection and open pull requests`
+    : 'GitHub — connect a repository to watch pull requests'
+  return jsx(HeaderIconButton, {
+    label: 'GitHub', tip, active: open, onClick, buttonRef,
+    children: jsx(GithubDot, { configured }),
   })
 }
 
@@ -553,26 +561,27 @@ function ErrorCard({ title, error, onRetry }) {
 
 function SessionRow({ session, selected, onSelect }) {
   const age = session.status === 'running' ? timingLabel(session) : fmtAge(session.updated_at || session.created_at)
+  // One line per chat: title and age. Model and repo live in the tooltip so a
+  // 16rem rail stays scannable at a glance.
+  const tooltip = [sessionTitle(session), sessionModelLabel(session), String(session.repo || '').trim()]
+    .filter(Boolean)
+    .join(' · ')
   return jsxs('button', {
     type: 'button',
     onClick: () => onSelect(session.id),
-    className: cn('flex w-full flex-col gap-0.5 rounded px-2 py-1.5 text-left',
+    title: tooltip,
+    'aria-current': selected ? 'true' : undefined,
+    className: cn('flex w-full min-w-0 items-baseline gap-1.5 rounded px-2 py-1 text-left',
       selected ? 'bg-(--chrome-action-hover)' : 'hover:bg-(--chrome-action-hover)'),
     children: [
-      jsxs('div', {
-        key: 'top', className: 'flex min-w-0 items-baseline gap-1.5',
-        children: [
-          jsx(StatusGlyph, { key: 'g', status: session.status, pulse: true }),
-          jsx('span', { key: 't', className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: sessionTitle(session) }),
-        ],
+      jsx(StatusGlyph, { key: 'g', status: session.status, pulse: true }),
+      jsx('span', {
+        key: 't', className: 'min-w-0 flex-1 truncate text-xs text-(--ui-text-secondary)',
+        children: sessionTitle(session),
       }),
-      jsxs('div', {
-        key: 'meta', className: 'flex min-w-0 items-baseline gap-1.5 pl-4 text-[0.6875rem] text-(--ui-text-quaternary)',
-        children: [
-          jsx('span', { key: 'm', className: 'min-w-0 flex-1 truncate', children: sessionModelLabel(session) }),
-          jsx(PrBadge, { key: 'pr', session }),
-          jsx('span', { key: 'a', className: 'shrink-0 tabular-nums', children: age }),
-        ],
+      jsx('span', {
+        key: 'a', className: 'shrink-0 text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
+        children: age,
       }),
     ],
   })
@@ -592,10 +601,32 @@ function railFilterMatch(session, filter) {
   return true
 }
 
+/** Client-side search over the two things a chat is remembered by: its title
+ *  and the request that opened it. */
+function railQueryMatch(session, query) {
+  const needle = String(query || '').trim().toLowerCase()
+  if (!needle) return true
+  const haystack = `${sessionTitle(session)}\n${String((session && session.prompt) || '')}`.toLowerCase()
+  return haystack.indexOf(needle) !== -1
+}
+
 const RAIL_EMPTY = {
   all: 'No chats yet.',
   live: 'Nothing running.',
   review: 'Nothing to review.',
+}
+
+/** True under the md breakpoint (768px). Only used to fold the mobile rail
+ *  after a pick; the layout itself is CSS-driven, so a wrong answer is benign. */
+function isNarrowViewport() {
+  try {
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+      return !!window.matchMedia('(max-width: 767px)').matches
+    }
+  } catch (error) {
+    // Older shells: assume a wide window.
+  }
+  return false
 }
 
 function RailFilter({ value, onChange }) {
@@ -619,29 +650,78 @@ function RailFilter({ value, onChange }) {
 
 function SessionsRail({ sessions, selectedId, onSelect }) {
   const [filter, setFilter] = useState('all')
+  const [query, setQuery] = useState('')
+  // Under `md` the rail folds into a 'Chats' section above the chat; picking a
+  // chat closes it so the transcript gets the screen. md+ ignores this state.
+  const [open, setOpen] = useState(() => !selectedId)
   const shown = useMemo(
-    () => (filter === 'all' ? sessions : sessions.filter((session) => railFilterMatch(session, filter))),
-    [sessions, filter],
+    () => sessions.filter((session) =>
+      railFilterMatch(session, filter) && railQueryMatch(session, query)),
+    [sessions, filter, query],
   )
+
+  const choose = (id) => {
+    onSelect(id)
+    if (isNarrowViewport()) setOpen(false)
+  }
+
+  const emptyText = String(query || '').trim() ? 'No matching chats.' : RAIL_EMPTY[filter]
+  const countLabel = shown.length === sessions.length
+    ? `${sessions.length} chat${sessions.length === 1 ? '' : 's'}`
+    : `${shown.length} of ${sessions.length}`
+
   return jsxs('div', {
-    className: 'flex min-h-0 w-full flex-col gap-2 md:w-[17rem] md:shrink-0',
+    className: 'flex min-h-0 w-full flex-col gap-2 md:w-[16rem] md:shrink-0',
     children: [
-      jsxs('div', {
-        key: 'head', className: 'flex items-center justify-between gap-2',
+      jsxs('button', {
+        key: 'fold',
+        type: 'button',
+        'aria-expanded': open,
+        'aria-label': 'Chats',
+        onClick: () => setOpen((value) => !value),
+        className: cn('flex h-7 w-full items-center gap-1.5 rounded px-2 text-xs md:hidden',
+          'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)'),
         children: [
-          jsx('div', {
-            key: 'label', className: 'text-xs font-medium text-(--ui-text-tertiary)',
-            children: sessions.length ? `Chats (${sessions.length})` : 'Chats',
+          jsx(Caret, { key: 'c', open }),
+          jsx('span', { key: 'l', className: 'font-medium', children: 'Chats' }),
+          jsx('span', {
+            key: 'n', className: 'ml-auto text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
+            children: sessions.length ? String(sessions.length) : '',
           }),
-          jsx(RailFilter, { key: 'filter', value: filter, onChange: setFilter }),
         ],
       }),
-      jsx('div', {
-        key: 'list', className: 'flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-1',
-        children: shown.length
-          ? shown.map((session) =>
-              jsx(SessionRow, { key: session.id, session, selected: session.id === selectedId, onSelect }))
-          : jsx('div', { className: 'px-2 py-1 text-xs text-(--ui-text-tertiary)', children: RAIL_EMPTY[filter] }),
+      jsxs('div', {
+        key: 'body',
+        className: cn('flex min-h-0 flex-col gap-2', open ? 'flex' : 'hidden md:flex'),
+        children: [
+          jsx('input', {
+            key: 'search',
+            type: 'search',
+            value: query,
+            placeholder: 'Search chats',
+            'aria-label': 'Search chats',
+            autoComplete: 'off',
+            onChange: (event) => setQuery(event.target.value),
+            className: cn('w-full min-w-0 rounded border border-(--ui-stroke-secondary) bg-transparent',
+              'px-2 py-1 text-xs text-(--ui-text-secondary)',
+              'placeholder:text-(--ui-text-quaternary) focus:outline-none'),
+          }),
+          jsx(RailFilter, { key: 'filter', value: filter, onChange: setFilter }),
+          jsx('div', {
+            key: 'list',
+            className: 'flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-1',
+            children: shown.length
+              ? shown.map((session) => jsx(SessionRow, {
+                  key: session.id, session, selected: session.id === selectedId, onSelect: choose,
+                }))
+              : jsx('div', { className: 'px-2 py-1 text-xs text-(--ui-text-tertiary)', children: emptyText }),
+          }),
+          jsx('div', {
+            key: 'foot',
+            className: 'shrink-0 px-2 text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
+            children: countLabel,
+          }),
+        ],
       }),
     ],
   })
@@ -761,8 +841,8 @@ const Bubble = memo(function Bubble({ role, content, createdAt }) {
       children: [
         jsx('div', {
           key: 'b',
-          className: cn('min-w-0 rounded bg-(--chrome-action-hover) px-2.5 py-1.5',
-            'whitespace-pre-wrap break-words text-xs leading-relaxed text-(--ui-text-secondary)'),
+          className: cn('min-w-0 rounded-lg bg-(--chrome-action-hover) px-3 py-1.5',
+            'whitespace-pre-wrap break-words text-sm leading-relaxed text-(--ui-text-secondary)'),
           children: body,
         }),
         clock
@@ -774,14 +854,15 @@ const Bubble = memo(function Bubble({ role, content, createdAt }) {
       ],
     })
   }
+  // An answer is a document, not a card: no border, just generous line-height
+  // so a long reply reads like the main chat. Code blocks keep their own fill.
   return jsxs('div', {
-    className: 'flex w-full max-w-[85%] min-w-0 flex-col gap-1 self-start',
+    className: 'flex w-full max-w-[92%] min-w-0 flex-col gap-1 self-start',
     children: [
       jsx(MessageMeta, { key: 'h', role, createdAt, content: body }),
       jsx('div', {
         key: 'b',
-        className: cn('min-w-0 max-w-full overflow-hidden rounded border border-(--ui-stroke-secondary)',
-          'px-2.5 py-1.5 text-xs leading-relaxed text-(--ui-text-secondary)'),
+        className: 'min-w-0 max-w-full text-sm leading-[1.7] text-(--ui-text-secondary)',
         children: jsx(MessageBody, { text: body }),
       }),
     ],
@@ -870,7 +951,7 @@ function Activity({ events, running, sessionId }) {
 /** Skeleton-ish placeholder while a live turn has not produced an answer yet. */
 function WaitingCard({ session }) {
   return jsxs('div', {
-    className: 'flex max-w-[85%] min-w-0 flex-col gap-1.5 self-start rounded border border-(--ui-stroke-secondary) p-2.5',
+    className: 'flex max-w-[85%] min-w-0 flex-col gap-1.5 self-start',
     children: [
       jsxs('div', {
         key: 'meta',
@@ -882,7 +963,7 @@ function WaitingCard({ session }) {
         ],
       }),
       jsx('div', {
-        key: 't', className: 'text-xs text-(--ui-text-secondary)',
+        key: 't', className: 'text-sm text-(--ui-text-secondary)',
         children: 'Waiting for the first response…',
       }),
       jsxs('div', {
@@ -955,8 +1036,7 @@ function Transcript({ session }) {
           stickRef.current = atBottom
           setAway(!atBottom)
         },
-        className: cn('flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded',
-          'border border-(--ui-stroke-secondary) p-3'),
+        className: cn('flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-1 py-1'),
         children: body,
       }),
       away
@@ -1102,7 +1182,7 @@ function presetRowsFrom(settings) {
  * server whenever the saved values change (including after a save), so a
  * Cancel/close never leaves stale text behind on the next open.
  */
-function SettingsPanel({ settings, models, loading, error, onRetry, onClose }) {
+function SettingsPanel({ settings, models, loading, error, onRetry }) {
   const queryClient = useQueryClient()
   const [model, setModel] = useState(() => ({
     model: (settings && settings.default_model) || '',
@@ -1181,21 +1261,14 @@ function SettingsPanel({ settings, models, loading, error, onRetry, onClose }) {
 
   return jsxs('section', {
     'aria-label': 'Settings',
-    className: cn('flex shrink-0 flex-col gap-2 overflow-y-auto rounded border',
-      'border-(--ui-stroke-secondary) p-3 max-h-[26rem]'),
+    className: 'flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3',
     children: [
       jsxs('div', {
-        key: 'head', className: 'flex flex-wrap items-baseline justify-between gap-2',
+        key: 'head', className: 'flex flex-wrap items-center justify-between gap-2 text-[0.6875rem]',
         children: [
-          jsxs('div', {
-            key: 'title', className: 'flex min-w-0 items-baseline gap-2',
-            children: [
-              jsx('span', { key: 'l', className: 'text-xs font-medium text-(--ui-text-secondary)', children: 'Settings' }),
-              jsx('span', {
-                key: 'h', className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-quaternary)',
-                children: 'defaults apply to new chats and worker launches',
-              }),
-            ],
+          jsx('span', {
+            key: 'h', className: 'min-w-0 flex-1 truncate text-(--ui-text-quaternary)',
+            children: 'Defaults apply to new chats and worker launches.',
           }),
           jsxs('div', {
             key: 'actions', className: 'flex shrink-0 items-center gap-1',
@@ -1209,7 +1282,6 @@ function SettingsPanel({ settings, models, loading, error, onRetry, onClose }) {
                 onClick: () => { setNotice(''); onRetry() },
                 children: 'Refresh',
               }),
-              jsx(GhostButton, { key: 'cancel', onClick: onClose, children: 'Cancel' }),
             ],
           }),
         ],
@@ -1225,10 +1297,10 @@ function SettingsPanel({ settings, models, loading, error, onRetry, onClose }) {
       loading && !settings
         ? jsx('div', { key: 'loading', className: 'px-1 py-2 text-xs text-(--ui-text-tertiary)', children: 'Loading settings…' })
         : jsxs('div', {
-            key: 'columns', className: 'flex min-h-0 flex-col gap-3 md:flex-row',
+            key: 'columns', className: 'flex min-h-0 flex-col gap-4',
             children: [
               jsxs('div', {
-                key: 'defaults', className: 'flex min-w-0 flex-col gap-2 md:w-[22rem] md:shrink-0',
+                key: 'defaults', className: 'flex min-w-0 flex-col gap-2',
                 children: [
                   jsx('div', {
                     key: 'label', className: 'text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
@@ -1420,7 +1492,7 @@ function presetLabelText(preset) {
 }
 
 function Composer(props) {
-  const { mode, session, draft, onDraft, onSend, onStop, pending, stopPending, error,
+  const { mode, session, draft, onDraft, onSend, pending, error,
     model, onModelChange, repo, onRepoChange, models, inputRef,
     onSessionModel, modelPending, presets, presetName, onPreset } = props
   const busy = isBusy(session)
@@ -1461,6 +1533,7 @@ function Composer(props) {
           jsx('textarea', {
             key: 'input', ref: inputRef, rows: 2, value: draft,
             disabled: pending || busy, placeholder,
+            'aria-label': mode === 'session' ? 'Reply to this chat' : 'Describe the work',
             onChange: (event) => onDraft(event.target.value),
             onKeyDown: (event) => {
               if (event.key === 'Enter' && !event.shiftKey) {
@@ -1468,25 +1541,16 @@ function Composer(props) {
                 onSend()
               }
             },
-            className: cn('min-h-16 min-w-0 flex-1 resize-none rounded border border-(--ui-stroke-secondary)',
-              'bg-transparent px-2 py-1.5 text-xs text-(--ui-text-secondary)',
+            className: cn('min-h-16 min-w-0 flex-1 resize-none rounded-lg border border-(--ui-stroke-secondary)',
+              'bg-transparent px-3 py-2 text-sm leading-relaxed text-(--ui-text-secondary)',
               'placeholder:text-(--ui-text-quaternary) focus:outline-none disabled:opacity-60'),
           }),
-          jsxs('div', {
-            key: 'actions', className: 'flex shrink-0 flex-col gap-1',
-            children: [
-              jsx('button', {
-                key: 'send', type: 'button', disabled: !canSend, onClick: onSend,
-                className: cn('rounded px-3 py-1.5 text-xs text-(--ui-text-secondary)',
-                  'hover:bg-(--chrome-action-hover)', !canSend && 'opacity-50'),
-                children: pending ? (mode === 'session' ? 'Sending…' : 'Starting…') : 'Send',
-              }),
-              busy ? jsx('button', {
-                key: 'stop', type: 'button', disabled: stopPending, onClick: onStop,
-                className: 'rounded px-3 py-1.5 text-xs text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover)',
-                children: stopPending ? 'Stopping…' : 'Stop',
-              }) : null,
-            ],
+          jsx('button', {
+            key: 'send', type: 'button', disabled: !canSend, onClick: onSend,
+            title: 'Send (Enter)',
+            className: cn('shrink-0 self-end rounded bg-(--ui-bg-quaternary) px-3 py-1.5 text-xs',
+              'text-(--ui-text-primary) hover:bg-(--chrome-action-hover)', !canSend && 'opacity-50'),
+            children: pending ? (mode === 'session' ? 'Sending…' : 'Starting…') : 'Send',
           }),
         ],
       }),
@@ -1720,47 +1784,143 @@ function CommentBox({ session, onClose }) {
 
 // -- chat center ------------------------------------------------------------
 
+/** Secondary chat actions behind one ⋯: the SDK menu when this shell has it,
+ *  a plain popover list otherwise. Neither is a visible button, so the header
+ *  keeps at most Stop / Diff / Open. */
+function OverflowItem({ item }) {
+  return jsx('button', {
+    type: 'button',
+    role: 'menuitem',
+    disabled: !!item.disabled,
+    onClick: item.onSelect,
+    className: cn('flex w-full min-w-0 items-center rounded px-2 py-1 text-left text-xs',
+      'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
+      item.disabled && 'opacity-50'),
+    children: item.label,
+  })
+}
+
+function OverflowMenu({ items, label }) {
+  const [open, setOpen] = useState(false)
+  if (!items || !items.length) return null
+  const trigger = jsx('button', {
+    type: 'button',
+    'aria-label': label || 'More actions',
+    'aria-haspopup': 'menu',
+    'aria-expanded': !!open,
+    title: label || 'More actions',
+    onClick: () => setOpen((value) => !value),
+    className: cn('inline-flex h-6 w-6 items-center justify-center rounded leading-none',
+      'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)',
+      open && 'bg-(--chrome-action-hover) text-(--ui-text-secondary)'),
+    children: '⋯',
+  })
+  const entries = items.map((item) => jsx(OverflowItem, { key: item.id, item }))
+  if (DropdownMenu && DropdownMenuTrigger && DropdownMenuContent) {
+    return jsxs(DropdownMenu, {
+      open, onOpenChange: setOpen,
+      children: [
+        jsx(DropdownMenuTrigger, { key: 'trigger', asChild: true, children: trigger }),
+        jsx(DropdownMenuContent, { key: 'content', align: 'end', className: 'w-52 p-1', children: entries }),
+      ],
+    })
+  }
+  return jsxs('div', {
+    className: 'relative',
+    children: [
+      trigger,
+      open
+        ? jsx('div', {
+            role: 'menu',
+            'aria-label': label || 'More actions',
+            className: cn('absolute right-0 top-7 z-30 flex w-52 flex-col gap-0.5 rounded border',
+              'border-(--ui-stroke-secondary) bg-background p-1 shadow-md'),
+            children: entries,
+          })
+        : null,
+    ],
+  })
+}
+
+/** Two lines and three actions: title + status dot, then model · repo · PR.
+ *  Comment-on-PR and the workspace tile live behind the ⋯ menu. */
 function ChatHeader({ session, onStop, stopPending, tile, diff, comment }) {
   const canOpen = !!session.hermes_session_id && !!(host && typeof host.openSession === 'function')
   const canTile = !tile && !!(host && typeof host.openWorkspace === 'function')
-  const meta = [
-    jsx(Pill, { key: 'status', children: session.status }),
-    jsx('span', { key: 'model', className: 'text-(--ui-text-tertiary)', children: sessionModelLabel(session) }),
-  ]
-  if (session.repo) {
-    meta.push(jsx('span', {
-      key: 'repo', className: 'min-w-0 max-w-[18rem] truncate font-mono text-(--ui-text-quaternary)',
-      children: session.repo,
-    }))
+  const repo = String(session.repo || '').trim()
+  const busy = isBusy(session)
+  const detail = String(session.error || '').trim()
+
+  const overflow = []
+  if (!tile && comment) {
+    overflow.push({
+      id: 'comment',
+      label: comment.open ? 'Close the comment box' : `Comment on PR #${session.pr_number}`,
+      disabled: comment.disabled,
+      onSelect: comment.onToggle,
+    })
   }
-  if (session.pr_number) {
-    meta.push(jsx(PrBadge, { key: 'pr', session }))
-  } else if (session.pr_url) {
-    meta.push(jsx('button', {
-      key: 'pr', type: 'button', onClick: () => openUrl(session.pr_url),
-      className: 'shrink-0 text-(--ui-text-secondary) underline',
-      children: 'Pull request',
-    }))
-  }
-  if (session.error || session.status === 'failed') {
-    // A failed session must say why in the header, not leave the status pill
-    // to imply it. Wider and slightly brighter than a passive meta item.
-    const detail = String(session.error || '').trim()
-    meta.push(jsx('span', {
-      key: 'err',
-      title: detail || 'No error text was recorded for this turn.',
-      className: cn('min-w-0 max-w-[26rem] truncate',
-        session.status === 'failed' ? 'text-(--ui-text-secondary)' : 'text-(--ui-text-quaternary)'),
-      children: detail ? `error: ${clip(detail, 200)}` : 'failed: no error recorded',
-    }))
+  if (canTile) {
+    overflow.push({ id: 'tile', label: 'Open in a workspace tile', onSelect: () => openChatTile(session) })
   }
 
   return jsxs('div', {
-    className: 'flex flex-wrap items-center justify-between gap-2',
+    className: 'flex items-start justify-between gap-2',
     children: [
-      jsx('div', { key: 'meta', className: 'flex min-w-0 flex-wrap items-center gap-2 text-[0.6875rem]', children: meta }),
       jsxs('div', {
-        key: 'actions', className: 'flex shrink-0 items-center gap-1',
+        key: 'meta', className: 'flex min-w-0 flex-col gap-0.5',
+        children: [
+          jsxs('div', {
+            key: 'title', className: 'flex min-w-0 items-center gap-1.5',
+            children: [
+              jsx(ChatDot, { key: 'dot', status: session.status }),
+              jsx('span', {
+                key: 't', title: sessionTitle(session),
+                className: 'min-w-0 truncate text-sm font-medium text-(--ui-text-secondary)',
+                children: sessionTitle(session),
+              }),
+            ],
+          }),
+          jsxs('div', {
+            key: 'line', className: 'flex min-w-0 items-center gap-1.5 text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: [
+              jsx('span', { key: 'm', className: 'shrink-0', children: sessionModelLabel(session) }),
+              repo
+                ? jsxs('span', {
+                    key: 'r', className: 'flex min-w-0 items-center gap-1.5',
+                    children: [
+                      jsx('span', { key: 'd', className: 'shrink-0', children: '·' }),
+                      jsx('span', {
+                        key: 'p', title: repo,
+                        className: 'min-w-0 max-w-[18rem] truncate font-mono',
+                        children: clipMiddle(repo, 48),
+                      }),
+                    ],
+                  })
+                : null,
+              session.pr_number
+                ? jsx(PrBadge, { key: 'pr', session })
+                : (session.pr_url
+                    ? jsx('button', {
+                        key: 'prl', type: 'button', onClick: () => openUrl(session.pr_url),
+                        className: 'shrink-0 text-(--ui-text-secondary) underline',
+                        children: 'Pull request',
+                      })
+                    : null),
+            ],
+          }),
+          detail || session.status === 'failed'
+            ? jsx('span', {
+                key: 'err',
+                title: detail || 'No error text was recorded for this turn.',
+                className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-quaternary)',
+                children: detail ? `error: ${clip(detail, 200)}` : 'failed: no error recorded',
+              })
+            : null,
+        ],
+      }),
+      jsxs('div', {
+        key: 'actions', className: 'flex shrink-0 flex-wrap items-center justify-end gap-1',
         children: [
           diff ? jsx(GhostButton, {
             key: 'diff',
@@ -1769,30 +1929,17 @@ function ChatHeader({ session, onStop, stopPending, tile, diff, comment }) {
             onClick: diff.onToggle,
             children: diff.open ? 'Diff ▴' : (diff.count ? `Diff (${diff.count})` : 'Diff'),
           }) : null,
-          comment ? jsx(GhostButton, {
-            key: 'comment',
-            title: comment.disabled
-              ? 'Wait for this turn to finish, then comment on the pull request'
-              : `Write a comment on PR #${session.pr_number}`,
-            'aria-expanded': !!comment.open,
-            disabled: comment.disabled,
-            onClick: comment.onToggle,
-            children: comment.open ? 'Comment ▴' : 'Comment on PR',
-          }) : null,
-          canTile ? jsx(GhostButton, {
-            key: 'tile', title: 'Open in a workspace tile',
-            onClick: () => openChatTile(session),
-            children: '⧉',
-          }) : null,
           canOpen ? jsx(GhostButton, {
             key: 'open',
+            title: 'Open this chat in Hermes',
             onClick: () => { host.openSession(session.hermes_session_id).catch(() => {}) },
-            children: 'Open in Hermes',
+            children: 'Open',
           }) : null,
-          isBusy(session) && typeof onStop === 'function' ? jsx(GhostButton, {
-            key: 'stop', onClick: onStop, disabled: stopPending,
+          busy && typeof onStop === 'function' ? jsx(GhostButton, {
+            key: 'stop', title: 'Stop this turn', onClick: onStop, disabled: stopPending,
             children: stopPending ? 'Stopping…' : 'Stop',
           }) : null,
+          jsx(OverflowMenu, { key: 'more', items: overflow, label: 'More actions' }),
         ],
       }),
     ],
@@ -1800,7 +1947,7 @@ function ChatHeader({ session, onStop, stopPending, tile, diff, comment }) {
 }
 
 function ChatCenter(props) {
-  const { summary, detail, onStop, stopPending, canComment, ...composerProps } = props
+  const { summary, detail, onStop, stopPending, canComment, sessions, onSelect, banner, ...composerProps } = props
   const session = (detail && detail.data && detail.data.session) || summary
   const sessionId = session && session.id
   const busy = isBusy(session)
@@ -1817,14 +1964,15 @@ function ChatCenter(props) {
 
   if (!session) {
     return jsxs('div', {
-      className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-2',
+      className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-3',
       children: [
+        banner ? jsx('div', { key: 'banner', className: 'shrink-0', children: banner }) : null,
         jsx('div', {
           key: 'empty',
-          className: cn('flex min-h-0 flex-1 items-center justify-center rounded border',
-            'border-(--ui-stroke-secondary) p-4 text-center text-xs text-(--ui-text-tertiary)'),
+          className: 'flex min-h-0 flex-1 items-center justify-center p-4 text-center text-xs text-(--ui-text-tertiary)',
           children: 'Start a chat — pick a model and describe the work.',
         }),
+        jsx(LiveWorkerStrip, { key: 'workers', sessions, selectedId: null, onSelect }),
         jsx(Composer, { key: 'composer', mode: 'new', ...composerProps }),
       ],
     })
@@ -1845,12 +1993,13 @@ function ChatCenter(props) {
     : null
 
   return jsxs('div', {
-    className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-2',
+    className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-3',
     children: [
       jsx(ChatHeader, {
         key: 'head', session, onStop, stopPending,
         diff: diffAction, comment: commentAction,
       }),
+      banner ? jsx('div', { key: 'banner', className: 'shrink-0', children: banner }) : null,
       detail && detail.isError
         ? jsx(ErrorCard, {
             key: 'err', title: `Could not load ${session.id}.`, error: detail.error,
@@ -1867,6 +2016,7 @@ function ChatCenter(props) {
             key: 'comment', session, onClose: () => setCommentOpen(false),
           })
         : null,
+      jsx(LiveWorkerStrip, { key: 'workers', sessions, selectedId: sessionId, onSelect }),
       jsx(Composer, { key: 'composer', mode: 'session', session, ...composerProps }),
     ],
   })
@@ -1900,37 +2050,31 @@ function openChatTile(session) {
   }
 }
 
-// -- live workers -----------------------------------------------------------
+// -- live workers (a strip under the transcript, not a third column) --------
 
-/** Three dim event lines, oldest first — the last thing this worker did. */
-function WorkerFeed({ session }) {
+/** The last thing this worker did, on one line. A failed card's first
+ *  question is "why", so its stored error wins when no feed arrived. */
+function lastEventText(session) {
   const events = Array.isArray(session.recent_events) ? session.recent_events.filter(Boolean) : []
-  const lines = events.length
-    ? events.slice(0, 3).reverse().map((event) => {
-        const kind = String(event.kind || '').trim()
-        const detail = String(event.detail || '').replace(/\s+/g, ' ').trim()
-        return clip(detail ? `${kind}: ${detail}` : kind, 120)
-      })
-    : (() => {
-        // A failed card's first question is "why" — show the stored error
-        // before the generic last event when no mini-feed arrived.
-        const failure = session.status === 'failed' ? firstLine(session.error) : ''
-        const fallback = failure || String(session.last_event || '').replace(/\s+/g, ' ').trim()
-        return fallback ? [clip(fallback, 120)] : []
-      })()
-  if (!lines.length) return null
-  return jsx('div', {
-    className: 'flex min-w-0 flex-col gap-0.5 text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
-    children: lines.map((line, index) => jsx('div', {
-      key: `${index}:${line.slice(0, 16)}`,
-      className: 'min-w-0 truncate',
-      title: line,
-      children: line,
-    })),
-  })
+  const latest = events.length ? events[0] : null
+  let text = ''
+  if (latest) {
+    const kind = String(latest.kind || '').trim()
+    const detail = String(latest.detail || '').replace(/\s+/g, ' ').trim()
+    text = detail ? `${kind}: ${detail}` : kind
+  }
+  if (!text) {
+    const failure = session.status === 'failed' ? firstLine(session.error) : ''
+    text = failure || String(session.last_event || '').replace(/\s+/g, ' ').trim()
+  }
+  if (text) return clip(text, 120)
+  if (session.status === 'queued') return 'Queued — waiting for a slot'
+  if (session.status === 'review') return 'Finished — ready to review'
+  if (session.status === 'failed') return 'Failed'
+  return ''
 }
 
-function WorkerCard({ session, onSelect }) {
+function WorkerCard({ session, selected, onSelect }) {
   const busy = isBusy(session)
   // Client-only ticker: it repaints this card every second and touches no
   // query, so polling budgets stay exactly as configured.
@@ -1940,56 +2084,110 @@ function WorkerCard({ session, onSelect }) {
         ? `queued ${fmtSeconds(liveElapsedSeconds(session, now))}`
         : fmtSeconds(liveElapsedSeconds(session, now)))
     : timingLabel(session)
-  const tokens = busy ? '' : fmtTokens(session.tokens)
+  const event = lastEventText(session)
   return jsxs('button', {
     type: 'button',
     onClick: () => onSelect(session.id),
-    className: cn('flex w-full flex-col gap-1 rounded border border-(--ui-stroke-secondary)',
-      'p-2 text-left text-xs hover:bg-(--chrome-action-hover)'),
+    title: `${sessionTitle(session)} · ${sessionModelLabel(session)}`,
+    'aria-current': selected ? 'true' : undefined,
+    className: cn('flex h-[76px] w-56 shrink-0 flex-col gap-1 rounded border border-(--ui-stroke-secondary)',
+      'p-2 text-left hover:bg-(--chrome-action-hover)',
+      selected && 'bg-(--chrome-action-hover)'),
     children: [
-      jsxs('div', {
-        key: 'top', className: 'flex min-w-0 items-center gap-1.5',
-        children: [
-          jsx(ChatDot, { key: 'dot', status: session.status }),
-          jsx('span', { key: 't', className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: sessionTitle(session) }),
-          jsx(PrBadge, { key: 'pr', session }),
-          jsx('span', { key: 's', className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)', children: session.status }),
-        ],
+      jsx('span', {
+        key: 't', className: 'w-full truncate text-xs text-(--ui-text-secondary)',
+        children: sessionTitle(session),
       }),
-      jsxs('div', {
-        key: 'meta', className: 'flex min-w-0 items-baseline justify-between gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+      jsxs('span', {
+        key: 'm', className: 'flex w-full min-w-0 items-center gap-1 text-[0.6875rem] text-(--ui-text-quaternary)',
         children: [
-          jsx('span', { key: 'm', className: 'min-w-0 truncate', children: sessionModelLabel(session) }),
-          jsxs('span', {
-            key: 't', className: 'flex shrink-0 items-baseline gap-1 tabular-nums',
-            children: [
-              tokens ? jsx('span', { key: 'k', children: tokens }) : null,
-              tokens && timing ? jsx('span', { key: 'd', children: '·' }) : null,
-              jsx('span', { key: 'v', children: timing }),
-            ],
+          jsx('span', {
+            key: 'dot',
+            className: cn('flex shrink-0 items-center', session.status === 'running' && 'animate-pulse'),
+            children: jsx(ChatDot, { status: session.status }),
           }),
+          jsx('span', { key: 'model', className: 'min-w-0 flex-1 truncate', children: sessionModelLabel(session) }),
+          jsx('span', { key: 'e', className: 'shrink-0 tabular-nums', children: timing }),
         ],
       }),
-      jsx(WorkerFeed, { key: 'feed', session }),
+      jsx('span', {
+        key: 'ev', title: event,
+        className: 'w-full truncate text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
+        children: event,
+      }),
     ],
   })
 }
 
-function LiveWorkers({ sessions, onSelect }) {
-  const live = sessions.filter((session) => LIVE_STATUSES.indexOf(session.status) !== -1).slice(0, MAX_WORKERS)
+/** Collapsible strip under the transcript: a 28px header with a chevron and
+ *  one dot per live worker, then a horizontally scrolling row of cards.
+ *
+ *  It opens itself while anything is running or queued and folds when the
+ *  board goes quiet; a manual toggle wins until the next transition and is
+ *  remembered in storage so the next visit starts where the user left it. */
+function LiveWorkerStrip({ sessions, selectedId, onSelect }) {
+  const live = sessions
+    .filter((session) => LIVE_STATUSES.indexOf(session.status) !== -1)
+    .slice(0, MAX_WORKERS)
+  const active = live.some((session) => isBusy(session))
+  const [open, setOpen] = useState(() => active || readStored('workersOpen', '') === '1')
+  const wasActive = useRef(active)
+
+  useEffect(() => {
+    if (wasActive.current === active) return
+    wasActive.current = active
+    setOpen(active)
+  }, [active])
+
+  // Nothing live and nobody asked to see the empty state: no strip at all.
+  if (!live.length && !open) return null
+
+  const toggle = () => setOpen((value) => {
+    const next = !value
+    writeStored('workersOpen', next ? '1' : '0')
+    return next
+  })
+
   return jsxs('div', {
-    className: 'flex min-h-0 w-full flex-col gap-2 md:w-[20rem] md:shrink-0',
+    className: 'flex min-w-0 shrink-0 flex-col gap-1.5',
     children: [
-      jsx('div', {
-        key: 'label', className: 'text-xs font-medium text-(--ui-text-tertiary)',
-        children: live.length ? `Live workers (${live.length})` : 'Live workers',
+      jsxs('button', {
+        key: 'head',
+        type: 'button',
+        'aria-expanded': open,
+        'aria-label': `Live workers, ${live.length}`,
+        onClick: toggle,
+        className: cn('flex h-7 w-full items-center gap-1.5 rounded px-1 text-[0.6875rem]',
+          'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)'),
+        children: [
+          jsx(Caret, { key: 'caret', open }),
+          jsx('span', {
+            key: 'label', className: 'shrink-0 font-medium',
+            children: live.length ? `Live workers · ${live.length}` : 'Live workers',
+          }),
+          jsx('span', {
+            key: 'dots', className: 'flex min-w-0 items-center gap-1 pl-0.5',
+            children: live.slice(0, 6).map((session) =>
+              jsx(ChatDot, { key: session.id, status: session.status })),
+          }),
+        ],
       }),
-      jsx('div', {
-        key: 'grid', className: 'grid min-h-0 flex-1 grid-cols-1 content-start gap-2 overflow-y-auto pr-1',
-        children: live.length
-          ? live.map((session) => jsx(WorkerCard, { key: session.id, session, onSelect }))
-          : jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: 'Nothing running.' }),
-      }),
+      open
+        ? jsx('div', {
+            key: 'body',
+            className: 'flex min-w-0 gap-2 overflow-x-auto pb-1',
+            children: live.length
+              ? live.map((session) => jsx(WorkerCard, {
+                  key: session.id, session,
+                  selected: session.id === selectedId,
+                  onSelect,
+                }))
+              : jsx('div', {
+                  className: 'px-1 py-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+                  children: 'No live workers.',
+                }),
+          })
+        : null,
     ],
   })
 }
@@ -2147,26 +2345,11 @@ function GithubPanel({ status, prs, prsLoading, onSelectSession }) {
 
   return jsxs('section', {
     'aria-label': 'GitHub',
-    className: cn('flex shrink-0 flex-col gap-2 overflow-y-auto rounded border',
-      'border-(--ui-stroke-secondary) p-3 max-h-[24rem]'),
+    className: 'flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3',
     children: [
-      jsxs('div', {
-        key: 'head', className: 'flex flex-wrap items-baseline justify-between gap-2',
-        children: [
-          jsxs('div', {
-            key: 'title', className: 'flex min-w-0 items-baseline gap-2',
-            children: [
-              jsx('span', { key: 'l', className: 'text-xs font-medium text-(--ui-text-secondary)', children: 'GitHub' }),
-              jsx('span', {
-                key: 'r', className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-quaternary)',
-                title: statusRepo, children: statusRepo || 'no repository',
-              }),
-            ],
-          }),
-          jsx('span', {
-            key: 'status', className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: statusLine,
-          }),
-        ],
+      jsx('div', {
+        key: 'head', className: 'min-w-0 text-[0.6875rem] text-(--ui-text-tertiary)',
+        children: statusLine,
       }),
       failure
         ? jsx('div', { key: 'failure', className: 'truncate text-[0.6875rem] text-(--ui-text-quaternary)', children: failure })
@@ -2178,10 +2361,10 @@ function GithubPanel({ status, prs, prsLoading, onSelectSession }) {
           })
         : null,
       jsxs('div', {
-        key: 'columns', className: 'flex min-h-0 flex-col gap-3 md:flex-row',
+        key: 'columns', className: 'flex min-h-0 flex-col gap-4',
         children: [
           jsxs('div', {
-            key: 'connection', className: 'flex min-w-0 flex-col gap-1.5 md:w-[21rem] md:shrink-0',
+            key: 'connection', className: 'flex min-w-0 flex-col gap-1.5',
             children: [
               jsx('div', {
                 key: 'label', className: 'text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
@@ -2290,70 +2473,129 @@ function GithubPanel({ status, prs, prsLoading, onSelectSession }) {
 
 const ONBOARDING_STEPS = [
   {
+    key: 'settings',
+    short: 'Model preset',
     title: 'Pick a model / preset',
     hint: 'Set a default in Settings, or use the model picker in the composer.',
-    action: 'Open settings',
-    key: 'settings',
   },
   {
+    key: 'github',
+    short: 'Watch a repo',
     title: 'Connect a GitHub repo to watch PRs',
     hint: 'An empty allow-list means nobody can trigger work, and the agent ignores its own comments.',
-    action: 'Open GitHub',
-    key: 'github',
   },
   {
+    key: 'chat',
+    short: 'Start a chat',
     title: 'Start a chat below',
     hint: 'Describe the work, pick a repo if you want one, then press Enter.',
-    action: '',
-    key: 'chat',
   },
 ]
 
-/** Compact first-run card: three numbered steps, dismissible for good. */
-function OnboardingCard({ onSettings, onGithub, onStart, onDismiss }) {
+/** One slim row above the transcript: three numbered steps, each clickable,
+ *  and a dismiss that is remembered. Never a second card competing with the
+ *  chat. */
+function OnboardingBanner({ onSettings, onGithub, onStart, onDismiss }) {
   const actions = { settings: onSettings, github: onGithub, chat: onStart }
   return jsxs('section', {
     'aria-label': 'Getting started',
-    className: cn('flex shrink-0 flex-col gap-1.5 rounded border border-(--ui-stroke-secondary)',
-      'bg-transparent p-2.5 text-xs'),
+    className: cn('flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 rounded border',
+      'border-(--ui-stroke-secondary) px-2.5 py-1.5 text-[0.6875rem]'),
     children: [
-      jsxs('div', {
-        key: 'head', className: 'flex items-baseline justify-between gap-2',
-        children: [
-          jsx('span', { key: 't', className: 'font-medium text-(--ui-text-secondary)', children: 'Get started' }),
-          jsx(GhostButton, {
-            key: 'dismiss', className: 'shrink-0 px-1 py-0', title: 'Dismiss getting started',
-            'aria-label': 'Dismiss getting started', onClick: onDismiss, children: '×',
-          }),
-        ],
+      jsx('span', {
+        key: 'l', className: 'shrink-0 font-medium text-(--ui-text-secondary)',
+        children: 'Get started',
       }),
-      ...ONBOARDING_STEPS.map((step, index) => jsxs('div', {
-        key: step.key, className: 'flex min-w-0 items-start gap-2',
+      ...ONBOARDING_STEPS.map((step, index) => jsx('button', {
+        key: step.key,
+        type: 'button',
+        title: step.hint,
+        'aria-label': `${step.title}: ${step.hint}`,
+        onClick: actions[step.key],
+        className: cn('flex min-w-0 items-center gap-1 rounded px-1 py-0.5',
+          'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)'),
         children: [
           jsx('span', {
             key: 'n',
-            className: cn('mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full',
+            className: cn('flex h-4 w-4 shrink-0 items-center justify-center rounded-full',
               'border border-(--ui-stroke-secondary) text-[0.625rem] tabular-nums text-(--ui-text-tertiary)'),
             children: String(index + 1),
           }),
-          jsxs('div', {
-            key: 'body', className: 'flex min-w-0 flex-1 flex-col gap-0.5',
-            children: [
-              jsx('span', { key: 't', className: 'text-(--ui-text-secondary)', children: step.title }),
-              jsx('span', {
-                key: 'h', className: 'text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
-                children: step.hint,
-              }),
-            ],
-          }),
-          step.action
-            ? jsx(GhostButton, {
-                key: 'a', className: 'shrink-0 self-center', onClick: actions[step.key],
-                children: step.action,
-              })
-            : null,
+          jsx('span', { key: 's', className: 'min-w-0 truncate', children: step.short }),
         ],
       })),
+      jsx(GhostButton, {
+        key: 'dismiss', className: 'ml-auto shrink-0 px-1 py-0',
+        title: 'Dismiss getting started', 'aria-label': 'Dismiss getting started',
+        onClick: onDismiss, children: '✕',
+      }),
+    ],
+  })
+}
+
+// -- overlay drawers --------------------------------------------------------
+
+/** A right-side panel over the chat. It is absolutely positioned, so opening
+ *  GitHub or Settings cannot reflow the transcript, and it scrolls on its own.
+ *  Escape and the ✕ close it; the page restores focus to the header trigger. */
+function OverlayDrawer({ panel, title, subtitle, onClose, children }) {
+  const panelRef = useRef(null)
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+
+  useEffect(() => {
+    const el = panelRef.current
+    if (el && typeof el.focus === 'function') el.focus()
+    const onKeyDown = (event) => {
+      if (!event || event.key !== 'Escape') return
+      if (typeof event.preventDefault === 'function') event.preventDefault()
+      closeRef.current()
+    }
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
+
+  return jsxs('section', {
+    'aria-label': title,
+    'data-drawer': panel,
+    ref: panelRef,
+    tabIndex: -1,
+    className: cn('absolute inset-y-0 right-0 z-20 flex w-full max-w-full flex-col border-l',
+      'border-(--ui-stroke-secondary) bg-(--ui-bg-primary) shadow-lg focus:outline-none',
+      'md:w-[380px] md:max-w-[92vw]'),
+    children: [
+      jsxs('div', {
+        key: 'head',
+        className: cn('flex h-9 shrink-0 items-center justify-between gap-2 border-b',
+          'border-(--ui-stroke-secondary) px-3'),
+        children: [
+          jsxs('div', {
+            key: 't', className: 'flex min-w-0 items-baseline gap-2',
+            children: [
+              jsx('span', {
+                key: 'l', className: 'shrink-0 text-xs font-medium text-(--ui-text-secondary)',
+                children: title,
+              }),
+              subtitle
+                ? jsx('span', {
+                    key: 's', title: subtitle,
+                    className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-quaternary)',
+                    children: subtitle,
+                  })
+                : null,
+            ],
+          }),
+          jsx('button', {
+            key: 'x', type: 'button', 'aria-label': `Close ${title}`, title: 'Close (Esc)',
+            onClick: onClose,
+            className: cn('inline-flex h-6 w-6 shrink-0 items-center justify-center rounded',
+              'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)'),
+            children: '✕',
+          }),
+        ],
+      }),
+      jsx('div', { key: 'body', className: 'flex min-h-0 flex-1 flex-col overflow-hidden', children }),
     ],
   })
 }
@@ -2370,13 +2612,18 @@ function SuperagentPage() {
     model: readStored('lastModel', ''), provider: readStored('lastProvider', ''),
   }))
   const [repo, setRepo] = useState(() => readStored('lastRepo', ''))
-  const [githubOpen, setGithubOpen] = useState(false)
-  const [settingsOpen, setSettingsOpen] = useState(false)
+  // Exactly one drawer at a time: opening either closes the other.
+  const [drawer, setDrawer] = useState(null)
+  const githubOpen = drawer === 'github'
+  const settingsOpen = drawer === 'settings'
   const [presetName, setPresetName] = useState('')
   const [onboarded, setOnboarded] = useState(() => readStored('onboarded', '') === '1')
   const detail = useChat(selectedId)
   const settingsQuery = useSettings(settingsOpen)
   const inputRef = useRef(null)
+  // Focus returns here when a drawer closes (Escape, ✕, or a pick inside it).
+  const githubRef = useRef(null)
+  const settingsRef = useRef(null)
 
   const data = chatsQuery.data
   const sessions = useMemo(() => {
@@ -2391,7 +2638,6 @@ function SuperagentPage() {
   const counts = (data && data.counts) || {}
   const running = (data && data.running) || 0
   const queued = counts.queued || 0
-  const waiting = (counts.review || 0) + (counts.failed || 0)
   const selectedSummary = useMemo(
     () => sessions.find((session) => session.id === selectedId) || null,
     [sessions, selectedId],
@@ -2516,14 +2762,15 @@ function SuperagentPage() {
 
   const presetList = (modelsQuery.data && modelsQuery.data.presets) || []
 
-  const refresh = () => {
-    chatsQuery.refetch()
-    modelsQuery.refetch()
-    if (selectedId) detail.refetch()
-    if (githubOpen) {
-      githubQuery.refetch()
-      githubPrsQuery.refetch()
-    }
+  /** Toggle one drawer; the other closes because there is a single slot. */
+  const toggleDrawer = (name) => setDrawer((current) => (current === name ? null : name))
+
+  /** Close, then hand focus back to the button that opened it. */
+  const closeDrawer = () => {
+    const which = drawer
+    setDrawer(null)
+    const target = which === 'settings' ? settingsRef.current : githubRef.current
+    if (target && typeof target.focus === 'function') target.focus()
   }
 
   const stop = () => {
@@ -2531,39 +2778,63 @@ function SuperagentPage() {
     stopChat.mutate(selectedSession.id)
   }
 
-  const countLabel = queued
-    ? `${running} running · ${waiting} waiting · ${queued} queued`
-    : `${running} running · ${waiting} waiting`
+  // Only the segments that are non-zero: '2 running · 1 review', never '0 running'.
+  const summaryParts = []
+  if (running) summaryParts.push(`${running} running`)
+  if (queued) summaryParts.push(`${queued} queued`)
+  if (counts.review) summaryParts.push(`${counts.review} review`)
+  if (counts.failed) summaryParts.push(`${counts.failed} failed`)
+  const summaryLabel = summaryParts.join(' · ')
+
+  // The first-run banner rides above the transcript, not above the whole page.
+  const onboarding = !chatsQuery.isLoading && !onboarded && sessions.length === 0
+    ? jsx(OnboardingBanner, {
+        onSettings: () => setDrawer('settings'),
+        onGithub: () => setDrawer('github'),
+        onStart: startChat,
+        onDismiss: dismissOnboarding,
+      })
+    : null
 
   return jsxs('div', {
-    className: 'flex h-full min-h-0 flex-col gap-3 overflow-hidden p-4 text-sm',
+    className: 'relative flex h-full min-h-0 flex-col gap-3 overflow-hidden p-4 text-sm',
     children: [
       jsxs('div', {
-        key: 'header', className: 'flex flex-wrap items-center justify-between gap-2',
+        key: 'header', className: 'flex h-11 shrink-0 items-center justify-between gap-3',
         children: [
           jsxs('div', {
-            key: 'title', className: 'flex flex-wrap items-baseline gap-2',
+            key: 'title', className: 'flex min-w-0 items-baseline gap-2',
             children: [
-              jsx('span', { key: 'name', className: 'text-sm font-medium', children: 'Superagent' }),
-              jsx('span', { key: 'counts', className: 'text-xs text-(--ui-text-tertiary)', children: countLabel }),
+              jsx('span', { key: 'name', className: 'shrink-0 text-sm font-medium', children: 'Superagent' }),
+              summaryLabel
+                ? jsx('span', {
+                    key: 'counts', className: 'min-w-0 truncate text-xs text-(--ui-text-quaternary)',
+                    children: summaryLabel,
+                  })
+                : null,
             ],
           }),
           jsxs('div', {
-            key: 'actions', className: 'flex items-center gap-1',
+            key: 'actions', className: 'flex shrink-0 items-center gap-1.5',
             children: [
-              jsx(GhostButton, {
-                key: 'settings',
-                title: 'Settings: default model, presets and worker limits',
-                'aria-label': 'Settings', 'aria-expanded': !!settingsOpen,
-                onClick: () => setSettingsOpen((value) => !value),
+              jsx('button', {
+                key: 'new', type: 'button', onClick: newChat,
+                className: cn('shrink-0 rounded bg-primary px-2.5 py-1 text-xs font-medium',
+                  'text-primary-foreground hover:bg-primary/90'),
+                children: 'New chat',
+              }),
+              jsx(GithubHeaderButton, {
+                key: 'github', open: githubOpen, status: githubQuery.data,
+                onClick: () => toggleDrawer('github'), buttonRef: githubRef,
+              }),
+              jsx(HeaderIconButton, {
+                key: 'settings', label: 'Settings',
+                tip: 'Settings: default model, presets and worker limits',
+                active: settingsOpen,
+                onClick: () => toggleDrawer('settings'),
+                buttonRef: settingsRef,
                 children: '⚙',
               }),
-              jsx(GithubButton, {
-                key: 'github', open: githubOpen, status: githubQuery.data,
-                onClick: () => setGithubOpen((value) => !value),
-              }),
-              jsx(GhostButton, { key: 'new', onClick: newChat, children: 'New chat' }),
-              jsx(GhostButton, { key: 'refresh', onClick: refresh, children: 'Refresh' }),
             ],
           }),
         ],
@@ -2577,36 +2848,13 @@ function SuperagentPage() {
             }),
           })
         : null,
-      githubOpen
-        ? jsx(GithubPanel, {
-            key: 'github', status: githubQuery.data,
-            prs: githubPrsQuery.data, prsLoading: githubPrsQuery.isLoading,
-            onSelectSession: select,
-          })
-        : null,
-      settingsOpen
-        ? jsx(SettingsPanel, {
-            key: 'settings-panel', settings: settingsQuery.data, models: modelsQuery.data,
-            loading: settingsQuery.isLoading, error: settingsQuery.error,
-            onRetry: () => settingsQuery.refetch(),
-            onClose: () => setSettingsOpen(false),
-          })
-        : null,
-      !chatsQuery.isLoading && !onboarded && sessions.length === 0
-        ? jsx(OnboardingCard, {
-            key: 'onboarding',
-            onSettings: () => setSettingsOpen(true),
-            onGithub: () => setGithubOpen(true),
-            onStart: startChat,
-            onDismiss: dismissOnboarding,
-          })
-        : null,
       jsxs('div', {
         key: 'body', className: 'flex min-h-0 flex-1 flex-col gap-3 md:flex-row',
         children: [
           jsx(SessionsRail, { key: 'rail', sessions, selectedId, onSelect: select }),
           jsx(ChatCenter, {
             key: 'center', summary: selectedSummary, detail,
+            sessions, onSelect: select, banner: onboarding,
             draft, onDraft: setDraft, onSend: submit, onStop: stop,
             pending, stopPending, error: failure,
             // The PR comment needs a saved token; the status query already
@@ -2617,9 +2865,36 @@ function SuperagentPage() {
             onSessionModel: changeSessionModel, modelPending: setChatModel.isPending,
             presets: presetList, presetName, onPreset: pickPreset,
           }),
-          jsx(LiveWorkers, { key: 'workers', sessions, onSelect: select }),
         ],
       }),
+      githubOpen
+        ? jsx(OverlayDrawer, {
+            key: 'github-drawer',
+            panel: 'github',
+            title: 'GitHub',
+            subtitle: (githubQuery.data && githubQuery.data.repo) || 'no repository',
+            onClose: closeDrawer,
+            children: jsx(GithubPanel, {
+              status: githubQuery.data,
+              prs: githubPrsQuery.data, prsLoading: githubPrsQuery.isLoading,
+              onSelectSession: (id) => { select(id); closeDrawer() },
+            }),
+          })
+        : null,
+      settingsOpen
+        ? jsx(OverlayDrawer, {
+            key: 'settings-drawer',
+            panel: 'settings',
+            title: 'Settings',
+            subtitle: 'defaults, presets, worker limits',
+            onClose: closeDrawer,
+            children: jsx(SettingsPanel, {
+              settings: settingsQuery.data, models: modelsQuery.data,
+              loading: settingsQuery.isLoading, error: settingsQuery.error,
+              onRetry: () => settingsQuery.refetch(),
+            }),
+          })
+        : null,
     ],
   })
 }
