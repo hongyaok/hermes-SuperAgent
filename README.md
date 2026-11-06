@@ -203,7 +203,7 @@ hermes superagent doctor
 | `hermes superagent run <ticket-id>` | Promote an `observed`/`blocked`/`failed` ticket to `queued`. |
 | `hermes superagent show <id>` | A ticket's full detail, or a chat session (`S-…`) with messages and events. |
 | `hermes superagent chat "<prompt>"` | Start a headless chat turn (blocking; `--detach` returns immediately). `--preset <name>` resolves a named preset; `--model`/`--provider` still win. |
-| `hermes superagent sessions` / `stop <id>` | List chat sessions / cancel a queued or running turn. |
+| `hermes superagent sessions` / `stop <id>` | List chat sessions (archived ones are hidden; `--all` shows them) / cancel a queued or running turn. |
 | `hermes superagent diff <id>` | `git status` + `git diff --stat` + the (capped) patch for the session's repository; `--json` returns the full dict. `1` for an unknown session or one without a repository. |
 | `hermes superagent comment <id> [--body TEXT \| --body-file PATH]` | Post one summary comment to the session's pull request and print its URL. `1` without a PR/token or when GitHub refuses, `2` for bad usage. |
 | `hermes superagent models` | Default model/provider plus the preset section (`name -> provider: model`). |
@@ -237,13 +237,16 @@ Because cron automations execute as full Hermes agent turns, `Superagent watch` 
 
 The plugin ships a unified desktop extension (`desktop/plugin.js`) and a FastAPI backend (`dashboard/plugin_api.py` mounted at `/api/plugins/superagent`). GET ticket routes are read-only; `POST /ask`, `/run` and `/tick` record or queue tickets but cannot launch a ticket worker from REST. The chat, settings and GitHub routes drive the page:
 
-- `GET /api/plugins/superagent/health` — plugin version and SQLite database status.
+- `GET /api/plugins/superagent/health` — plugin version, `api_version`, the `features` list, `pid`, `started_at` (plugin load time), SQLite database status and `archived_count`.
 - `GET /api/plugins/superagent/tickets?limit=30` — status counts, `"Needs you"` attention list, and recent tickets.
 - `GET /api/plugins/superagent/tickets/{ticket_id}` — full ticket details and event log.
 - `GET /api/plugins/superagent/sessions` — enriched ticket rows (the ticket sessions grid; not chat sessions).
 - `POST /api/plugins/superagent/ask` · `/run` · `/tick` — record a ticket, queue a promotion, run one routing pass.
 - `GET|POST /api/plugins/superagent/chats` — list chat sessions / start a new headless chat.
 - `GET /api/plugins/superagent/chats/{session_id}` — one chat with its transcript and events.
+- `PATCH /api/plugins/superagent/chats/{session_id}` — rename a chat (`{title}`, 1–200 chars; `400` empty/oversized, `404` unknown).
+- `POST /api/plugins/superagent/chats/{session_id}/archive` — archive (`{archived: true}`, the default) or restore one chat; `409` while its turn is queued/running.
+- `DELETE /api/plugins/superagent/chats/{session_id}` — delete a chat and its transcript (`409` while queued/running). Files, worktrees and PRs are never touched.
 - `POST /api/plugins/superagent/chats/{session_id}/messages` — send a follow-up and resume the Hermes session.
 - `POST /api/plugins/superagent/chats/{session_id}/model` — set model/provider for future turns.
 - `POST /api/plugins/superagent/chats/{session_id}/stop` — cancel the running turn.
@@ -280,8 +283,9 @@ Each session row contains `id`, `status`, `source`, `requester`, `request` (160-
 The Superagent page (`/superagent`) is chat-first. Everything in the tab is backed by `/chats` and `/models`; ticket state is shown alongside but a chat turn never creates a ticket.
 
 - **Chat rail (left)** — the newest chats, each with status, model, age (or elapsed time while a turn runs). Selecting a row opens its transcript; **New chat** clears the composer.
+- **Chat housekeeping** — each row grows a `⋯` on hover/focus: **Rename** edits the title inline (Enter saves, Esc cancels, blur saves a change), **Archive** / **Unarchive** files a chat away, and **Delete** asks once (the app's confirm dialog) before removing the row and its transcript. Archived rows are dimmed and tagged, a compact **Show archived** toggle in the rail footer switches to `?archived=all` and is remembered, and an archived chat's header carries an **Archived** pill while its composer is read-only until it is unarchived. Nothing here touches files, worktrees or pull requests.
 - **Transcript (centre)** — the session prompt followed by `chat_messages` and `chat_events` merged in order, so assistant text interleaves with tool calls, errors and result lines. A failed turn shows the stored error.
-- **Composer** — a model picker fed by `/models` (presets plus **Default model**), an optional repo path (defaults to the configured repo) and Enter-to-send / Shift+Enter newline. While a turn is queued or running the composer is disabled and **Stop** cancels the turn.
+- **Composer** — a model picker fed by `/models` (presets plus **Default model**), an optional repo path (defaults to the configured repo) and Enter-to-send / Shift+Enter newline. While a turn is queued or running the composer is disabled and **Stop** cancels the turn; an archived chat is read-only (`Archived — unarchive to continue`).
 - **Chat header** — status, model/provider, tokens, duration, and **Open in Hermes** when `hermes_session_id` is known. A `failed` session puts its stored `error` in the header (prefixed `error:`) instead of leaving the status pill to imply it.
 - **Live workers (right)** — every queued or running chat as a card, so parallel workers stay visible without opening each chat. A failed card with no recent event feed shows the first line of the stored error.
 - **Completion toasts** — when a chat moves from `queued`/`running` to `review` or `failed` while the page is mounted, one `host.notify` toast says `<title> finished` (`info`) or `<title> failed` (`error`). The first poll only seeds the status map, so opening the page never replays old completions; `cancelled` is silent.
@@ -299,8 +303,11 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 | `GET` | `/models` | `{default_model, default_provider, models, presets}` from settings/env. `presets` is `[{name, model, provider}]` and is `[]` when none are configured; `models` is the flat list of preset models in order plus the configured `default_model`, never a hardcoded catalogue. |
 | `GET` | `/settings` | Merged, public settings (`mode`, `repo_path`, defaults, normalised `model_presets`, worker limits, GitHub watch fields) plus `github_token_set`; never the token. |
 | `POST` | `/settings` | Validate and save `mode`, `repo_path`, `default_model`, `default_provider`, `model_presets`, `max_workers` (1–8), `worker_yolo`, `chat_max_turns` (1–500); unknown keys and out-of-range values are `400`. Drops the Runner singleton so the next turn uses the new values. Returns `{ok, settings}`. |
-| `GET` | `/chats?limit=50` | `{db_exists, sessions, counts, running}`; also runs the runaway watchdog before answering. |
+| `GET` | `/chats?limit=50` | `{db_exists, sessions, counts, running, archived_count}`; also runs the runaway watchdog before answering. An optional `archived` query takes `hide` (default: no archived rows), `only` or `all`; an unknown value is `400`. `counts` describe the visible set. |
 | `POST` | `/chats` | Validate, create and launch a chat. Optional `preset` selects a named model (explicit `model`/`provider` still win; unknown preset is `400` listing the available names) and records a `preset` event. `400` on an empty/oversized prompt or an invalid repo; `200 {ok:false}` when the worker cannot start (the session is stored as `failed`). |
+| `PATCH` | `/chats/{id}` | Rename: `{title}` is trimmed, whitespace-collapsed and capped at 200 chars. `400` empty/oversized/non-string, `404` unknown id. Returns `{ok, session}`; allowed while a turn runs. |
+| `POST` | `/chats/{id}/archive` | `{archived?: true}` archives (stamps `archived_at` once, leaves `updated_at` alone) and `{archived: false}` restores. `409` while queued/running, `404` unknown. Returns `{ok, session}`. |
+| `DELETE` | `/chats/{id}` | Delete the row, its `chat_messages` and its `chat_events` in one transaction (`gh_seen` is kept so a GitHub comment is not replayed). `409` while queued/running, `404` unknown. Never deletes files. Returns `{ok, id}`. |
 | `GET` | `/chats/{id}` | Session with `messages` and `events`; `404` for an unknown id. |
 | `POST` | `/chats/{id}/messages` | Append the user message and resume the Hermes session. `409` while a turn is queued/running; `400` when the stored repo is no longer valid; with no `hermes_session_id` a fresh chat is created and `previous_session_id` is returned. |
 | `POST` | `/chats/{id}/model` | Set `{model, provider}` for future turns. `400` when both are empty, `409` while queued/running, `404` for an unknown id. |

@@ -362,6 +362,42 @@ def test_sessions_json_shape(sa, store, fake_executor, monkeypatch, capsys):
     assert row["tokens"] == 42
 
 
+def test_sessions_hide_archived_rows_unless_asked(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    chat = sa.sa_chats.ChatStore(store.path)
+    visible = chat.create_session("visible task")
+    filed = chat.create_session("filed task")
+    chat.set_archived(filed["id"])
+
+    rc = sa.sa_cli.run(_args(superagent_command="sessions", limit=20), object())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert visible["id"] in out and filed["id"] not in out
+    assert "archived=1" in out and "--all" in out
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="sessions", limit=20, show_archived=True), object()
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert visible["id"] in out and filed["id"] in out
+
+
+def test_sessions_json_reports_the_archived_count(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    chat = sa.sa_chats.ChatStore(store.path)
+    filed = chat.create_session("filed task")
+    chat.set_archived(filed["id"])
+
+    rc = sa.sa_cli.run(_args(superagent_command="sessions", json=True), object())
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert data["sessions"] == []
+    assert data["archived_count"] == 1
+
+
 def test_show_session_detail_has_messages_and_events(
     sa, store, fake_executor, monkeypatch, capsys
 ):

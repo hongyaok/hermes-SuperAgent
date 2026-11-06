@@ -65,6 +65,12 @@ except ImportError:  # loaded standalone by the gateway / pytest
 router = APIRouter()
 
 VERSION = "0.4.0"
+# Contract generation for the desktop: bumped when a release adds routes the
+# panel feature-detects (v2 = session management: rename/archive/delete).
+API_VERSION = 2
+FEATURES = ("chats", "settings", "github", "diff", "session_management")
+# Module import time: when the gateway loaded this plugin, not the request time.
+STARTED_AT = time.time()
 
 # Server-side caps (mirrored in sa_runner so the runner enforces them too).
 MAX_PROMPT_CHARS = sa_runner.MAX_PROMPT_CHARS
@@ -468,8 +474,38 @@ def _session_row(ticket: sqlite3.Row, last_event: dict[str, Any] | None) -> dict
 
 @router.get("/health")
 def health() -> dict[str, Any]:
+    """Liveness plus the shape of this API, so a desktop can adapt.
+
+    ``api_version`` is the contract generation; ``features`` names the
+    namespaces this build serves. ``started_at`` is the module import time
+    (when the gateway loaded the plugin), not the request time.
+    """
     path = _db_path()
-    return {"ok": True, "version": VERSION, "db_exists": path.is_file(), "db_path": str(path)}
+    archived = 0
+    if path.is_file():
+        # Read-only and defensive: an older database without chat_sessions (or
+        # without the column) still answers, it just reports zero.
+        try:
+            with _connect_ro(path) as conn:
+                archived = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS n FROM chat_sessions"
+                        " WHERE archived_at IS NOT NULL"
+                    ).fetchone()["n"]
+                )
+        except Exception:
+            archived = 0  # a health answer is never worth a 500
+    return {
+        "ok": True,
+        "version": VERSION,
+        "api_version": API_VERSION,
+        "features": list(FEATURES),
+        "pid": os.getpid(),
+        "started_at": STARTED_AT,
+        "db_exists": path.is_file(),
+        "db_path": str(path),
+        "archived_count": archived,
+    }
 
 
 @router.get("/tickets")
@@ -825,21 +861,33 @@ def list_models() -> dict[str, Any]:
 
 
 @router.get("/chats")
-def list_chats(limit: int = 50, status: str = "") -> dict[str, Any]:
+def list_chats(limit: int = 50, status: str = "", archived: str = "hide") -> dict[str, Any]:
     """Sessions newest-first; live rows carry ``recent_events``/``elapsed_seconds``.
 
     ``?status=running,queued`` narrows the rows (comma separated); omitting it
-    keeps the historical behaviour. Status counts stay board-wide.
+    keeps the historical behaviour. ``?archived=hide|only|all`` picks whether
+    archived sessions are visible (default ``hide``); an unknown value is a 400
+    rather than a silently different board. Status counts describe the visible
+    set, and ``archived_count`` always says how many are filed away.
     """
     path = _db_path()
     if not path.is_file():
-        return {"db_exists": False, "sessions": [], "counts": {}, "running": 0}
+        return {
+            "db_exists": False, "sessions": [], "counts": {}, "running": 0,
+            "archived_count": 0,
+        }
     limit = max(1, min(int(limit or 50), 200))
+    mode = str(archived if archived is not None else "hide").strip().lower() or "hide"
+    if mode not in sa_chats.ARCHIVED_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"archived must be one of {', '.join(sa_chats.ARCHIVED_MODES)}",
+        )
     # A list read is also the supervisor: turns past the timeout are cancelled
     # here, so a forgotten chat cannot hold a worker slot forever.
     _reap_turns()
     statuses = [part.strip() for part in str(status or "").split(",") if part.strip()]
-    data = _chat_store().list_sessions(limit=limit, statuses=statuses)
+    data = _chat_store().list_sessions(limit=limit, statuses=statuses, archived=mode)
     return {"db_exists": True, **data}
 
 
@@ -850,6 +898,76 @@ def get_chat(session_id: str) -> dict[str, Any]:
     if session is None:
         raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
     return {"db_exists": True, "session": session}
+
+
+@router.patch("/chats/{session_id}")
+def rename_chat(session_id: str, body: dict | None = None) -> dict[str, Any]:
+    """Rename one chat. 400 for an empty/oversized title, 404 for an unknown id.
+
+    A title is a human label, not a prompt: it is trimmed, whitespace-collapsed
+    and capped at 200 chars, and nothing else about the session changes.
+    """
+    session_id = _check_session_id(session_id)
+    data = body if isinstance(body, dict) else {}
+    raw = data.get("title")
+    if raw is not None and not isinstance(raw, str):
+        raise HTTPException(status_code=400, detail="title must be a string")
+    store = _chat_store()
+    try:
+        updated = store.rename_session(session_id, raw if raw is not None else "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    return {"ok": True, "session": updated}
+
+
+@router.post("/chats/{session_id}/archive")
+def archive_chat(session_id: str, body: dict | None = None) -> dict[str, Any]:
+    """Archive (default) or restore one chat. 409 while its turn is live.
+
+    The row stays in SQLite with its transcript; only ``archived_at`` changes,
+    so the rail can hide it and the header can offer "unarchive".
+    """
+    session_id = _check_session_id(session_id)
+    data = body if isinstance(body, dict) else {}
+    raw = data.get("archived", True)
+    archived = True if raw is None else _settings_bool(raw, "archived")
+    store = _chat_store()
+    session = store.get_session(session_id, message_limit=0)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    if session["status"] in (sa_chats.QUEUED, sa_chats.RUNNING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"session {session_id} is {session['status']}; wait for the turn to finish",
+        )
+    updated = store.set_archived(session_id, archived=archived)
+    if updated is None:  # deleted between the read and the write
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    return {"ok": True, "session": updated}
+
+
+@router.delete("/chats/{session_id}")
+def delete_chat(session_id: str) -> dict[str, Any]:
+    """Delete one chat and its transcript. 409 while its turn is live.
+
+    A database delete only: the session row, its messages and its events go;
+    the repository, worktree, branch and pull request are never touched.
+    """
+    session_id = _check_session_id(session_id)
+    store = _chat_store()
+    session = store.get_session(session_id, message_limit=0)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    if session["status"] in (sa_chats.QUEUED, sa_chats.RUNNING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"session {session_id} is {session['status']}; stop it before deleting",
+        )
+    if not store.delete_session(session_id):
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    return {"ok": True, "id": session_id}
 
 
 @router.post("/chats")

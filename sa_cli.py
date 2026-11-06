@@ -562,7 +562,12 @@ def _enrich_sessions(data: dict, now: float | None = None) -> list[dict]:
 def render_sessions(data: dict) -> str:
     rows = data.get("sessions") or []
     counts = data.get("counts") or {}
-    lines = [f"Chat sessions   total={len(rows)}   running={data.get('running', 0)}"]
+    archived = int(data.get("archived_count") or 0)
+    header = f"Chat sessions   total={len(rows)}   running={data.get('running', 0)}"
+    if archived:
+        # Hidden by default; the count is what tells a reader they exist.
+        header += f"   archived={archived} (hidden; --all shows them)"
+    lines = [header]
     if counts:
         lines.append("  " + "  ".join(f"{key}={value}" for key, value in sorted(counts.items())))
     lines.append("")
@@ -791,14 +796,16 @@ def _list_sessions(args: argparse.Namespace, engine: Any, want_json: bool) -> in
     except (TypeError, ValueError):
         limit = 20
     limit = max(1, min(limit, 200))
+    archived = "all" if getattr(args, "show_archived", False) else "hide"
     try:
         store = _chat_store(engine)
-        data = store.list_sessions(limit=limit)
+        data = store.list_sessions(limit=limit, archived=archived)
         payload = {
             "db_exists": Path(str(store.path)).is_file(),
             "sessions": _enrich_sessions(data),
             "counts": data.get("counts") or {},
             "running": data.get("running", 0),
+            "archived_count": data.get("archived_count", 0),
         }
     except Exception as exc:
         print(f"error: sessions failed: {exc}")
@@ -1394,6 +1401,10 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
     _add_json_flag(chat_p)
     sessions_p = subs.add_parser("sessions", help="List chat sessions, newest first")
     sessions_p.add_argument("--limit", type=int, default=20, help="How many sessions to show")
+    sessions_p.add_argument(
+        "--all", dest="show_archived", action="store_true",
+        help="Include archived sessions (hidden by default)",
+    )
     _add_json_flag(sessions_p)
     stop_p = subs.add_parser("stop", help="Cancel a queued or running chat turn")
     stop_p.add_argument("session_id", help="Chat session id (e.g. S-0001)")

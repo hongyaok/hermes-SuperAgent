@@ -501,7 +501,10 @@ class Runner:
         moment = time.time() if now is None else float(now)
         expired: list[dict] = []
         try:
-            sessions = self.chat.list_sessions(limit=500).get("sessions", [])
+            # Archived rows are hidden from the rail but must still be reaped:
+            # a turn that was archived in a race with its own launch is live
+            # all the same.
+            sessions = self.chat.list_sessions(limit=500, archived="all").get("sessions", [])
         except Exception:
             return expired
         for row in sessions:

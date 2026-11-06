@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     created_at        REAL NOT NULL,
     updated_at        REAL NOT NULL,
     started_at        REAL,
-    finished_at       REAL
+    finished_at       REAL,
+    archived_at       REAL
 );
 CREATE INDEX IF NOT EXISTS chat_sessions_updated ON chat_sessions(updated_at);
 CREATE INDEX IF NOT EXISTS chat_sessions_status ON chat_sessions(status, updated_at);
@@ -110,11 +111,20 @@ UPDATABLE = (
     "last_event",
     "started_at",
     "finished_at",
+    # set_archived() is the normal door; the column stays writable so a
+    # migration or a repair script can move a whole set in one call.
+    "archived_at",
 )
 
 MAX_MESSAGE_CHARS = 20000
 MAX_EVENT_CHARS = 2000
 MAX_TITLE_CHARS = 80
+# A renamed title may be longer than the 80-char derived one: it is a human's
+# own label, and the rail truncates it for display. The column is TEXT.
+MAX_RENAME_CHARS = 200
+
+# Which archived rows list_sessions() / GET /chats return.
+ARCHIVED_MODES = ("hide", "only", "all")
 
 # Statuses that are doing something right now. Only these rows get the live
 # extras in list_sessions(); a board of 50 historical chats stays slim.
@@ -165,6 +175,26 @@ class ChatStore:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Bring a pre-existing chat_sessions table up to this schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an old table untouched, so a
+        column added after the first install (``archived_at``) has to be
+        altered in place. The archived index is created here rather than in
+        :data:`SCHEMA`: it names the new column, and ``executescript`` would
+        fail on an old table before the ALTER had a chance to run. Idempotent,
+        and every open calls it, so an upgrade is just "open the store once".
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(chat_sessions)")}
+        if "archived_at" not in columns:
+            conn.execute("ALTER TABLE chat_sessions ADD COLUMN archived_at REAL")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS chat_sessions_archived"
+            " ON chat_sessions(archived_at)"
+        )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -257,6 +287,64 @@ class ChatStore:
                 conn.execute(f"UPDATE chat_sessions SET {assignments} WHERE id = :id", payload)
         return self.get_session(session_id, message_limit=0)
 
+    def rename_session(self, session_id: str, title: str) -> Optional[dict]:
+        """Give a session a human title (trimmed, 1..200 chars).
+
+        Whitespace is collapsed so a pasted multi-line label still reads as one
+        line in the rail. ``ValueError`` for a title the store will not keep
+        (the endpoint turns that into a 400); ``None`` for an unknown id.
+        """
+        text = " ".join(str(title if title is not None else "").split())
+        if not text:
+            raise ValueError("title is required")
+        if len(text) > MAX_RENAME_CHARS:
+            raise ValueError(f"title is too long (max {MAX_RENAME_CHARS} chars)")
+        return self.update_session(session_id, title=text)
+
+    def set_archived(self, session_id: str, archived: bool = True) -> Optional[dict]:
+        """Archive or restore a session; returns the row, or None if unknown.
+
+        Archiving stamps ``archived_at`` once (a second archive keeps the
+        original moment) and deliberately does **not** touch ``updated_at``:
+        the row keeps its place in the newest-first list instead of jumping to
+        the top merely because it was filed away. Restoring clears the stamp.
+        """
+        if not self.exists(session_id):
+            return None
+        if archived:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE chat_sessions SET archived_at = COALESCE(archived_at, ?)"
+                    " WHERE id = ?",
+                    (time.time(), session_id),
+                )
+        else:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE chat_sessions SET archived_at = NULL WHERE id = ?", (session_id,)
+                )
+        return self.get_session(session_id, message_limit=0)
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session and its transcript in one transaction.
+
+        Messages and events go with the row; ``gh_seen`` does **not**, so a
+        GitHub comment that already produced a session is not replayed into a
+        new one after its session is deleted. Files and worktrees are never
+        touched here — this is a database delete, nothing more.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT 1 FROM chat_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM chat_events WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+        return True
+
     def get_session(
         self, session_id: str, message_limit: int = 200, event_limit: int = 50
     ) -> Optional[dict]:
@@ -270,7 +358,10 @@ class ChatStore:
         return session
 
     def list_sessions(
-        self, limit: int = 50, statuses: Optional[Sequence[str]] = None
+        self,
+        limit: int = 50,
+        statuses: Optional[Sequence[str]] = None,
+        archived: str = "hide",
     ) -> dict:
         """Recent sessions plus status counts for the live session grid.
 
@@ -278,15 +369,40 @@ class ChatStore:
         ``RECENT_EVENT_LIMIT`` events, so a grid of cards can draw a per-card
         feed from one poll instead of a detail request per card. Historical rows
         stay slim on purpose. ``statuses`` filters the rows only; ``counts``
-        keep describing the whole board so the header still tells the truth.
+        describe the whole board minus archived rows, so the header still tells
+        the truth.
+
+        ``archived`` picks which rows are visible: ``hide`` (the default) never
+        returns an archived session, ``only`` returns just those, ``all``
+        returns both. Counts follow that visibility — an archived chat must not
+        inflate "3 review" while its card cannot be seen — and
+        ``archived_count`` always reports how many archived rows exist, so the
+        rail's "Show archived" toggle has a number even while hiding them.
         """
         limit = max(1, int(limit))
+        mode = str(archived or "hide").strip().lower()
+        if mode not in ARCHIVED_MODES:
+            raise ValueError(
+                f"archived must be one of {', '.join(ARCHIVED_MODES)} (got {archived!r})"
+            )
         wanted = [str(status).strip() for status in (statuses or []) if str(status).strip()]
-        clause = ""
+        clauses: list[str] = []
         params: list[Any] = []
         if wanted:
-            clause = " WHERE s.status IN (%s)" % ", ".join("?" for _ in wanted)
+            clauses.append("s.status IN (%s)" % ", ".join("?" for _ in wanted))
             params.extend(wanted)
+        if mode == "hide":
+            clauses.append("s.archived_at IS NULL")
+        elif mode == "only":
+            clauses.append("s.archived_at IS NOT NULL")
+        clause = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        # Counts ignore the status filter (existing behaviour) but obey the
+        # archived one, so "running" can never count a hidden card.
+        count_clause = ""
+        if mode == "hide":
+            count_clause = " WHERE archived_at IS NULL"
+        elif mode == "only":
+            count_clause = " WHERE archived_at IS NOT NULL"
         params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
@@ -298,9 +414,15 @@ class ChatStore:
             counts = {
                 row["status"]: row["n"]
                 for row in conn.execute(
-                    "SELECT status, COUNT(*) AS n FROM chat_sessions GROUP BY status"
+                    "SELECT status, COUNT(*) AS n FROM chat_sessions" + count_clause
+                    + " GROUP BY status"
                 )
             }
+            archived_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM chat_sessions WHERE archived_at IS NOT NULL"
+                ).fetchone()["n"]
+            )
             sessions = [dict(row) for row in rows]
             live_ids = [row["id"] for row in sessions if row["status"] in LIVE_STATUSES]
             feeds = self._recent_events(conn, live_ids)
@@ -309,7 +431,12 @@ class ChatStore:
             session["elapsed_seconds"] = _elapsed_seconds(session, now)
             if session["id"] in feeds:
                 session["recent_events"] = feeds[session["id"]]
-        return {"sessions": sessions, "counts": counts, "running": counts.get(RUNNING, 0)}
+        return {
+            "sessions": sessions,
+            "counts": counts,
+            "running": counts.get(RUNNING, 0),
+            "archived_count": archived_count,
+        }
 
     def _recent_events(
         self,

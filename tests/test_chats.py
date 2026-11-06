@@ -216,3 +216,200 @@ def test_chat_tables_live_in_the_ticket_database(tmp_path, sa):
     chat.create_session("a chat")
     assert len(store.list()) == 1  # ticket tables untouched
     assert len(chat.list_sessions()["sessions"]) == 1
+
+
+# -- session management (iteration 14) -------------------------------------
+#
+# Rename, archive and delete are housekeeping on the same rows: none of them
+# may disturb the ticket schema, the transcript, or a repository on disk.
+
+
+def _old_schema_without_archived(sa) -> str:
+    """The pre-iteration-14 chat_sessions shape (no archived_at, no index)."""
+    lines = [line for line in sa.sa_chats.SCHEMA.splitlines() if "archived_at" not in line]
+    old = "\n".join(lines).replace("finished_at       REAL,", "finished_at       REAL")
+    assert "archived_at" not in old
+    return old
+
+
+def test_an_old_database_gains_the_archived_column_in_place(tmp_path, sa):
+    import sqlite3
+
+    db = tmp_path / "superagent.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(_old_schema_without_archived(sa))
+    conn.execute(
+        "INSERT INTO chat_sessions (id, title, prompt, status, created_at, updated_at)"
+        " VALUES ('S-0007', 'older chat', 'older prompt', 'idle', 1.0, 1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = sa_chats.ChatStore(db)
+
+    with sqlite3.connect(db) as check:
+        columns = {row[1] for row in check.execute("PRAGMA table_info(chat_sessions)")}
+    assert "archived_at" in columns
+    # The pre-existing row is readable and simply not archived.
+    old = store.get_session("S-0007", message_limit=0)
+    assert old["archived_at"] is None
+    assert store.list_sessions()["sessions"][0]["id"] == "S-0007"
+
+    archived = store.set_archived("S-0007")
+    assert archived["archived_at"] is not None
+    # Opening the store again is idempotent: no duplicate-column error.
+    sa_chats.ChatStore(db)
+    assert sa_chats.ChatStore(db).get_session("S-0007", message_limit=0)["archived_at"]
+
+
+def test_rename_session_stores_a_trimmed_title(chat):
+    session = chat.create_session("fix the parser")
+    renamed = chat.rename_session(session["id"], "  Parser crash  ")
+    assert renamed["title"] == "Parser crash"
+    assert chat.get_session(session["id"], message_limit=0)["title"] == "Parser crash"
+
+
+def test_rename_session_collapses_whitespace_and_newlines(chat):
+    session = chat.create_session("work")
+    renamed = chat.rename_session(session["id"], "  One\ttwo\n\nthree  ")
+    assert renamed["title"] == "One two three"
+
+
+def test_rename_session_accepts_a_longer_title_than_a_derived_one(chat):
+    session = chat.create_session("work")
+    title = "t" * sa_chats.MAX_RENAME_CHARS
+    assert chat.rename_session(session["id"], title)["title"] == title
+
+
+def test_rename_session_rejects_empty_and_oversized_titles(chat):
+    session = chat.create_session("work")
+    for title in ("", "   ", "\n\t", "x" * (sa_chats.MAX_RENAME_CHARS + 1)):
+        try:
+            chat.rename_session(session["id"], title)
+        except ValueError:
+            pass
+        else:  # pragma: no cover - every value above must raise
+            raise AssertionError(f"title {title!r} should not be accepted")
+    # A rejected rename leaves the old title alone.
+    assert chat.get_session(session["id"], message_limit=0)["title"] == "work"
+
+
+def test_rename_unknown_session_returns_none(chat):
+    assert chat.rename_session("S-9999", "anything") is None
+
+
+def test_archive_sets_the_stamp_and_unarchive_clears_it(chat):
+    session = chat.create_session("file me away")
+    assert session["archived_at"] is None
+
+    archived = chat.set_archived(session["id"])
+    assert archived["archived_at"] is not None
+    assert chat.get_session(session["id"], message_limit=0)["archived_at"] == archived["archived_at"]
+
+    restored = chat.set_archived(session["id"], archived=False)
+    assert restored["archived_at"] is None
+
+
+def test_archive_is_idempotent_and_does_not_reorder_the_rail(chat):
+    session = chat.create_session("keep my place")
+    chat.update_session(session["id"], status="review")
+    before = chat.get_session(session["id"], message_limit=0)
+
+    first = chat.set_archived(session["id"])
+    second = chat.set_archived(session["id"])
+
+    assert second["archived_at"] == first["archived_at"]  # the first moment wins
+    assert second["updated_at"] == before["updated_at"]  # filing is not activity
+
+
+def test_set_archived_unknown_session_returns_none(chat):
+    assert chat.set_archived("S-9999") is None
+    assert chat.set_archived("S-9999", archived=False) is None
+
+
+def test_archived_at_is_writable_through_update_session(chat):
+    session = chat.create_session("repair path")
+    updated = chat.update_session(session["id"], archived_at=123.5)
+    assert updated["archived_at"] == 123.5
+
+
+def test_list_sessions_hides_archived_rows_by_default(chat):
+    visible = chat.create_session("visible")
+    filed = chat.create_session("filed")
+    chat.set_archived(filed["id"])
+
+    data = chat.list_sessions()
+    assert [row["id"] for row in data["sessions"]] == [visible["id"]]
+    assert data["archived_count"] == 1
+    # Counts describe what the rail can actually show.
+    assert data["counts"] == {"queued": 1}
+    assert data["running"] == 0
+
+
+def test_list_sessions_archived_only_and_all(chat):
+    first = chat.create_session("visible")
+    second = chat.create_session("filed")
+    chat.set_archived(second["id"])
+
+    only = chat.list_sessions(archived="only")
+    assert [row["id"] for row in only["sessions"]] == [second["id"]]
+    assert only["archived_count"] == 1
+    assert only["counts"] == {"queued": 1}
+
+    everything = chat.list_sessions(archived="all")
+    assert {row["id"] for row in everything["sessions"]} == {first["id"], second["id"]}
+    assert everything["archived_count"] == 1
+    assert everything["counts"] == {"queued": 2}
+
+
+def test_list_sessions_archived_count_survives_a_status_filter(chat):
+    running = chat.create_session("running")
+    chat.update_session(running["id"], status="running")
+    filed = chat.create_session("filed")
+    chat.set_archived(filed["id"])
+
+    data = chat.list_sessions(statuses=["running"])
+    assert [row["id"] for row in data["sessions"]] == [running["id"]]
+    assert data["archived_count"] == 1
+
+
+def test_list_sessions_rejects_an_unknown_archived_mode(chat):
+    chat.create_session("one")
+    try:
+        chat.list_sessions(archived="sometimes")
+    except ValueError as exc:
+        assert "archived" in str(exc)
+    else:  # pragma: no cover - the call above must raise
+        raise AssertionError("an unknown archived mode should raise")
+
+
+def test_delete_session_removes_the_row_messages_and_events(chat):
+    session = chat.create_session("delete me")
+    keep = chat.create_session("keep me")
+    chat.add_message(session["id"], "user", "hello")
+    chat.add_event(session["id"], "tool", "ls")
+
+    assert chat.delete_session(session["id"]) is True
+    assert chat.get_session(session["id"]) is None
+    assert chat.get_messages(session["id"]) == []
+    assert chat.get_events(session["id"]) == []
+    assert [row["id"] for row in chat.list_sessions()["sessions"]] == [keep["id"]]
+    # The neighbour's transcript is untouched.
+    assert [m["content"] for m in chat.get_messages(keep["id"])] == []
+
+
+def test_delete_unknown_session_returns_false(chat):
+    assert chat.delete_session("S-9999") is False
+
+
+def test_delete_keeps_the_github_dedupe_rows_and_files_on_disk(tmp_path, chat):
+    marker = tmp_path / "worktree.txt"
+    marker.write_text("still here", encoding="utf-8")
+    session = chat.create_session("github work")
+    chat.mark_seen("gh_comment:owner/repo:7")
+
+    assert chat.delete_session(session["id"]) is True
+    # A deleted session must not make the watcher replay its comment...
+    assert chat.is_seen("gh_comment:owner/repo:7") is True
+    # ...and a delete is never a file operation.
+    assert marker.read_text(encoding="utf-8") == "still here"

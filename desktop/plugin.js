@@ -4,6 +4,8 @@
  * Data path: ctx.rest('/chats'), '/chats/{id}', '/chats/{id}/diff',
  * '/chats/{id}/comment-preview', '/models', '/settings', POST /chats,
  * POST /chats/{id}/messages, POST /chats/{id}/model, POST /chats/{id}/stop,
+ * PATCH /chats/{id} (rename), POST /chats/{id}/archive (archive/unarchive),
+ * DELETE /chats/{id} (row + transcript only — never files), and
  * POST /chats/{id}/comment, POST /settings → dashboard/plugin_api.py. The list
  * query polls at 2s while a worker runs and 8s when the board is quiet; the
  * open transcript polls at 1.5s while its own turn is live. The diff panel is
@@ -11,6 +13,12 @@
  * Every mutation invalidates both so the rail, the transcript, and the worker
  * strip agree on the next paint. The per-card elapsed timer ticks on local
  * state only — it must never add a request to those budgets.
+ *
+ * Housekeeping lives behind a per-row ⋯ that only appears on hover/focus: a
+ * rename is an inline editor in the row, archive keeps the row (dimmed, tagged)
+ * and makes the composer read-only, and delete asks once before removing the
+ * database rows. `?archived=all` is the "Show archived" filter, remembered in
+ * ctx.storage.
  *
  * Layout: one 44px header row, then a 16rem session rail beside a chat column.
  * Live workers are a collapsible strip inside the chat column (under the
@@ -52,6 +60,9 @@ const {
   // Transcript niceties. Optional: a shell that predates them leaves the
   // binding undefined and every use below is feature-detected.
   MessageTextContent, CopyButton, DisclosureCaret,
+  // Session housekeeping: the app's own confirm dialog when this shell has
+  // one; older shells get a two-step "Confirm delete" instead.
+  ConfirmDialog,
 } = SDK
 
 const ID = 'superagent'
@@ -312,8 +323,9 @@ function fetchTickets() {
   return rest ? rest('/tickets') : Promise.reject(new Error('backend not ready'))
 }
 
-function fetchChats() {
-  return rest ? rest('/chats?limit=50') : Promise.reject(new Error('backend not ready'))
+function fetchChats(archived) {
+  const suffix = archived === 'all' ? '&archived=all' : ''
+  return rest ? rest(`/chats?limit=50${suffix}`) : Promise.reject(new Error('backend not ready'))
 }
 
 function fetchChat(id) {
@@ -353,9 +365,12 @@ function useTickets() {
   })
 }
 
-function useChats() {
+/** Session list. `archived` is the server-side visibility mode: 'hide' (the
+ *  default board) or 'all' (the rail's "Show archived"). The mode is part of
+ *  the query key, so toggling the filter is a different, cached board. */
+function useChats(archived = 'hide') {
   return useQuery({
-    queryKey: [ID, 'chats'], queryFn: fetchChats, retry: false,
+    queryKey: [ID, 'chats', archived], queryFn: () => fetchChats(archived), retry: false,
     refetchInterval: (query) => {
       const data = query.state.data
       return data && (data.running || 0) > 0 ? LIST_POLL_RUNNING : LIST_POLL_QUIET
@@ -567,30 +582,253 @@ function ErrorCard({ title, error, onRetry }) {
 
 // -- sessions rail ----------------------------------------------------------
 
-function SessionRow({ session, selected, onSelect }) {
-  const age = session.status === 'running' ? timingLabel(session) : fmtAge(session.updated_at || session.created_at)
+// How long the fallback "Confirm delete" stays armed (the SDK dialog, when the
+// shell has one, is the real confirm step).
+const DELETE_ARM_MS = 3000
+
+/** One line in the row's ⋯ menu. Plain buttons: the SDK menu portals its
+ *  content out of the row, so a nested-button row would still be invalid. */
+function RailMenuItem({ label, onSelect }) {
+  return jsx('button', {
+    type: 'button',
+    role: 'menuitem',
+    onClick: (event) => {
+      // Never let a menu click reach the row under it: selection must not move.
+      event.stopPropagation()
+      event.preventDefault()
+      onSelect()
+    },
+    className: cn('flex w-full min-w-0 items-center rounded px-2 py-1 text-left text-xs',
+      'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)'),
+    children: label,
+  })
+}
+
+/** SessionRow: a pointer row plus a hover/focus-only ⋯ menu.
+ *
+ *  The row is a div wrapping a button because the ⋯ trigger is a second
+ *  control: a nested <button> is invalid DOM. The ⋯ sits exactly where the age
+ *  is and the age fades out under it, so nothing shifts on hover. Rename swaps
+ *  the whole row for an inline input (Enter saves, Esc cancels, blur saves when
+ *  the text changed); archive toggles archived_at; delete asks first — through
+ *  the SDK ConfirmDialog when the shell exports one, otherwise this button
+ *  becomes "Confirm delete" for three seconds.
+ */
+function SessionRow({
+  session, selected, onSelect, onRename, onArchive, onDelete, onDeleteAsk, opensUp,
+}) {
+  const archived = !!session.archived_at
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [renaming, setRenaming] = useState(false)
+  const [title, setTitle] = useState('')
+  const [armed, setArmed] = useState(false)
+  const armTimer = useRef(null)
+  // Enter, Esc and blur can all arrive for one edit; only the first settles it.
+  const settled = useRef(false)
+  const age = session.status === 'running'
+    ? timingLabel(session)
+    : fmtAge(session.updated_at || session.created_at)
   // One line per chat: title and age. Model and repo live in the tooltip so a
   // 16rem rail stays scannable at a glance.
   const tooltip = [sessionTitle(session), sessionModelLabel(session), String(session.repo || '').trim()]
     .filter(Boolean)
     .join(' · ')
-  return jsxs('button', {
+
+  useEffect(() => () => {
+    if (armTimer.current) clearTimeout(armTimer.current)
+  }, [])
+
+  const startRename = () => {
+    settled.current = false
+    setTitle(sessionTitle(session))
+    setRenaming(true)
+  }
+
+  const cancelRename = () => {
+    settled.current = true
+    setRenaming(false)
+  }
+
+  const saveRename = () => {
+    if (settled.current) return
+    settled.current = true
+    const next = String(title || '').trim()
+    setRenaming(false)
+    if (!next || next === sessionTitle(session)) return
+    onRename(session.id, next)
+  }
+
+  const requestDelete = () => {
+    if (ConfirmDialog) {
+      onDeleteAsk(session)
+      return
+    }
+    setArmed(true)
+    if (armTimer.current) clearTimeout(armTimer.current)
+    armTimer.current = setTimeout(() => setArmed(false), DELETE_ARM_MS)
+  }
+
+  const confirmDelete = () => {
+    if (armTimer.current) clearTimeout(armTimer.current)
+    setArmed(false)
+    onDelete(session.id)
+  }
+
+  const items = [
+    jsx(RailMenuItem, {
+      key: 'rename', label: 'Rename',
+      onSelect: () => { setMenuOpen(false); startRename() },
+    }),
+    jsx(RailMenuItem, {
+      key: 'archive', label: archived ? 'Unarchive' : 'Archive',
+      onSelect: () => { setMenuOpen(false); onArchive(session.id, !archived) },
+    }),
+    jsx(RailMenuItem, {
+      key: 'delete', label: 'Delete',
+      onSelect: () => { setMenuOpen(false); requestDelete() },
+    }),
+  ]
+
+  const sdkMenu = !!(DropdownMenu && DropdownMenuTrigger && DropdownMenuContent)
+  const trigger = jsx('button', {
     type: 'button',
-    onClick: () => onSelect(session.id),
-    title: tooltip,
-    'aria-current': selected ? 'true' : undefined,
-    className: cn('flex w-full min-w-0 items-baseline gap-1.5 rounded px-2 py-1 text-left',
+    'aria-label': `Chat actions for ${sessionTitle(session)}`,
+    'aria-haspopup': 'menu',
+    'aria-expanded': !!menuOpen,
+    title: 'Rename, archive or delete',
+    onClick: sdkMenu
+      ? (event) => event.stopPropagation()
+      : (event) => { event.stopPropagation(); setMenuOpen((value) => !value) },
+    className: cn('inline-flex h-5 w-5 items-center justify-center rounded leading-none',
+      'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)',
+      menuOpen && 'bg-(--chrome-action-hover) text-(--ui-text-secondary)'),
+    children: '⋯',
+  })
+  const more = sdkMenu
+    ? jsxs(DropdownMenu, {
+        open: menuOpen, onOpenChange: setMenuOpen,
+        children: [
+          jsx(DropdownMenuTrigger, { key: 'trigger', asChild: true, children: trigger }),
+          jsx(DropdownMenuContent, {
+            key: 'content', align: 'end', className: 'w-40 p-1', children: items,
+          }),
+        ],
+      })
+    : jsxs('div', {
+        className: 'relative',
+        // A legacy shell has no portalled menu, and the list scrolls: close on
+        // focus loss / Escape, and open upwards near the bottom of the rail so
+        // the list's overflow cannot clip the three items.
+        onBlur: (event) => {
+          if (!event.currentTarget.contains(event.relatedTarget)) setMenuOpen(false)
+        },
+        onKeyDown: (event) => {
+          if (event.key === 'Escape') setMenuOpen(false)
+        },
+        children: [
+          trigger,
+          menuOpen
+            ? jsx('div', {
+                role: 'menu',
+                'aria-label': 'Chat actions',
+                className: cn('absolute right-0 z-30 flex w-40 flex-col gap-0.5 rounded border',
+                  'border-(--ui-stroke-secondary) bg-background p-1 shadow-md',
+                  opensUp ? 'bottom-6' : 'top-6'),
+                children: items,
+              })
+            : null,
+        ],
+      })
+
+  return jsxs('div', {
+    'data-archived': archived ? '1' : undefined,
+    className: cn('group relative flex w-full min-w-0 items-center rounded',
       selected ? 'bg-(--chrome-action-hover)' : 'hover:bg-(--chrome-action-hover)'),
     children: [
-      jsx(StatusGlyph, { key: 'g', status: session.status, pulse: true }),
-      jsx('span', {
-        key: 't', className: 'min-w-0 flex-1 truncate text-xs text-(--ui-text-secondary)',
-        children: sessionTitle(session),
-      }),
-      jsx('span', {
-        key: 'a', className: 'shrink-0 text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
-        children: age,
-      }),
+      renaming
+        ? jsxs('div', {
+            key: 'edit',
+            className: 'flex w-full min-w-0 items-center gap-1.5 px-2 py-1',
+            children: [
+              jsx(StatusGlyph, { key: 'g', status: session.status }),
+              jsx('input', {
+                key: 'i',
+                type: 'text',
+                value: title,
+                autoFocus: true,
+                maxLength: 200,
+                'aria-label': 'Rename chat',
+                onMouseDown: (event) => event.stopPropagation(),
+                onClick: (event) => event.stopPropagation(),
+                onChange: (event) => setTitle(event.target.value),
+                onKeyDown: (event) => {
+                  event.stopPropagation()
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    saveRename()
+                  } else if (event.key === 'Escape') {
+                    event.preventDefault()
+                    cancelRename()
+                  }
+                },
+                onBlur: saveRename,
+                className: cn('min-w-0 flex-1 rounded border border-(--ui-stroke-secondary)',
+                  'bg-transparent px-1 py-0.5 text-xs text-(--ui-text-secondary) focus:outline-none'),
+              }),
+            ],
+          })
+        : jsxs('button', {
+            key: 'row',
+            type: 'button',
+            onClick: () => onSelect(session.id),
+            title: tooltip,
+            'aria-current': selected ? 'true' : undefined,
+            className: cn('flex w-full min-w-0 items-baseline gap-1.5 rounded px-2 py-1 text-left',
+              archived && 'opacity-60'),
+            children: [
+              jsx(StatusGlyph, { key: 'g', status: session.status, pulse: true }),
+              jsx('span', {
+                key: 't', className: 'min-w-0 flex-1 truncate text-xs text-(--ui-text-secondary)',
+                children: sessionTitle(session),
+              }),
+              archived
+                ? jsx('span', {
+                    key: 'tag',
+                    className: cn('shrink-0 rounded border border-(--ui-stroke-secondary) px-1',
+                      'text-[0.625rem] leading-4 text-(--ui-text-quaternary)'),
+                    children: 'archived',
+                  })
+                : null,
+              jsx('span', {
+                key: 'a',
+                className: cn('shrink-0 text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
+                  'group-hover:opacity-0 group-focus-within:opacity-0'),
+                children: age,
+              }),
+            ],
+          }),
+      renaming
+        ? null
+        : armed
+          ? jsx('button', {
+              key: 'confirm',
+              type: 'button',
+              onClick: (event) => { event.stopPropagation(); confirmDelete() },
+              className: cn('absolute right-0.5 top-1/2 z-10 -translate-y-1/2 rounded border',
+                'border-(--ui-stroke-secondary) bg-(--ui-bg-primary) px-1 py-0.5',
+                'text-[0.6875rem] text-(--ui-text-secondary) shadow-sm'),
+              children: 'Confirm delete',
+            })
+          : jsx('div', {
+              key: 'more',
+              className: cn('absolute right-0.5 top-1/2 flex -translate-y-1/2 items-center',
+                'opacity-0 transition-opacity focus-within:opacity-100',
+                'group-hover:opacity-100 group-focus-within:opacity-100',
+                // An open menu must stay visible even if the pointer leaves and
+                // the browser did not focus the trigger on click.
+                menuOpen && 'opacity-100'),
+              children: more,
+            }),
     ],
   })
 }
@@ -656,9 +894,15 @@ function RailFilter({ value, onChange }) {
   })
 }
 
-function SessionsRail({ sessions, selectedId, onSelect }) {
+function SessionsRail({
+  sessions, selectedId, onSelect, onRename, onArchive, onDelete,
+  showArchived, onToggleArchived, archivedCount,
+}) {
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
+  // The delete confirm step: the SDK dialog needs to live above the row that
+  // opened it (a row can unmount as soon as the list refreshes).
+  const [pendingDelete, setPendingDelete] = useState(null)
   // Under `md` the rail folds into a 'Chats' section above the chat; picking a
   // chat closes it so the transcript gets the screen. md+ ignores this state.
   const [open, setOpen] = useState(() => !selectedId)
@@ -673,10 +917,24 @@ function SessionsRail({ sessions, selectedId, onSelect }) {
     if (isNarrowViewport()) setOpen(false)
   }
 
-  const emptyText = String(query || '').trim() ? 'No matching chats.' : RAIL_EMPTY[filter]
+  const removeNow = (id) => {
+    setPendingDelete(null)
+    onDelete(id)
+  }
+
+  const searching = !!String(query || '').trim()
+  const noChats = sessions.length === 0
+  const emptyText = showArchived
+    ? (noChats ? 'No archived chats.' : 'No matching archived chats.')
+    : noChats
+      ? 'No chats yet.'
+      : searching
+        ? 'No matching chats.'
+        : RAIL_EMPTY[filter]
   const countLabel = shown.length === sessions.length
     ? `${sessions.length} chat${sessions.length === 1 ? '' : 's'}`
     : `${shown.length} of ${sessions.length}`
+  const showToggle = !!showArchived || (Number(archivedCount) || 0) > 0
 
   return jsxs('div', {
     className: 'flex min-h-0 w-full flex-col gap-2 md:w-[16rem] md:shrink-0',
@@ -719,18 +977,57 @@ function SessionsRail({ sessions, selectedId, onSelect }) {
             key: 'list',
             className: 'flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-1',
             children: shown.length
-              ? shown.map((session) => jsx(SessionRow, {
-                  key: session.id, session, selected: session.id === selectedId, onSelect: choose,
+              ? shown.map((session, index) => jsx(SessionRow, {
+                  key: session.id, session, selected: session.id === selectedId,
+                  onSelect: choose, onRename, onArchive, onDelete,
+                  onDeleteAsk: setPendingDelete,
+                  // The last two rows open their menu upwards so the list's
+                  // overflow cannot clip it in a shell without a portal.
+                  opensUp: index >= shown.length - 2,
                 }))
               : jsx('div', { className: 'px-2 py-1 text-xs text-(--ui-text-tertiary)', children: emptyText }),
           }),
-          jsx('div', {
+          jsxs('div', {
             key: 'foot',
-            className: 'shrink-0 px-2 text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
-            children: countLabel,
+            className: cn('flex shrink-0 items-center justify-between gap-1 px-2',
+              'text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)'),
+            children: [
+              jsx('span', { key: 'n', className: 'min-w-0 truncate', children: countLabel }),
+              showToggle
+                ? jsx('button', {
+                    key: 'archived',
+                    type: 'button',
+                    'aria-pressed': !!showArchived,
+                    onClick: onToggleArchived,
+                    title: 'Include archived chats in the rail',
+                    className: cn('shrink-0 rounded px-1 py-0.5',
+                      showArchived
+                        ? 'bg-(--chrome-action-hover) text-(--ui-text-secondary)'
+                        : 'hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)'),
+                    children: showArchived
+                      ? 'Hide archived'
+                      : `Show archived${Number(archivedCount) ? ` (${archivedCount})` : ''}`,
+                  })
+                : null,
+            ],
           }),
         ],
       }),
+      ConfirmDialog
+        ? jsx(ConfirmDialog, {
+            key: 'delete',
+            open: !!pendingDelete,
+            onClose: () => setPendingDelete(null),
+            onConfirm: () => { if (pendingDelete) removeNow(pendingDelete.id) },
+            title: 'Delete this chat?',
+            description: pendingDelete
+              ? `“${sessionTitle(pendingDelete)}” and its transcript are deleted for good. Files, worktrees and pull requests are not touched.`
+              : '',
+            confirmLabel: 'Delete',
+            destructive: true,
+            dismissOnConfirm: true,
+          })
+        : null,
     ],
   })
 }
@@ -1607,19 +1904,26 @@ function Composer(props) {
   const { mode, session, draft, onDraft, onSend, pending, error,
     model, onModelChange, repo, onRepoChange, models, inputRef,
     onSessionModel, modelPending, presets, presetName, onPreset, onPresetClear,
-    onStop, stopPending, recentRepos } = props
+    onStop, stopPending, recentRepos, onUnarchive } = props
   const busy = isBusy(session)
+  // An archived chat is history: the transcript stays readable, the box does
+  // not pretend it can send. Unarchive (from here or the row's ⋯) restores it.
+  const archived = mode === 'session' && !!(session && session.archived_at)
   const text = String(draft == null ? '' : draft)
-  const canSend = !!text.trim() && !pending && !busy
+  const canSend = !!text.trim() && !pending && !busy && !archived
   // The one sentence that explains a disabled Send, in priority order.
-  const reason = pending
-    ? 'Sending…'
-    : busy
-      ? 'Waiting for this turn to finish'
-      : !text.trim() ? 'Type a message' : ''
-  const placeholder = mode === 'session'
-    ? (busy ? 'Waiting for this turn to finish…' : 'Reply to this chat…')
-    : 'Describe the work…'
+  const reason = archived
+    ? 'Archived — unarchive to continue'
+    : pending
+      ? 'Sending…'
+      : busy
+        ? 'Waiting for this turn to finish'
+        : !text.trim() ? 'Type a message' : ''
+  const placeholder = archived
+    ? 'Archived — unarchive to continue'
+    : mode === 'session'
+      ? (busy ? 'Waiting for this turn to finish…' : 'Reply to this chat…')
+      : 'Describe the work…'
   const repos = Array.isArray(recentRepos) ? recentRepos : []
   const sentRef = useRef(false)
 
@@ -1650,9 +1954,15 @@ function Composer(props) {
 
   const left = mode === 'session'
     ? [
-        jsx(SessionModelControl, {
-          key: 'model', session, models, pending: modelPending, onChange: onSessionModel,
-        }),
+        archived && typeof onUnarchive === 'function'
+          ? jsx(GhostButton, {
+              key: 'unarchive', className: 'h-6 shrink-0 px-1.5 py-0',
+              onClick: onUnarchive, title: 'Restore this chat so it can continue',
+              children: 'Unarchive',
+            })
+          : jsx(SessionModelControl, {
+              key: 'model', session, models, pending: modelPending, onChange: onSessionModel,
+            }),
       ]
     : [
         jsx(PresetControl, {
@@ -1718,8 +2028,10 @@ function Composer(props) {
         : null,
       jsx('textarea', {
         key: 'input', ref: inputRef, rows: COMPOSER_ROWS, value: draft,
-        disabled: pending || busy, placeholder,
-        'aria-label': mode === 'session' ? 'Reply to this chat' : 'Describe the work',
+        disabled: pending || busy || archived, placeholder,
+        'aria-label': archived
+          ? 'Archived chat (read-only)'
+          : mode === 'session' ? 'Reply to this chat' : 'Describe the work',
         onChange: (event) => onDraft(event.target.value),
         onKeyDown: (event) => {
           if (event.key === 'Escape') {
@@ -2084,6 +2396,17 @@ function ChatHeader({ session, tile, diff, comment }) {
                 className: 'min-w-0 truncate text-sm font-medium text-(--ui-text-secondary)',
                 children: sessionTitle(session),
               }),
+              // Archived is a state, not a badge of honour: one quiet pill is
+              // enough, and the composer explains what to do about it.
+              session.archived_at
+                ? jsx('span', {
+                    key: 'arch',
+                    title: 'Archived: read-only until you unarchive it',
+                    className: cn('shrink-0 rounded border border-(--ui-stroke-secondary) px-1',
+                      'text-[0.625rem] font-normal leading-4 text-(--ui-text-quaternary)'),
+                    children: 'Archived',
+                  })
+                : null,
             ],
           }),
           jsxs('div', {
@@ -2328,7 +2651,7 @@ function WorkerCard({ session, selected, onSelect }) {
  *  remembered in storage so the next visit starts where the user left it. */
 function LiveWorkerStrip({ sessions, selectedId, onSelect }) {
   const live = sessions
-    .filter((session) => LIVE_STATUSES.indexOf(session.status) !== -1)
+    .filter((session) => !session.archived_at && LIVE_STATUSES.indexOf(session.status) !== -1)
     .slice(0, MAX_WORKERS)
   const active = live.some((session) => isBusy(session))
   const [open, setOpen] = useState(() => active || readStored('workersOpen', '') === '1')
@@ -2805,7 +3128,12 @@ function OverlayDrawer({ panel, title, subtitle, onClose, children }) {
 
 function SuperagentPage() {
   const queryClient = useQueryClient()
-  const chatsQuery = useChats()
+  // The rail's "Show archived" toggle: a remembered view, not a per-session
+  // flag. `?archived=all` keeps archived rows on the same board so they can be
+  // read, unarchived or deleted.
+  const [showArchived, setShowArchived] = useState(() => readStored('showArchived', '') === '1')
+  const archivedMode = showArchived ? 'all' : 'hide'
+  const chatsQuery = useChats(archivedMode)
   const modelsQuery = useModels()
   const [selectedId, setSelectedId] = useState(null)
   // The draft is per target; `draft:new` starts the page, a chat restores its
@@ -2916,13 +3244,98 @@ function SuperagentPage() {
     onSuccess: () => invalidateChats(queryClient, selectedId),
   })
 
+  /** Paint one session's change before the next poll (a rename, an archive
+   *  stamp). A shell without setQueryData simply waits for the refetch. */
+  const patchSession = (id, patch) => {
+    if (!queryClient || typeof queryClient.setQueryData !== 'function') return
+    const apply = (row) => (row.id === id ? { ...row, ...patch } : row)
+    queryClient.setQueryData([ID, 'chats', archivedMode], (current) => (
+      current && Array.isArray(current.sessions)
+        ? { ...current, sessions: current.sessions.map(apply) }
+        : current
+    ))
+    queryClient.setQueryData([ID, 'chat', id], (current) => (
+      current && current.session
+        ? { ...current, session: { ...current.session, ...patch } }
+        : current
+    ))
+  }
+
+  /** Remove one row from the cached board (delete, or archive while hiding). */
+  const dropSession = (id) => {
+    if (!queryClient || typeof queryClient.setQueryData !== 'function') return
+    queryClient.setQueryData([ID, 'chats', archivedMode], (current) => (
+      current && Array.isArray(current.sessions)
+        ? { ...current, sessions: current.sessions.filter((row) => row.id !== id) }
+        : current
+    ))
+  }
+
+  const renameChat = useMutation({
+    mutationFn: (vars) => rest(`/chats/${encodeURIComponent(vars.id)}`, {
+      method: 'PATCH', body: { title: vars.title },
+    }),
+    // A failed rename must put the old title back, which the refetch does.
+    onSuccess: () => invalidateChats(queryClient, selectedId),
+    onError: () => invalidateChats(queryClient, selectedId),
+  })
+
+  const archiveChat = useMutation({
+    mutationFn: (vars) => rest(`/chats/${encodeURIComponent(vars.id)}/archive`, {
+      method: 'POST', body: { archived: vars.archived },
+    }),
+    onSuccess: () => invalidateChats(queryClient, selectedId),
+    onError: () => invalidateChats(queryClient, selectedId),
+  })
+
+  const deleteChat = useMutation({
+    mutationFn: (id) => rest(`/chats/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    onSuccess: () => invalidateChats(queryClient, selectedId),
+    onError: () => invalidateChats(queryClient, selectedId),
+  })
+
+  const renameSession = (id, title) => {
+    patchSession(id, { title })
+    renameChat.mutate({ id, title })
+  }
+
+  const archiveSession = (id, archived) => {
+    // A live turn cannot be filed away (the server answers 409). Painting the
+    // change first would flash the row out and back, so a busy chat waits for
+    // the answer and the error notice instead.
+    const target = sessions.find((row) => row.id === id)
+    if (!isBusy(target)) {
+      if (archived && archivedMode !== 'all') dropSession(id)
+      else patchSession(id, { archived_at: archived ? Date.now() / 1000 : null })
+    }
+    archiveChat.mutate({ id, archived })
+  }
+
+  const deleteSession = (id) => {
+    // Same rule as archive: never hide a row the server may refuse to delete.
+    const target = sessions.find((row) => row.id === id)
+    if (!isBusy(target)) {
+      dropSession(id)
+      if (selectedId === id) setSelectedId(null)
+    }
+    deleteChat.mutate(id)
+  }
+
+  const toggleArchived = () => {
+    const next = !showArchived
+    setShowArchived(next)
+    writeStored('showArchived', next ? '1' : '0')
+  }
+
   const pending = createChat.isPending || sendChat.isPending
   const stopPending = stopChat.isPending
   const busyTurn = isBusy(selectedSession)
   const notice = (createChat.data && createChat.data.ok === false && createChat.data.error) ||
     (sendChat.data && sendChat.data.ok === false && sendChat.data.error) || ''
   const failure = errorText(createChat.error) || errorText(sendChat.error) ||
-    errorText(stopChat.error) || errorText(setChatModel.error) || notice
+    errorText(stopChat.error) || errorText(setChatModel.error) ||
+    errorText(renameChat.error) || errorText(archiveChat.error) ||
+    errorText(deleteChat.error) || notice
 
   const changeSessionModel = (next) => {
     if (!selectedSession || !next) return
@@ -3048,7 +3461,10 @@ function SuperagentPage() {
   const summaryLabel = summaryParts.join(' · ')
 
   // The first-run banner rides above the transcript, not above the whole page.
-  const onboarding = !chatsQuery.isLoading && !onboarded && sessions.length === 0
+  // A board whose only chats are archived is not a first run: the rail's
+  // "Show archived" toggle is the answer there, not an onboarding card.
+  const archivedTotal = (data && data.archived_count) || 0
+  const onboarding = !chatsQuery.isLoading && !onboarded && sessions.length === 0 && !archivedTotal
     ? jsx(OnboardingBanner, {
         onSettings: () => setDrawer('settings'),
         onGithub: () => setDrawer('github'),
@@ -3112,7 +3528,12 @@ function SuperagentPage() {
       jsxs('div', {
         key: 'body', className: 'flex min-h-0 flex-1 flex-col gap-3 md:flex-row',
         children: [
-          jsx(SessionsRail, { key: 'rail', sessions, selectedId, onSelect: select }),
+          jsx(SessionsRail, {
+            key: 'rail', sessions, selectedId, onSelect: select,
+            onRename: renameSession, onArchive: archiveSession, onDelete: deleteSession,
+            showArchived, onToggleArchived: toggleArchived,
+            archivedCount: archivedTotal,
+          }),
           jsx(ChatCenter, {
             key: 'center', summary: selectedSummary, detail,
             sessions, onSelect: select, banner: onboarding, optimistic,
@@ -3126,6 +3547,9 @@ function SuperagentPage() {
             onSessionModel: changeSessionModel, modelPending: setChatModel.isPending,
             presets: presetList, presetName, onPreset: pickPreset,
             onPresetClear: () => setPresetName(''),
+            onUnarchive: selectedSession
+              ? () => archiveSession(selectedSession.id, false)
+              : null,
           }),
         ],
       }),
