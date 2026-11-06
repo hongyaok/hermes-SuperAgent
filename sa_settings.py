@@ -278,9 +278,35 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _config_document() -> dict[str, Any]:
+    """Read the Hermes config document, preferring Hermes' own loader.
+
+    The plugin host is a separate process and its interpreter does not
+    necessarily ship PyYAML, but it always has ``hermes_cli`` importable. A
+    PyYAML-only read silently produced DEFAULTS there, which made the settings
+    panel and the worker model look unset while ``ctx.get_config`` saw the real
+    values. ``load_config()`` is the same merged view every other surface uses;
+    the YAML read stays as a fallback for isolated/test environments.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.config import get_config_path as hermes_config_path
+
+        # Only trust the global loader when it resolves to the same file this
+        # module reads. Tests and isolated homes point config_path() elsewhere;
+        # borrowing the machine config there would make the suite non-hermetic.
+        if Path(hermes_config_path()).resolve() == config_path().resolve():
+            data = load_config()
+            if isinstance(data, dict) and data:
+                return data
+    except Exception:
+        pass
+    return _load_yaml(config_path())
+
+
 def _config_settings() -> dict[str, Any]:
     """`plugins.entries.superagent.settings` from the Hermes config.yaml."""
-    data = _load_yaml(config_path())
+    data = _config_document()
     plugins = data.get("plugins") if isinstance(data, dict) else None
     entries = plugins.get("entries") if isinstance(plugins, dict) else None
     entry = entries.get("superagent") if isinstance(entries, dict) else None

@@ -94,6 +94,14 @@ that never commits or pushes for you.
 
 ### Fixed
 
+- **Settings survive the plugin host.** The settings loader now reads the
+  Hermes config through `hermes_cli.config.load_config()` when it resolves to
+  the same file, with the PyYAML read as a fallback. The plugin host's
+  interpreter does not ship PyYAML, so the old loader silently returned
+  `DEFAULTS` there: the settings panel showed empty defaults and a worker
+  could start without the configured model even though `ctx.get_config` saw
+  the real values. The loader only borrows the global reader when both paths
+  agree, so tests and isolated homes stay hermetic.
 - **No fallback presets.** `GET /models` and the composer no longer advertise
   the hardcoded `MODEL_PRESETS` list. With nothing configured, `presets` is
   `[]` and the chip row is hidden; `models` is the preset models in order plus

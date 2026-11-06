@@ -270,3 +270,49 @@ def test_save_settings_normalizes_presets(home):
     assert data["model_presets"] == [
         {"name": "fast", "model": "one-model", "provider": "opencode-go"}
     ]
+
+
+def _fake_hermes_config(monkeypatch, *, path, payload):
+    """Install a fake ``hermes_cli.config`` module for one test."""
+    import sys
+    import types
+
+    package = types.ModuleType("hermes_cli")
+    package.__path__ = []  # mark it as a package so the submodule import works
+    module = types.ModuleType("hermes_cli.config")
+    module.get_config_path = lambda: path
+    module.load_config = lambda: payload
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", module)
+
+
+def test_config_settings_uses_hermes_loader_when_paths_match(home, monkeypatch):
+    """The plugin host has no PyYAML; Hermes' loader must be the primary read."""
+    cfg = home / "config.yaml"
+    cfg.write_text("plugins: {}\n", encoding="utf-8")
+    payload = {"plugins": {"entries": {"superagent": {"settings": {"default_model": "from-loader"}}}}}
+    _fake_hermes_config(monkeypatch, path=cfg, payload=payload)
+    monkeypatch.setattr(
+        sa_settings, "_load_yaml", lambda path: (_ for _ in ()).throw(AssertionError("yaml read"))
+    )
+
+    assert sa_settings._config_settings() == {"default_model": "from-loader"}
+
+
+def test_config_settings_falls_back_to_yaml_when_loader_points_elsewhere(home, monkeypatch):
+    """A test/isolated home must never borrow the machine's config."""
+    elsewhere = home.parent / "other" / "config.yaml"
+    _fake_hermes_config(monkeypatch, path=elsewhere, payload={})
+    import sys
+
+    def boom():
+        raise AssertionError("loader read")
+
+    sys.modules["hermes_cli.config"].load_config = boom
+    monkeypatch.setattr(
+        sa_settings,
+        "_load_yaml",
+        lambda path: {"plugins": {"entries": {"superagent": {"settings": {"default_model": "from-yaml"}}}}},
+    )
+
+    assert sa_settings._config_settings() == {"default_model": "from-yaml"}
