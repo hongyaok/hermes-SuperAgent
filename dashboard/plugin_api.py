@@ -7,7 +7,8 @@ GET /sessions returns per-ticket enriched session rows for the desktop
 sessions grid.
 
 Chat sessions (v0.2) live under /chats: POST /chats starts one headless
-`hermes chat` worker, POST /chats/{id}/messages resumes it, and
+`hermes chat` worker, POST /chats/{id}/messages resumes it,
+POST /chats/{id}/model swaps the model for future turns, and
 POST /chats/{id}/stop cancels it. They are kept in their own namespace so the
 existing ticket grid and this release's desktop UI keep working unchanged.
 
@@ -456,12 +457,18 @@ def list_models() -> dict[str, Any]:
 
 
 @router.get("/chats")
-def list_chats(limit: int = 50) -> dict[str, Any]:
+def list_chats(limit: int = 50, status: str = "") -> dict[str, Any]:
+    """Sessions newest-first; live rows carry ``recent_events``/``elapsed_seconds``.
+
+    ``?status=running,queued`` narrows the rows (comma separated); omitting it
+    keeps the historical behaviour. Status counts stay board-wide.
+    """
     path = _db_path()
     if not path.is_file():
         return {"db_exists": False, "sessions": [], "counts": {}, "running": 0}
     limit = max(1, min(int(limit or 50), 200))
-    data = _chat_store().list_sessions(limit=limit)
+    statuses = [part.strip() for part in str(status or "").split(",") if part.strip()]
+    data = _chat_store().list_sessions(limit=limit, statuses=statuses)
     return {"db_exists": True, **data}
 
 
@@ -586,6 +593,41 @@ def post_chat_message(session_id: str, body: dict) -> dict[str, Any]:
         "resumed": True,
         "session": store.get_session(session_id),
     }
+
+
+@router.post("/chats/{session_id}/model")
+def set_chat_model(session_id: str, body: dict) -> dict[str, Any]:
+    """Change the model/provider a session will use for its *next* turn.
+
+    The model is fixed for a chat at creation time in the composer, so this is
+    the only way to move an existing conversation to another model. A live turn
+    already passed its model to the worker: 409 until it finishes.
+    """
+    session_id = _check_session_id(session_id)
+    data = body or {}
+    model = str(data.get("model") or "").strip()
+    provider = str(data.get("provider") or "").strip()
+    if not model and not provider:
+        raise HTTPException(status_code=400, detail="model or provider is required")
+
+    store = _chat_store()
+    session = store.get_session(session_id, message_limit=0)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    if session["status"] in (sa_chats.QUEUED, sa_chats.RUNNING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"session {session_id} is {session['status']}; wait for the turn to finish",
+        )
+
+    model = model[:200]
+    provider = provider[:200]
+    label = f"{provider}: {model}" if model and provider else (model or provider)
+    # Event first, then the row: once the new model is visible its audit trail
+    # already explains it (same order the runner uses when it finishes a turn).
+    store.add_event(session_id, "model", f"next turn uses {label}")
+    updated = store.update_session(session_id, model=model, provider=provider)
+    return {"ok": True, "session": updated}
 
 
 @router.post("/chats/{session_id}/stop")

@@ -128,6 +128,87 @@ def test_list_sessions_shape_and_order(chat):
     assert data["sessions"][0]["message_count"] == 1
 
 
+def test_live_rows_carry_the_last_three_events_newest_first(chat):
+    first = chat.create_session("live work")
+    second = chat.create_session("more live work")
+    for index in range(4):
+        chat.add_event(first["id"], "tool", f"a{index}")
+        chat.add_event(second["id"], "tool", f"b{index}")
+
+    rows = {row["id"]: row for row in chat.list_sessions()["sessions"]}
+    a = rows[first["id"]]["recent_events"]
+    b = rows[second["id"]]["recent_events"]
+    # Three each, from its own session, newest first — one query, two buckets.
+    assert [event["detail"] for event in a] == ["a3", "a2", "a1"]
+    assert [event["detail"] for event in b] == ["b3", "b2", "b1"]
+    assert all(event["kind"] == "tool" for event in a)
+    assert all("created_at" in event for event in a)
+    assert a[0]["created_at"] >= a[-1]["created_at"]
+
+
+def test_recent_event_detail_is_clipped_to_160_chars(chat):
+    session = chat.create_session("long detail")
+    chat.add_event(session["id"], "tool", "d" * 900)
+
+    event = chat.list_sessions()["sessions"][0]["recent_events"][0]
+    assert len(event["detail"]) == sa_chats.RECENT_EVENT_CHARS
+
+
+def test_only_live_sessions_get_recent_events(chat):
+    chat.create_session("still queued")
+    done = chat.create_session("finished")
+    chat.update_session(done["id"], status="idle")
+
+    rows = {row["id"]: row for row in chat.list_sessions()["sessions"]}
+    assert "recent_events" in rows["S-0001"]
+    assert "recent_events" not in rows["S-0002"]
+    assert all("created_at" in event for event in rows["S-0001"]["recent_events"])
+
+
+def test_elapsed_seconds_is_only_reported_for_live_turns(chat):
+    running = chat.create_session("running")
+    now = sa_chats.time.time()
+    chat.update_session(running["id"], status="running", started_at=now - 30)
+    queued = chat.create_session("queued")
+    idle = chat.create_session("idle")
+    chat.update_session(idle["id"], status="idle", started_at=now - 90, finished_at=now)
+
+    rows = {row["id"]: row for row in chat.list_sessions()["sessions"]}
+    assert 25 <= rows[running["id"]]["elapsed_seconds"] <= 40
+    assert rows[queued["id"]]["elapsed_seconds"] == 0
+    assert rows[idle["id"]]["elapsed_seconds"] is None
+
+
+def test_queued_rows_ignore_a_previous_turns_start(chat):
+    """A resumed turn is queued while `started_at` still holds the old turn."""
+    session = chat.create_session("resume me")
+    chat.update_session(session["id"], status="running", started_at=sa_chats.time.time() - 600)
+    chat.update_session(session["id"], status="queued")
+
+    row = chat.list_sessions()["sessions"][0]
+    assert row["elapsed_seconds"] == 0
+
+
+def test_list_sessions_status_filter_keeps_board_counts(chat):
+    running = chat.create_session("running")
+    chat.update_session(running["id"], status="running")
+    queued = chat.create_session("queued")
+    done = chat.create_session("done")
+    chat.update_session(done["id"], status="review")
+
+    data = chat.list_sessions(statuses=["running", "queued"])
+    assert [row["id"] for row in data["sessions"]] == [queued["id"], running["id"]]
+    assert data["counts"]["review"] == 1  # counts describe the whole board
+    assert data["running"] == 1
+
+
+def test_list_sessions_ignores_an_empty_status_filter(chat):
+    chat.create_session("one")
+    chat.create_session("two")
+    assert len(chat.list_sessions(statuses=[])["sessions"]) == 2
+    assert len(chat.list_sessions(statuses=["  "])["sessions"]) == 2
+
+
 def test_chat_tables_live_in_the_ticket_database(tmp_path, sa):
     store = sa.sa_store.Store(tmp_path / "superagent.db")
     store.create_ticket(request="a ticket", status="queued")
