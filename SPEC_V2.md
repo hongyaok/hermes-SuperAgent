@@ -78,6 +78,9 @@ hermes chat -q <prompt> -Q --format stream-json --source tool \
 | POST   | `/chats/{id}/messages`        | append the user message and resume the Hermes session; 409 while a turn runs; with no `hermes_session_id` a fresh chat is created and `previous_session_id` returned |
 | POST   | `/chats/{id}/model`           | set `{model, provider}` for future turns; 400 when both are empty, 409 while queued/running, 404 unknown |
 | POST   | `/chats/{id}/stop`            | cancel a queued/running turn; 409 when nothing is running |
+| GET    | `/chats/{id}/diff`            | `{ok, repo, files:[{status,path}], stat, patch, truncated, error}` from `git status`/`diff --stat`/`diff`; patch capped at 60 000 chars with a trailing marker; 404 unknown, 400 no repo / repo gone |
+| GET    | `/chats/{id}/comment-preview`  | the body `POST /comment` would send (`{ok, body, length, pr_number, github_repo, url}`); no network, no token needed; 400 without a PR |
+| POST   | `/chats/{id}/comment`         | post `{body?}` (default: `sa_diff.default_comment_body`) to the PR; 400 no PR/repo/token, 502 on a GitHub failure (redacted); records a `commented` event with the URL |
 
 All chat routes are defensive: a missing database yields `db_exists: false`
 for lists, and every handler returns JSON.
@@ -205,9 +208,18 @@ New `plugin.yaml` settings: `default_model`, `default_provider`,
    cheap model for assessment, strong model for implementation — remains
    future work.)*
 8. **Robustness and security** — path checks, prompt/response caps, runaway
-   watchdog, rate limits, redaction of tokens in events.
+   watchdog, rate limits, redaction of tokens in events. *(The handoff adds one
+   more read path: `sa_diff.collect_diff` runs git without a shell, never
+   raises, redacts stderr, caps the patch at 60 000 characters and resolves the
+   session repository through the same containment check as a worker turn;
+   `POST /chats/{id}/comment` caps the body at 20 000, never echoes the token
+   and never commits, pushes or edits the PR.)*
 9. **UX and docs** — onboarding, empty states, README/SPEC refresh, skill
-   update for operators.
+   update for operators. *(A finished session now closes the loop: a lazy
+   `Diff` panel in the chat header shows status/stat/patch and a
+   `Comment on PR` button opens an inline, editable confirm prefilled from
+   `GET /chats/{id}/comment-preview`; `hermes superagent diff|comment` do the
+   same from a terminal. Nothing is posted without a human pressing Post.)*
 10. **Final polish** — performance pass (polling, DB indexes), full test sweep,
     release notes and a 0.2.0 version bump everywhere.
 

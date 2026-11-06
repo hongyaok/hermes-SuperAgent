@@ -9,6 +9,7 @@ It separates **routing** from **execution**:
 - **Isolated Hermes worker subagents** launched via `ctx.subagent_lifecycle` perform the coding work inside your repository and leave uncommitted changes in the working tree for human review (`review` state).
 - **Headless chat workers (v0.2)** — the desktop **Chat** tab starts one `hermes chat` process per turn, streams its JSON output into the session transcript, and lets you resume, watch or stop it. Chat workers follow the same rule as ticket workers: changes stay uncommitted for review.
 - **GitHub PR watch (v0.3)** — connect a repository, and pull-request comments that mention the agent become sessions. `auto` mode checks each PR out as an isolated `git worktree` and launches a worker on it; `observe` (the default) only records the request.
+- **Session handoff (v0.5)** — a finished session can show exactly what the worker changed (`git status`/`--stat`/patch, capped) and post one human-reviewed summary comment back to its pull request. Nothing is committed, pushed or merged.
 
 Router-side work (polling, triage, ticket state) runs no LLM and starts no subprocess. Chat turns are explicit `hermes chat` workers launched from a user message and bounded by the caps and watchdog described in [Chat and models API](#8-chat-and-models-api-v02). By default, the plugin runs in `observe` mode so it only records tickets until you explicitly approve them or switch to `auto`.
 
@@ -154,6 +155,11 @@ hermes superagent models
 hermes superagent settings
 hermes superagent settings --json
 
+# Review what a finished session changed, then comment on its PR
+hermes superagent diff S-0001
+hermes superagent comment S-0001
+hermes superagent comment S-0001 --body-file review.md
+
 # Verify configuration, repo existence, and worker lifecycle availability
 hermes superagent doctor
 ```
@@ -167,6 +173,8 @@ hermes superagent doctor
 | `hermes superagent show <id>` | A ticket's full detail, or a chat session (`S-…`) with messages and events. |
 | `hermes superagent chat "<prompt>"` | Start a headless chat turn (blocking; `--detach` returns immediately). `--preset <name>` resolves a named preset; `--model`/`--provider` still win. |
 | `hermes superagent sessions` / `stop <id>` | List chat sessions / cancel a queued or running turn. |
+| `hermes superagent diff <id>` | `git status` + `git diff --stat` + the (capped) patch for the session's repository; `--json` returns the full dict. `1` for an unknown session or one without a repository. |
+| `hermes superagent comment <id> [--body TEXT \| --body-file PATH]` | Post one summary comment to the session's pull request and print its URL. `1` without a PR/token or when GitHub refuses, `2` for bad usage. |
 | `hermes superagent models` | Default model/provider plus the preset section (`name -> provider: model`). |
 | `hermes superagent settings [--json]` | Print the merged settings (the GitHub token is masked to `set`/`not set`); read-only. |
 | `hermes superagent github [status\|test\|connect\|disconnect\|prs\|poll\|work <n>]` | Connect a repository, manage the watch settings, list open PRs, and start work on one (see [GitHub connect & PR watch](#9-github-connect--pr-watch-v03)). |
@@ -206,6 +214,9 @@ The plugin ships a unified desktop extension (`desktop/plugin.js`) and a FastAPI
 - `GET /api/plugins/superagent/chats/{session_id}` — one chat with its transcript and events.
 - `POST /api/plugins/superagent/chats/{session_id}/messages` — send a follow-up and resume the Hermes session.
 - `POST /api/plugins/superagent/chats/{session_id}/stop` — cancel the running turn.
+- `GET /api/plugins/superagent/chats/{session_id}/diff` — git status, stat and a capped patch for the session's repository.
+- `GET /api/plugins/superagent/chats/{session_id}/comment-preview` — the comment body a post would send (no network, no write).
+- `POST /api/plugins/superagent/chats/{session_id}/comment` — post one human-confirmed comment to the session's pull request.
 
 The desktop page at `/superagent` now leads with the v0.2 chat workspace (see [Desktop chat tab](#7-desktop-chat-tab-v02)) and keeps the ticket views beside it:
 
@@ -343,6 +354,43 @@ A new user should be able to choose models and get started without reading the d
 
 ---
 
+### 11. Review a finished session (diff + PR comment)
+
+Closing the loop does not need a push. A finished session leaves its changes in the working tree; the plugin can show them and say what happened on the pull request, and nothing else.
+
+**Diff button (chat header).** Visible whenever the session has a repository. The diff is *lazy*: nothing is fetched until the panel is open, and it is refetched every 4 s only while the turn is `queued`/`running` (a finished session stays still until **Refresh**). The collapsible panel sits between the transcript and the composer (`max-h-22rem`, scrolls) and shows:
+
+- the file count, the repository and a *patch truncated* note when the cap hit;
+- the `git diff --stat` block (plus a `staged:` block when the index has changes);
+- one row per file with its porcelain letter (`M`, `A`, `D`, `R`, `??`, `!`); past 200 files it says how many were not listed;
+- the patch itself in a monospace `<pre>`.
+
+**Comment on PR button.** Visible when the session carries a PR number *and* a GitHub token is saved. It opens an inline confirm — never `window.confirm` — with a textarea prefilled from the preview endpoint, **Post** and **Cancel**. The button is disabled while a turn is running and nothing is posted until **Post** is pressed; the success notice links to the new comment. A user edit is never overwritten by a preview refetch.
+
+| Method | Path | Behaviour |
+| :--- | :--- | :--- |
+| `GET` | `/chats/{id}/diff` | `{ok, repo, files: [{status, path}], stat, patch, truncated, error}`. `404` unknown session; `400` when the session has no repository or it no longer exists / is not a git checkout. The patch is capped at 60 000 characters and ends with `… diff truncated …`. |
+| `GET` | `/chats/{id}/comment-preview` | `{ok, session_id, pr_number, github_repo, url, body, length}` — exactly what a post would send, with no network call and no token requirement. `400` when the session has no PR. |
+| `POST` | `/chats/{id}/comment` | Post `{body?}` (default: the generated summary). `400` without a PR, a repository, a saved token or a readable repo; `502` when GitHub refuses (message redacted). Records a `commented` event with the comment URL and returns `{ok, url, pr_number, body_preview, session}`. |
+
+The generated body is `Superagent finished <id> — <title>`, the last assistant message, `Files changed: N (+X/-Y)` from the diff stat, and `_Generated by Superagent._`; missing pieces are omitted and the whole thing is clipped to 20 000 characters (the assistant summary shrinks first).
+
+**CLI.** Both commands read the chat tables directly, so they work without a dashboard or a ticket engine:
+
+```bash
+hermes superagent diff S-0001                 # stat, file list, patch (exit 1: unknown/no repo)
+hermes superagent diff S-0001 --json          # {ok, session_id, diff}
+hermes superagent comment S-0001              # generated summary → the PR, prints the URL
+hermes superagent comment S-0001 --body "LGTM"        # your text instead
+hermes superagent comment S-0001 --body-file review.md
+```
+
+`comment` exits `2` for usage (both body sources, unreadable/empty file, over 20 000 chars), `1` for an unknown session, a session without a PR, no repo/token or a GitHub failure, and `0` with the comment URL on success.
+
+**Guardrails.** `collect_diff` runs git as an argv list with no shell and never raises: a missing directory, a plain directory, a missing `git` binary and a timeout are all `{ok: false, error}` with stderr redacted. The repository path is resolved through the same containment check as a worker turn, so a session cannot point the diff at an arbitrary directory. Commenting calls exactly one REST endpoint (`POST /repos/{repo}/issues/{n}/comments`) — no commit, push, merge or PR edit happens anywhere in this flow.
+
+---
+
 ## Testing
 
 Run the test suite from the repository root:
@@ -351,7 +399,7 @@ Run the test suite from the repository root:
 pytest -q
 ```
 
-The suite is hermetic: `tests/test_runner.py` and `tests/test_hardening.py` replace `Popen` with a fake, so no real `hermes` process is spawned. `tests/test_hardening.py` covers repo containment (missing/file/dot-dot/symlink escape), secret redaction, the 20k/2k caps, every `POST /ask` triage branch, and the runaway watchdog. The v0.3 GitHub tests are also offline: `tests/test_github.py` replaces the HTTP call at the `_urlopen` seam and git at the `git_runner` parameter, `tests/test_watcher.py` uses a canned client and a fake runner, and `tests/test_github_api.py` writes settings to a throwaway `HERMES_HOME` and patches the watcher/client singletons.
+The suite is hermetic: `tests/test_runner.py` and `tests/test_hardening.py` replace `Popen` with a fake, so no real `hermes` process is spawned. `tests/test_hardening.py` covers repo containment (missing/file/dot-dot/symlink escape), secret redaction, the 20k/2k caps, every `POST /ask` triage branch, and the runaway watchdog. The v0.3 GitHub tests are also offline: `tests/test_github.py` replaces the HTTP call at the `_urlopen` seam and git at the `git_runner` parameter, `tests/test_watcher.py` uses a canned client and a fake runner, and `tests/test_github_api.py` writes settings to a throwaway `HERMES_HOME` and patches the watcher/client singletons. The handoff tests use a real temporary git repository (`tests/test_diff.py` for status/stat/patch, staged changes and truncation; `tests/test_handoff_api.py` for the endpoints; `tests/test_cli_handoff.py` for `diff`/`comment`) and fake the GitHub client, so nothing reaches the network.
 
 Validate the plugin manifest and its registrations before shipping:
 

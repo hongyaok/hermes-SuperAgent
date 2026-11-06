@@ -16,10 +16,11 @@ from pathlib import Path
 from typing import Any
 
 try:  # normal: loaded as hermes_plugins.superagent (or sa_plugin in tests)
-    from . import sa_chats, sa_cli, sa_engine, sa_schemas, sa_tools
+    from . import sa_chats, sa_cli, sa_diff, sa_engine, sa_schemas, sa_tools
 except ImportError:  # top-level import (pytest imports root __init__.py as `__init__`)
     import sa_chats  # type: ignore[no-redef]
     import sa_cli  # type: ignore[no-redef]
+    import sa_diff  # type: ignore[no-redef]
     import sa_engine  # type: ignore[no-redef]
     import sa_schemas  # type: ignore[no-redef]
     import sa_tools  # type: ignore[no-redef]

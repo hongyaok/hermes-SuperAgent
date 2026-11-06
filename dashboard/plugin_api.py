@@ -21,6 +21,12 @@ the public merged view (token-free), POST /settings validates and saves the
 desktop-editable keys, and both /models and POST /chats resolve the same
 normalised preset catalog (explicit model/provider > named preset > defaults).
 
+Handoff (v0.3) lives under /chats/{id}: GET /diff returns git status, stat and
+a capped patch for the session's repository, GET /comment-preview renders the
+summary a human may post, and POST /comment posts exactly one comment to the
+session's pull request (a saved token is required; nothing is committed or
+pushed).
+
 Imported by the gateway on its own, outside the plugin package, so this
 module is self-contained: stdlib sqlite3 only, no relative imports except the
 optional package import below.
@@ -46,10 +52,11 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 try:  # loaded as part of the plugin package
-    from .. import sa_assessor, sa_chats, sa_github, sa_runner, sa_settings, sa_watcher
+    from .. import sa_assessor, sa_chats, sa_diff, sa_github, sa_runner, sa_settings, sa_watcher
 except ImportError:  # loaded standalone by the gateway / pytest
     import sa_assessor  # type: ignore[no-redef]
     import sa_chats  # type: ignore[no-redef]
+    import sa_diff  # type: ignore[no-redef]
     import sa_github  # type: ignore[no-redef]
     import sa_runner  # type: ignore[no-redef]
     import sa_settings  # type: ignore[no-redef]
@@ -1034,6 +1041,186 @@ def stop_chat(session_id: str) -> dict[str, Any]:
     return {
         "ok": True,
         "stopped": stopped,
+        "session": store.get_session(session_id, message_limit=0),
+    }
+
+
+# -- session handoff: diff + comment (v0.3) --------------------------------
+#
+# Closing the loop on a finished chat: show what the worker actually changed in
+# its repository, then post a human-reviewed summary back to the pull request.
+# Neither handler commits, pushes or edits the pull request beyond one comment.
+
+# A diff response is capped here as well as in sa_diff: a lockfile rewrite must
+# not travel through JSON and the desktop panel unbounded.
+DIFF_PATCH_LIMIT = sa_diff.DEFAULT_PATCH_CHARS
+COMMENT_BODY_LIMIT = 20000
+COMMENT_PREVIEW_CHARS = 280
+
+
+def _session_repo(session: dict) -> str:
+    """The session's repository, resolved, or a 400 explaining why not."""
+    repo = str((session or {}).get("repo") or "").strip()
+    if not repo:
+        raise HTTPException(
+            status_code=400,
+            detail="this session has no repository; start it with a repo path first",
+        )
+    try:
+        return sa_runner.resolve_repo_path(repo, root=_repo_root())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=_scrub(str(exc))) from exc
+
+
+def _session_diff(session: dict) -> dict[str, Any]:
+    """collect_diff for a session's repo; a broken repo is still a 400."""
+    diff = sa_diff.collect_diff(_session_repo(session), max_patch_chars=DIFF_PATCH_LIMIT)
+    if not diff.get("ok"):
+        raise HTTPException(
+            status_code=400, detail=_scrub(str(diff.get("error") or "could not read the diff"))
+        )
+    return diff
+
+
+def _session_or_404(store: Any, session_id: str) -> dict[str, Any]:
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    return session
+
+
+def _comment_pr(session: dict[str, Any]) -> tuple[int, str]:
+    """(PR number, GitHub repo) for a comment, or the 400 that stops it.
+
+    Token-free on purpose: the preview needs the PR and the repository to
+    render the same body the post would send, but asking for a token before
+    there is anything to read would be rude.
+    """
+    pr_number = session.get("pr_number")
+    if not pr_number:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"session {session.get('id')} is not linked to a pull request;"
+                " start it from GitHub or `github work <n>`"
+            ),
+        )
+    settings = sa_settings.load_settings()
+    repo = str(session.get("github_repo") or settings.get("github_repo") or "").strip()
+    if not sa_settings.valid_repo_name(repo):
+        raise HTTPException(status_code=400, detail="no GitHub repository is configured")
+    try:
+        number = int(pr_number)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="the session's pull request number is invalid") from None
+    return number, repo
+
+
+def _comment_token() -> str:
+    """The saved GitHub token, or the 400 that says how to set one."""
+    token = str(sa_settings.load_settings().get("github_token") or "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=400, detail="a GitHub token is required to comment (Settings → GitHub)"
+        )
+    return token
+
+
+def _comment_body(session: dict[str, Any], body: Any, diff: dict[str, Any] | None) -> str:
+    """The text to post: the caller's, or the generated summary, capped."""
+    supplied = str(body or "").strip()
+    if supplied:
+        text = _scrub(supplied)
+    else:
+        text = sa_diff.default_comment_body(session, diff, limit=COMMENT_BODY_LIMIT)
+    text = text.strip()[:COMMENT_BODY_LIMIT]
+    if not text:
+        raise HTTPException(status_code=400, detail="the comment body is empty")
+    return text
+
+
+@router.get("/chats/{session_id}/diff")
+def chat_diff(session_id: str) -> dict[str, Any]:
+    """Status, stat and (capped) patch for the session's repository.
+
+    404 for an unknown session, 400 when the session has no repo or the repo
+    no longer exists / is not a git checkout. The patch is truncated with a
+    marker rather than dropped, so the panel can still show the shape of a
+    large change.
+    """
+    session_id = _check_session_id(session_id)
+    session = _session_or_404(_chat_store(), session_id)
+    diff = _session_diff(session)
+    return {"db_exists": True, "session_id": session_id, **diff}
+
+
+@router.get("/chats/{session_id}/comment-preview")
+def chat_comment_preview(session_id: str) -> dict[str, Any]:
+    """The body ``POST /comment`` would post — no network, no writes.
+
+    The diff totals are included when the repository still reads; a missing
+    repo only drops that line here (the post itself refuses with a 400).
+    """
+    session_id = _check_session_id(session_id)
+    session = _session_or_404(_chat_store(), session_id)
+    pr_number, repo = _comment_pr(session)
+    diff: dict[str, Any] | None = None
+    try:
+        diff = sa_diff.collect_diff(_session_repo(session), max_patch_chars=DIFF_PATCH_LIMIT)
+    except HTTPException:
+        diff = None
+    body = sa_diff.default_comment_body(session, diff, limit=COMMENT_BODY_LIMIT)
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "pr_number": pr_number,
+        "github_repo": repo,
+        "url": str(session.get("pr_url") or ""),
+        "body": body,
+        "length": len(body),
+    }
+
+
+@router.post("/chats/{session_id}/comment")
+def chat_comment(session_id: str, body: dict | None = None) -> dict[str, Any]:
+    """Post one comment to the session's PR after a human confirms it.
+
+    400 without a PR, a GitHub repo, a saved token or a readable repository;
+    502 when GitHub rejects the post (message redacted). Never commits, pushes
+    or changes the PR itself.
+    """
+    session_id = _check_session_id(session_id)
+    store = _chat_store()
+    session = _session_or_404(store, session_id)
+    pr_number, github_repo = _comment_pr(session)
+    token = _comment_token()
+    # Reading the diff first keeps the "repo is gone" and "no PR" answers
+    # separate, and gives the generated body its file totals.
+    diff = _session_diff(session)
+    supplied = (body or {}).get("body")
+    if supplied is not None and len(str(supplied)) > COMMENT_BODY_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"comment is too long (max {COMMENT_BODY_LIMIT} chars)",
+        )
+    text = _comment_body(session, supplied, diff)
+
+    client = sa_github.GitHubClient(token, github_repo)
+    try:
+        posted = client.post_comment(pr_number, text)
+    except sa_github.GitHubError as exc:
+        raise HTTPException(status_code=502, detail=_scrub_github(str(exc))) from exc
+    url = str((posted or {}).get("html_url") or "")
+    store.add_event(
+        session_id, "commented", f"PR #{pr_number}: {url}" if url else f"PR #{pr_number}"
+    )
+    preview = text if len(text) <= COMMENT_PREVIEW_CHARS else text[:COMMENT_PREVIEW_CHARS] + "…"
+    return {
+        "ok": True,
+        "url": url,
+        "pr_number": pr_number,
+        "github_repo": github_repo,
+        "body_preview": preview,
         "session": store.get_session(session_id, message_limit=0),
     }
 

@@ -1,14 +1,16 @@
 /**
  * Superagent desktop surface — a chat-first workspace over headless chats.
  *
- * Data path: ctx.rest('/chats'), '/chats/{id}', '/models', '/settings',
- * POST /chats, POST /chats/{id}/messages, POST /chats/{id}/model,
- * POST /chats/{id}/stop, POST /settings → dashboard/plugin_api.py. The list
+ * Data path: ctx.rest('/chats'), '/chats/{id}', '/chats/{id}/diff',
+ * '/chats/{id}/comment-preview', '/models', '/settings', POST /chats,
+ * POST /chats/{id}/messages, POST /chats/{id}/model, POST /chats/{id}/stop,
+ * POST /chats/{id}/comment, POST /settings → dashboard/plugin_api.py. The list
  * query polls at 2s while a worker runs and 8s when the board is quiet; the
- * open transcript polls at 1.5s while its own turn is live. Every mutation
- * invalidates both so the rail, the transcript, and the live grid agree on
- * the next paint. The per-card elapsed timer ticks on local state only — it
- * must never add a request to those budgets.
+ * open transcript polls at 1.5s while its own turn is live. The diff panel is
+ * lazy (only while open) and refetches at 4s only while the turn is running.
+ * Every mutation invalidates both so the rail, the transcript, and the live
+ * grid agree on the next paint. The per-card elapsed timer ticks on local
+ * state only — it must never add a request to those budgets.
  *
  * The ticket pane and the status-bar chip stay (they answer "does a human need
  * to look at anything?"); the route page is chat-only.
@@ -41,6 +43,9 @@ const TICKET_POLL = 15000
 // GitHub is a secondary surface: its status/PR list is only worth a request
 // while the panel is open or a session on screen carries a PR badge.
 const GITHUB_POLL = 20000
+// An open diff panel on a *running* session: fast enough to watch files land,
+// slow enough that `git diff` never becomes the busiest thing on the machine.
+const DIFF_POLL = 4000
 
 // The live-workers column shows chats that are doing something (or that a
 // human should look at). Idle/cancelled chats stay in the rail only.
@@ -246,6 +251,16 @@ function fetchChat(id) {
   return rest ? rest(`/chats/${encodeURIComponent(id)}`) : Promise.reject(new Error('backend not ready'))
 }
 
+/** What this session changed: git status, stat and a capped patch. */
+function fetchChatDiff(id) {
+  return rest ? rest(`/chats/${encodeURIComponent(id)}/diff`) : Promise.reject(new Error('backend not ready'))
+}
+
+/** The comment body POST /comment would send (no network, no write). */
+function fetchCommentPreview(id) {
+  return rest ? rest(`/chats/${encodeURIComponent(id)}/comment-preview`) : Promise.reject(new Error('backend not ready'))
+}
+
 function fetchModels() {
   return rest ? rest('/models') : Promise.reject(new Error('backend not ready'))
 }
@@ -284,6 +299,17 @@ function useChat(id) {
     queryKey: [ID, 'chat', id], queryFn: () => fetchChat(id), enabled: !!id, retry: false,
     refetchInterval: (query) =>
       isBusy(query.state.data && query.state.data.session) ? DETAIL_POLL_RUNNING : DETAIL_POLL_QUIET,
+  })
+}
+
+/** Lazy: the diff is fetched only while its panel is open. A live turn can
+ *  still be writing files, so an open panel refetches every 4s; a finished
+ *  session leaves the panel alone until Refresh is pressed. */
+function useChatDiff(id, enabled, running) {
+  return useQuery({
+    queryKey: [ID, 'chat', id, 'diff'], queryFn: () => fetchChatDiff(id),
+    enabled: !!id && !!enabled, retry: false,
+    refetchInterval: enabled && running ? DIFF_POLL : false,
   })
 }
 
@@ -1171,9 +1197,229 @@ function Composer(props) {
   })
 }
 
+// -- handoff: diff panel + comment confirm ----------------------------------
+
+// A file's porcelain state as the one or two letters git users expect.
+const DIFF_LETTERS = {
+  modified: 'M', added: 'A', deleted: 'D', renamed: 'R', copied: 'C',
+  untracked: '??', conflict: '!', typechange: 'T', changed: '*',
+}
+// A 5 000-file status is not a review: show the head and say how much is left.
+const DIFF_FILE_ROWS = 200
+
+/** Collapsible "what did this session change" panel, between transcript and
+ *  composer. The query is owned by ChatCenter (the header needs its count);
+ *  this component only renders it. */
+function DiffPanel({ session, query, onClose }) {
+  const data = (query && query.data) || {}
+  const files = Array.isArray(data.files) ? data.files : []
+  const shown = files.slice(0, DIFF_FILE_ROWS)
+  const hidden = files.length - shown.length
+  const failed = (data && data.ok === false && data.error) || ''
+  const error = failed || errorText(query && query.error)
+  const fetching = !!(query && query.isFetching)
+
+  return jsxs('div', {
+    className: cn('flex max-h-[22rem] min-h-0 flex-col gap-1.5 overflow-y-auto rounded border',
+      'border-(--ui-stroke-secondary) p-2'),
+    children: [
+      jsxs('div', {
+        key: 'head', className: 'flex shrink-0 flex-wrap items-center justify-between gap-2 text-[0.6875rem]',
+        children: [
+          jsxs('div', {
+            key: 'm', className: 'flex min-w-0 flex-wrap items-baseline gap-2',
+            children: [
+              jsx('span', { key: 't', className: 'text-(--ui-text-secondary)', children: 'Diff' }),
+              jsx('span', {
+                key: 'n', className: 'text-(--ui-text-quaternary)',
+                children: `${files.length} file${files.length === 1 ? '' : 's'}`,
+              }),
+              data.truncated
+                ? jsx('span', { key: 'tr', className: 'text-(--ui-text-quaternary)', children: 'patch truncated' })
+                : null,
+              session && session.repo
+                ? jsx('span', {
+                    key: 'r', className: 'min-w-0 max-w-[20rem] truncate font-mono text-(--ui-text-quaternary)',
+                    children: session.repo,
+                  })
+                : null,
+            ],
+          }),
+          jsxs('div', {
+            key: 'a', className: 'flex shrink-0 items-center gap-1',
+            children: [
+              jsx(GhostButton, {
+                key: 'refresh', onClick: () => query && query.refetch(), disabled: fetching,
+                children: fetching ? 'Refreshing…' : 'Refresh',
+              }),
+              jsx(GhostButton, { key: 'close', onClick: onClose, children: 'Close' }),
+            ],
+          }),
+        ],
+      }),
+      query && query.isLoading
+        ? jsx('div', { key: 'load', className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: 'Reading the diff…' })
+        : null,
+      error
+        ? jsx('div', {
+            key: 'err', className: 'break-words text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: error,
+          })
+        : null,
+      !error && data.ok && !files.length
+        ? jsx('div', {
+            key: 'none', className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+            children: 'No changes in this repository.',
+          })
+        : null,
+      shown.length
+        ? jsxs('div', {
+            key: 'files', className: 'flex shrink-0 flex-col gap-0.5',
+            children: [
+              ...shown.map((file, index) => jsxs('div', {
+                key: `f${index}`,
+                className: 'flex min-w-0 items-baseline gap-1.5 font-mono text-[0.6875rem]',
+                children: [
+                  jsx('span', {
+                    key: 's', className: 'w-5 shrink-0 text-(--ui-text-quaternary)',
+                    children: DIFF_LETTERS[file.status] || '?',
+                  }),
+                  jsx('span', {
+                    key: 'p', className: 'min-w-0 truncate text-(--ui-text-tertiary)',
+                    children: file.path,
+                  }),
+                ],
+              })),
+              hidden > 0
+                ? jsx('div', {
+                    key: 'more', className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
+                    children: `… ${hidden} more file${hidden === 1 ? '' : 's'}`,
+                  })
+                : null,
+            ],
+          })
+        : null,
+      data.stat
+        ? jsx('pre', {
+            key: 'stat',
+            className: cn('shrink-0 overflow-x-auto whitespace-pre font-mono text-[0.6875rem]',
+              'leading-[1.35] text-(--ui-text-quaternary)'),
+            children: String(data.stat),
+          })
+        : null,
+      data.patch
+        ? jsx('pre', {
+            key: 'patch',
+            className: cn('min-h-0 shrink-0 overflow-x-auto whitespace-pre font-mono text-[0.6875rem]',
+              'leading-[1.35] text-(--ui-text-quaternary)'),
+            children: String(data.patch),
+          })
+        : null,
+    ],
+  })
+}
+
+/** Inline confirm (never window.confirm): the generated summary is editable,
+ *  Post is the only thing that talks to GitHub, and the URL is shown after. */
+function CommentBox({ session, onClose }) {
+  const queryClient = useQueryClient()
+  const preview = useQuery({
+    queryKey: [ID, 'chat', session.id, 'comment'],
+    queryFn: () => fetchCommentPreview(session.id),
+    retry: false,
+  })
+  const [text, setText] = useState('')
+  const [edited, setEdited] = useState(false)
+
+  // Prefill from the server once; a preview refetch must never overwrite what
+  // the user typed.
+  useEffect(() => {
+    if (edited || !preview.data) return
+    if (typeof preview.data.body === 'string') setText(preview.data.body)
+  }, [preview.data, edited])
+
+  const post = useMutation({
+    mutationFn: () => rest(`/chats/${encodeURIComponent(session.id)}/comment`, {
+      method: 'POST', body: { body: text },
+    }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [ID, 'chat', session.id] })
+      queryClient.invalidateQueries({ queryKey: [ID, 'chats'] })
+    },
+  })
+
+  const posted = post.data && post.data.ok ? post.data : null
+  const canPost = !!String(text || '').trim() && !post.isPending
+  const error = errorText(post.error) || errorText(preview.error) ||
+    (post.data && post.data.ok === false && post.data.error) || ''
+
+  return jsxs('div', {
+    className: cn('flex max-h-[22rem] min-h-0 flex-col gap-1.5 overflow-y-auto rounded border',
+      'border-(--ui-stroke-secondary) p-2'),
+    children: [
+      jsxs('div', {
+        key: 'head', className: 'flex shrink-0 flex-wrap items-center justify-between gap-2 text-[0.6875rem]',
+        children: [
+          jsx('span', {
+            key: 't', className: 'text-(--ui-text-secondary)',
+            children: `Comment on PR #${session.pr_number}`,
+          }),
+          jsx('span', {
+            key: 's', className: 'text-(--ui-text-quaternary)',
+            children: 'Nothing is posted until you press Post.',
+          }),
+        ],
+      }),
+      preview.isLoading
+        ? jsx('div', { key: 'load', className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: 'Preparing the summary…' })
+        : jsx('textarea', {
+            key: 'body', rows: 7, value: text,
+            onChange: (event) => { setEdited(true); setText(event.target.value) },
+            placeholder: 'What should the pull request hear?',
+            className: cn('min-h-24 w-full resize-y rounded border border-(--ui-stroke-secondary)',
+              'bg-transparent px-2 py-1.5 font-mono text-[0.6875rem] text-(--ui-text-secondary)',
+              'placeholder:text-(--ui-text-quaternary) focus:outline-none disabled:opacity-60'),
+          }),
+      error
+        ? jsx('div', {
+            key: 'err', className: 'break-words text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: error,
+          })
+        : null,
+      posted
+        ? jsxs('div', {
+            key: 'ok', className: 'flex flex-wrap items-center gap-2 text-[0.6875rem] text-(--ui-text-secondary)',
+            children: [
+              jsx('span', { key: 'm', children: 'Comment posted.' }),
+              posted.url
+                ? jsx('button', {
+                    key: 'open', type: 'button', onClick: () => openUrl(posted.url),
+                    className: 'text-(--ui-text-secondary) underline',
+                    children: 'Open on GitHub',
+                  })
+                : null,
+            ],
+          })
+        : null,
+      jsxs('div', {
+        key: 'actions', className: 'flex shrink-0 items-center gap-1',
+        children: [
+          jsx(GhostButton, {
+            key: 'post', onClick: () => { if (canPost) post.mutate() }, disabled: !canPost,
+            children: post.isPending ? 'Posting…' : 'Post',
+          }),
+          jsx(GhostButton, {
+            key: 'cancel', onClick: onClose, disabled: post.isPending, children: 'Cancel',
+          }),
+        ],
+      }),
+    ],
+  })
+}
+
 // -- chat center ------------------------------------------------------------
 
-function ChatHeader({ session, onStop, stopPending, tile }) {
+function ChatHeader({ session, onStop, stopPending, tile, diff, comment }) {
   const canOpen = !!session.hermes_session_id && !!(host && typeof host.openSession === 'function')
   const canTile = !tile && !!(host && typeof host.openWorkspace === 'function')
   const meta = [
@@ -1209,6 +1455,23 @@ function ChatHeader({ session, onStop, stopPending, tile }) {
       jsxs('div', {
         key: 'actions', className: 'flex shrink-0 items-center gap-1',
         children: [
+          diff ? jsx(GhostButton, {
+            key: 'diff',
+            title: 'Show what this session changed in its repository',
+            'aria-expanded': !!diff.open,
+            onClick: diff.onToggle,
+            children: diff.open ? 'Diff ▴' : (diff.count ? `Diff (${diff.count})` : 'Diff'),
+          }) : null,
+          comment ? jsx(GhostButton, {
+            key: 'comment',
+            title: comment.disabled
+              ? 'Wait for this turn to finish, then comment on the pull request'
+              : `Write a comment on PR #${session.pr_number}`,
+            'aria-expanded': !!comment.open,
+            disabled: comment.disabled,
+            onClick: comment.onToggle,
+            children: comment.open ? 'Comment ▴' : 'Comment on PR',
+          }) : null,
           canTile ? jsx(GhostButton, {
             key: 'tile', title: 'Open in a workspace tile',
             onClick: () => openChatTile(session),
@@ -1230,8 +1493,20 @@ function ChatHeader({ session, onStop, stopPending, tile }) {
 }
 
 function ChatCenter(props) {
-  const { summary, detail, onStop, stopPending, ...composerProps } = props
+  const { summary, detail, onStop, stopPending, canComment, ...composerProps } = props
   const session = (detail && detail.data && detail.data.session) || summary
+  const sessionId = session && session.id
+  const busy = isBusy(session)
+  const [diffOpen, setDiffOpen] = useState(false)
+  const [commentOpen, setCommentOpen] = useState(false)
+  // Unconditional hooks: `enabled` stays false until the panel is opened.
+  const diffQuery = useChatDiff(sessionId, diffOpen, busy)
+
+  // Switching chats closes both panels: neither belongs to the next session.
+  useEffect(() => {
+    setDiffOpen(false)
+    setCommentOpen(false)
+  }, [sessionId])
 
   if (!session) {
     return jsxs('div', {
@@ -1248,16 +1523,43 @@ function ChatCenter(props) {
     })
   }
 
+  const hasRepo = !!String(session.repo || '').trim()
+  const diffCount = diffQuery.data && Array.isArray(diffQuery.data.files)
+    ? diffQuery.data.files.length
+    : 0
+  const diffAction = hasRepo
+    ? { open: diffOpen, count: diffCount, onToggle: () => setDiffOpen((value) => !value) }
+    : null
+  const commentAction = session.pr_number && canComment
+    ? {
+        open: commentOpen, disabled: busy,
+        onToggle: () => setCommentOpen((value) => !value),
+      }
+    : null
+
   return jsxs('div', {
     className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-2',
     children: [
-      jsx(ChatHeader, { key: 'head', session, onStop, stopPending }),
+      jsx(ChatHeader, {
+        key: 'head', session, onStop, stopPending,
+        diff: diffAction, comment: commentAction,
+      }),
       detail && detail.isError
         ? jsx(ErrorCard, {
             key: 'err', title: `Could not load ${session.id}.`, error: detail.error,
             onRetry: () => detail.refetch(),
           })
         : jsx(Transcript, { key: 'transcript', session }),
+      diffOpen && hasRepo
+        ? jsx(DiffPanel, {
+            key: 'diff', session, query: diffQuery, onClose: () => setDiffOpen(false),
+          })
+        : null,
+      commentOpen && commentAction
+        ? jsx(CommentBox, {
+            key: 'comment', session, onClose: () => setCommentOpen(false),
+          })
+        : null,
       jsx(Composer, { key: 'composer', mode: 'session', session, ...composerProps }),
     ],
   })
@@ -1991,6 +2293,9 @@ function SuperagentPage() {
             key: 'center', summary: selectedSummary, detail,
             draft, onDraft: setDraft, onSend: submit, onStop: stop,
             pending, stopPending, error: failure,
+            // The PR comment needs a saved token; the status query already
+            // polls while a PR badge is on the board, so this is free.
+            canComment: !!(githubQuery.data && githubQuery.data.token_set),
             model, onModelChange: changeModel, repo, onRepoChange: setRepo,
             models: modelsQuery.data, inputRef,
             onSessionModel: changeSessionModel, modelPending: setChatModel.isPending,
