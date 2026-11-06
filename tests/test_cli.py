@@ -264,7 +264,7 @@ def test_chat_creates_session_and_launches_turn(
     assert "hermes superagent show S-0001" in out
     assert runner.launched == [
         {"session_id": "S-0001", "prompt": "Fix the parser",
-         "model": "", "provider": "", "repo": ""}
+         "model": "", "provider": "", "repo": "", "block": True}
     ]
     session = sa.sa_chats.ChatStore(store.path).get_session("S-0001", message_limit=0)
     assert session["title"] == "Fix the parser"
@@ -585,3 +585,38 @@ def test_models_falls_back_to_plugin_config(sa, monkeypatch, capsys):
     assert data["default_model"] == "from-config"
     assert data["default_provider"] == "cfg-provider"
     assert data["models"] == ["x-model", "y-model"]
+
+
+def test_chat_blocks_by_default_so_the_turn_actually_runs(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    """A CLI process is short-lived: a detached daemon thread dies with it.
+
+    Regression: `chat` used to call launch_turn() without block, so the worker
+    thread was killed when the command returned and the session stayed queued
+    forever with no error.
+    """
+    _clear_chat_env(monkeypatch)
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    runner = _patch_runner(sa, monkeypatch, FakeRunner())
+
+    rc = sa.sa_cli.run(_chat_args(prompt=["Fix", "it"]), object())
+    assert rc == 0
+    assert runner.launched[0]["block"] is True
+
+
+def test_chat_detach_returns_without_waiting(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    _clear_chat_env(monkeypatch)
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    runner = _patch_runner(sa, monkeypatch, FakeRunner())
+
+    rc = sa.sa_cli.run(_chat_args(prompt=["Fix", "it"], detach=True), object())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert runner.launched[0]["block"] is False
+    assert "queued" in out
+    assert "follow:" in out  # detached output is the short header, not a transcript

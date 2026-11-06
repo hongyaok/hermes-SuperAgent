@@ -397,6 +397,7 @@ class Runner:
         model: Optional[str] = None,
         provider: Optional[str] = None,
         repo: Optional[str] = None,
+        block: bool = False,
     ) -> dict:
         """Start one turn in a daemon thread; raises RuntimeError if it cannot."""
         prompt = (prompt or "").strip()
@@ -449,6 +450,25 @@ class Runner:
             name=f"superagent-{session_id}",
             daemon=True,
         )
+        if block:
+            # A CLI process is short-lived: a daemon thread would be killed the
+            # moment the command returns, leaving the session queued forever
+            # with no error. Run the turn on this thread instead.
+            self._run_turn(
+                session_id,
+                worker_prompt,
+                binary=binary,
+                resume=resume,
+                model=model or self.model,
+                provider=provider or self.provider,
+                repo=repo_path,
+            )
+            return {
+                "session_id": session_id,
+                "resume": bool(resume),
+                "command": binary,
+                "blocked": True,
+            }
         with self._lock:
             self._threads[session_id] = thread
             self._started[session_id] = time.time()

@@ -440,8 +440,19 @@ def _launch_chat(args: argparse.Namespace, ctx: Any, engine: Any, want_json: boo
         print(f"error: chat failed: {exc}")
         return 1
 
+    detach = bool(getattr(args, "detach", False))
     try:
-        _get_runner(store).launch_turn(session_id, prompt, model=model, provider=provider, repo=repo)
+        _get_runner(store).launch_turn(
+            session_id, prompt, model=model, provider=provider, repo=repo, block=not detach
+        )
+    except KeyboardInterrupt:
+        # Ctrl-C during a blocking turn: cancel the worker, keep the session.
+        try:
+            _get_runner(store).stop(session_id)
+        except Exception:
+            pass
+        print(f"\n{session_id} cancelled (interrupted)")
+        return 1
     except Exception as exc:  # missing binary, bad repo, ...
         message = str(exc) or exc.__class__.__name__
         try:
@@ -466,20 +477,30 @@ def _launch_chat(args: argparse.Namespace, ctx: Any, engine: Any, want_json: boo
         return 1
 
     try:
-        store.add_event(session_id, "launched", "headless hermes chat worker")
-        fresh = store.get_session(session_id, message_limit=0) or session
+        if detach:
+            store.add_event(session_id, "launched", "headless hermes chat worker")
+            fresh = store.get_session(session_id, message_limit=0) or session
+        else:
+            # The turn already ran on this thread: show what it produced.
+            fresh = store.get_session(session_id, message_limit=50) or session
     except Exception:
         fresh = session
     if want_json:
         print(json.dumps({
             "ok": True,
             "launched": True,
+            "detached": detach,
             "session": fresh,
             "db_path": str(getattr(store, "path", "")),
             "transcript": f"hermes superagent show {session_id}",
         }, indent=2, default=str))
-    else:
+    elif detach:
         print(render_chat(fresh, str(getattr(store, "path", ""))))
+    else:
+        # Blocking turn: header (transcript path, follow hint) + what it produced.
+        print(render_chat(fresh, str(getattr(store, "path", ""))))
+        print()
+        print(render_session(fresh))
     return 0
 
 
@@ -612,6 +633,11 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
     chat_p.add_argument("--provider", default="", help="Provider override for this session")
     chat_p.add_argument("--repo", default="", help="Repository the worker may edit")
     chat_p.add_argument("--title", default="", help="Session title (default: first prompt line)")
+    chat_p.add_argument(
+        "--detach",
+        action="store_true",
+        help="Launch the turn and return immediately instead of waiting for it",
+    )
     _add_json_flag(chat_p)
     sessions_p = subs.add_parser("sessions", help="List chat sessions, newest first")
     sessions_p.add_argument("--limit", type=int, default=20, help="How many sessions to show")

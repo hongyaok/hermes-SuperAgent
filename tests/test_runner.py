@@ -448,3 +448,26 @@ def test_runner_accepts_a_plain_store(tmp_path, sa):
     runner = sa_runner.Runner(store, hermes_bin="hermes")
     session = runner.chat.create_session("hi")
     assert sa_chats.ChatStore(tmp_path / "superagent.db").get_session(session["id"]) is not None
+
+
+def test_blocking_launch_runs_the_turn_before_returning(chat, popen, tmp_path):
+    """block=True executes inline: the session is finished when the call returns.
+
+    This is what keeps `hermes superagent chat` from launching into a daemon
+    thread that dies with the CLI process.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    popen.install(FakeProcess(jsonl(
+        {"type": "text", "text": "pong"},
+        {"type": "result", "session_id": "local-1", "exit_code": 0, "usage": {"total_tokens": 12}},
+    )))
+    runner = make_runner(chat, repo=str(repo))
+    session = chat.create_session("say pong", repo=str(repo))
+
+    result = runner.launch_turn(session["id"], "say pong", block=True)
+
+    assert result["blocked"] is True
+    assert status_of(chat, session["id"]) == "review"  # finished, not queued
+    detail = chat.get_session(session["id"], message_limit=10)
+    assert any(m["role"] == "assistant" and "pong" in (m["content"] or "") for m in detail["messages"])
