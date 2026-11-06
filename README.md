@@ -2,7 +2,7 @@
 
 `superagent` is an attention-frugal router/worker coding plugin for Hermes, inspired by DeepSeek's `dsh-superagent`.
 
-It separates **routing** from **execution**.
+It separates **routing** from **execution**, and keeps every result behind one review gate: nothing is committed, pushed or merged for you.
 
 ## Quick start (5 minutes)
 
@@ -10,7 +10,7 @@ It separates **routing** from **execution**.
    ```bash
    hermes plugins enable superagent
    ```
-   Then **Desktop → Settings → Plugins → Superagent** → enable, and run **Reload desktop plugins** from ⌘K if the tab is not there yet.
+   Then **Desktop → Settings → Plugins → Superagent** → enable, and run **Reload desktop plugins** from ⌘K if the tab is not there yet. Enabling live-reloads tool/command registration; a Python/backend change (for example `dashboard/plugin_api.py` or a route) needs `hermes gateway restart` before the desktop sees it.
 2. **Open the Superagent tab** (sidebar → Superagent, or `/superagent`).
 3. **Pick a model or preset.** Use the composer's model picker, click a preset chip if one is configured, or open **⚙ Settings** to save a default model and named presets. With nothing configured the chip row stays hidden — the picker still works and a new chat follows the CLI default.
 4. **Chat.** Describe the work, optionally set a repo path, press Enter. The turn runs as a headless `hermes chat` worker; the rail, transcript and **Live workers** grid update while it runs, and a toast tells you when it finishes or fails.
@@ -20,25 +20,29 @@ It separates **routing** from **execution**.
 ## What you get
 
 - **A real chat workspace** — a session rail, a live transcript that interleaves messages with tool events, and a composer with model picker, optional repo path and stop button. Follow-ups resume the same Hermes session.
-- **Live workers** — every queued/running chat as a card with status, model, elapsed timer, tokens and a three-event mini-feed, so parallel work fits on one screen.
+- **Live workers** — every queued, running, review or failed chat as a card with status, model, elapsed timer, tokens and a three-event mini-feed, so parallel work fits on one screen.
 - **Model presets and defaults** — named `(model, provider)` pairs saved from the ⚙ Settings panel, CLI or `config.yaml`, offered as composer chips; `GET /models` reports only what you configured plus your default model.
 - **Completion toasts** — one desktop notification per turn that ends in `review` or `failed` (no replay on page load, silent for cancelled turns).
 - **GitHub connect & PR watch** — one repository, an allow-list, `observe` or `auto` mode, open-PR list with **Work on this PR**, and one isolated `git worktree` per pull request.
 - **Review handoff** — a lazy diff panel and a human-confirmed PR comment, plus `hermes superagent diff|comment`.
 - **Tickets for everything else** — deterministic zero-token triage, `superagent_ask/tick/status/run` tools, `/superagent`, and the **Superagent watch** cron blueprint.
-- **A CLI for the same state** — `hermes superagent status|chat|sessions|models|settings|diff|comment|github|doctor`, all with `--json` and stable exit codes.
+- **A CLI for the same state** — `hermes superagent status|chat|sessions|show|stop|models|settings|github|diff|comment|doctor`, all with `--json` and stable exit codes.
 
 ## How it works
 
 - **Sources** (`LocalSource` for chat/CLI requests and `GitHubSource` for GitHub issue comment mentions) produce inbound requests.
 - A **deterministic, zero-token router** (`sa_assessor.py`) classifies each request (`accept`, `ignore`, `needs_human`).
-- **SQLite** (`<HERMES_HOME>/plugin-data/superagent/superagent.db`) persists tickets (`T-0001`, `T-0002`, ...), event history, source deduplication, and polling cursors.
-- **Isolated Hermes worker subagents** launched via `ctx.subagent_lifecycle` perform the coding work inside your repository and leave uncommitted changes in the working tree for human review (`review` state).
-- **Headless chat workers (v0.2)** — the desktop **Chat** tab starts one `hermes chat` process per turn, streams its JSON output into the session transcript, and lets you resume, watch or stop it. Chat workers follow the same rule as ticket workers: changes stay uncommitted for review.
-- **GitHub PR watch (v0.3)** — connect a repository, and pull-request comments that mention the agent become sessions. `auto` mode checks each PR out as an isolated `git worktree` and launches a worker on it; `observe` (the default) only records the request.
-- **Session handoff (v0.3)** — a finished session can show exactly what the worker changed (`git status`/`--stat`/patch, capped) and post one human-reviewed summary comment back to its pull request. Nothing is committed, pushed or merged.
+- **SQLite** (`<HERMES_HOME>/plugin-data/superagent/superagent.db`) persists tickets (`T-0001`, `T-0002`, ...), event history, source deduplication, and polling cursors, plus the chat tables (sessions, messages, events) and GitHub dedupe.
+- **Ticket worker subagents** launched via `ctx.subagent_lifecycle` perform the coding work inside your repository and leave uncommitted changes in the working tree for human review (`review` state).
+- **Headless chat workers** — the desktop Superagent tab starts one `hermes chat` process per turn, streams its JSON output into the session transcript, and lets you resume, watch or stop it. Chat workers follow the same rule as ticket workers: changes stay uncommitted for review.
+- **GitHub PR watch** — connect a repository, and pull-request comments that mention the agent become sessions. `auto` mode checks each PR out as an isolated `git worktree` and launches a worker on it; `observe` (the default) only records the request.
+- **Session handoff** — a finished session can show exactly what the worker changed (`git status`/`--stat`/patch, capped) and post one human-reviewed summary comment back to its pull request. Nothing is committed, pushed or merged.
 
-Router-side work (polling, triage, ticket state) runs no LLM and starts no subprocess. Chat turns are explicit `hermes chat` workers launched from a user message and bounded by the caps and watchdog described in [Chat and models API](#8-chat-and-models-api-v02). By default, the plugin runs in `observe` mode so it only records tickets until you explicitly approve them or switch to `auto`.
+Router-side triage (the assessor) runs no LLM, and polling is plain REST plus SQLite. Ticket workers are subagents launched only inside an agent turn; chat turns — including ones the GitHub watcher starts in `auto` — are headless `hermes chat` subprocesses bounded by the caps and watchdog described in [Chat and models API](#8-chat-and-models-api). By default, the plugin runs in `observe` mode so it only records tickets until you explicitly approve them or switch to `auto`.
+
+### Architecture
+
+The principles and the two worker mechanisms are explained in [DESIGN.md](DESIGN.md). The file map, SQLite tables, every HTTP endpoint, the desktop structure, CLI surface and release operations are in [HANDOVER.md](HANDOVER.md).
 
 ---
 
@@ -52,7 +56,7 @@ hermes plugins doctor .
 hermes plugins validate .
 ```
 
- Note: New agent tools (`superagent_ask`, `superagent_tick`, `superagent_status`, `superagent_run`) become available in **new** Hermes chat or cron sessions started after enabling the plugin. Release notes live in [`CHANGELOG.md`](CHANGELOG.md).
+Both commands are safe to run from the plugin directory. A Python/backend change (route, handler, runner) is only picked up by the gateway after `hermes gateway restart`; a change to `desktop/plugin.js` only needs ⌘K → **Reload desktop plugins**. New agent tools (`superagent_ask`, `superagent_tick`, `superagent_status`, `superagent_run`) become available in **new** Hermes chat or cron sessions started after enabling the plugin. Release notes live in [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
@@ -144,7 +148,7 @@ The dashboard backend is loaded outside the plugin package, so it reads these va
 
 ## Usage Across Surfaces
 
-> **Important Architectural Rule:** Ticket worker subagents can **only** be launched from an active Hermes agent turn (an interactive chat session or a scheduled cron turn). `ctx.subagent_lifecycle` requires an active parent session (`bind_subagent_parent`). The CLI, slash commands, and ticket REST endpoints can inspect state and queue tickets, but they never launch ticket workers directly (`launch=False`). The v0.2 chat endpoints are separate: they start a headless `hermes chat` process, which needs no parent turn and is not a subagent.
+> **Important Architectural Rule:** Ticket worker subagents can **only** be launched from an active Hermes agent turn (an interactive chat session or a scheduled cron turn). `ctx.subagent_lifecycle` requires an active parent session (`bind_subagent_parent`). The CLI, slash commands, and ticket REST endpoints can inspect state and queue tickets, but they never launch ticket workers directly (`launch=False`). The chat endpoints are separate: they start a headless `hermes chat` process, which needs no parent turn and is not a subagent.
 
 ### 1. Agent Tools (Chat Session or Cron Turn)
 
@@ -231,21 +235,26 @@ Because cron automations execute as full Hermes agent turns, `Superagent watch` 
 
 ### 5. Desktop Panel & Dashboard API
 
-The plugin ships a unified desktop extension (`desktop/plugin.js`) and a FastAPI backend (`dashboard/plugin_api.py` mounted at `/api/plugins/superagent`). Ticket routes stay read-only; the chat routes below them drive the v0.2 Chat tab:
+The plugin ships a unified desktop extension (`desktop/plugin.js`) and a FastAPI backend (`dashboard/plugin_api.py` mounted at `/api/plugins/superagent`). GET ticket routes are read-only; `POST /ask`, `/run` and `/tick` record or queue tickets but cannot launch a ticket worker from REST. The chat, settings and GitHub routes drive the page:
 
 - `GET /api/plugins/superagent/health` — plugin version and SQLite database status.
 - `GET /api/plugins/superagent/tickets?limit=30` — status counts, `"Needs you"` attention list, and recent tickets.
 - `GET /api/plugins/superagent/tickets/{ticket_id}` — full ticket details and event log.
-- `GET /api/plugins/superagent/models` — default model/provider and the configured presets (`[]` when none are configured).
+- `GET /api/plugins/superagent/sessions` — enriched ticket rows (the ticket sessions grid; not chat sessions).
+- `POST /api/plugins/superagent/ask` · `/run` · `/tick` — record a ticket, queue a promotion, run one routing pass.
 - `GET|POST /api/plugins/superagent/chats` — list chat sessions / start a new headless chat.
 - `GET /api/plugins/superagent/chats/{session_id}` — one chat with its transcript and events.
 - `POST /api/plugins/superagent/chats/{session_id}/messages` — send a follow-up and resume the Hermes session.
+- `POST /api/plugins/superagent/chats/{session_id}/model` — set model/provider for future turns.
 - `POST /api/plugins/superagent/chats/{session_id}/stop` — cancel the running turn.
 - `GET /api/plugins/superagent/chats/{session_id}/diff` — git status, stat and a capped patch for the session's repository.
 - `GET /api/plugins/superagent/chats/{session_id}/comment-preview` — the comment body a post would send (no network, no write).
 - `POST /api/plugins/superagent/chats/{session_id}/comment` — post one human-confirmed comment to the session's pull request.
+- `GET|POST /api/plugins/superagent/settings` — merged public settings / save the panel-editable keys (the token is never returned).
+- `GET /api/plugins/superagent/models` — default model/provider and the configured presets (`[]` when none are configured).
+- `GET /api/plugins/superagent/github/status` · `POST /github/{test,connect,settings,disconnect,poll}` · `GET /github/prs` · `POST /github/prs/{n}/work` — connect one repository, watch PRs and start a session on one (see [GitHub connect & PR watch](#9-github-connect--pr-watch)).
 
-The desktop page at `/superagent` leads with the v0.2 chat workspace (see [Desktop chat tab](#7-desktop-chat-tab-v02)); the ticket surface lives beside it:
+The desktop page at `/superagent` leads with the chat workspace (see [Desktop chat workspace](#7-desktop-chat-workspace)); the ticket surface lives beside it:
 
 - **Chat workspace** — a chat rail, a live transcript, a composer with model picker and optional repo path, and the **Live workers** grid. The first prompt starts a headless `hermes chat` worker; follow-ups resume it; **Stop** cancels it.
 - **Ticket pane** (right dock) — the `"Needs you"` attention list (`observed` / `blocked` / `review` / `failed`) and recent tickets from `GET /tickets`. The status-bar chip only falls back to this list when the chats query has no data.
@@ -253,7 +262,7 @@ The desktop page at `/superagent` leads with the v0.2 chat workspace (see [Deskt
 
 Enable the desktop view under **Desktop → Settings → Plugins → Superagent** (then reload desktop plugins) to see the status bar chip and the Superagent pane.
 
-### 6. Sessions Enrichment API (`Engine.sessions` / `get_ticket_detail`)
+### 6. Ticket sessions API (`Engine.sessions` / `get_ticket_detail`)
 
 For programmatic and UI use, the engine exposes a read-only sessions layer (no behavior change to `ask` / `tick` / `promote`):
 
@@ -266,7 +275,7 @@ Each session row contains `id`, `status`, `source`, `requester`, `request` (160-
 
 ---
 
-### 7. Desktop chat tab (v0.2)
+### 7. Desktop chat workspace
 
 The Superagent page (`/superagent`) is chat-first. Everything in the tab is backed by `/chats` and `/models`; ticket state is shown alongside but a chat turn never creates a ticket.
 
@@ -283,7 +292,7 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 
 ---
 
-### 8. Chat and models API (v0.2)
+### 8. Chat and models API
 
 | Method | Path | Behaviour |
 | :--- | :--- | :--- |
@@ -294,6 +303,7 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 | `POST` | `/chats` | Validate, create and launch a chat. Optional `preset` selects a named model (explicit `model`/`provider` still win; unknown preset is `400` listing the available names) and records a `preset` event. `400` on an empty/oversized prompt or an invalid repo; `200 {ok:false}` when the worker cannot start (the session is stored as `failed`). |
 | `GET` | `/chats/{id}` | Session with `messages` and `events`; `404` for an unknown id. |
 | `POST` | `/chats/{id}/messages` | Append the user message and resume the Hermes session. `409` while a turn is queued/running; `400` when the stored repo is no longer valid; with no `hermes_session_id` a fresh chat is created and `previous_session_id` is returned. |
+| `POST` | `/chats/{id}/model` | Set `{model, provider}` for future turns. `400` when both are empty, `409` while queued/running, `404` for an unknown id. |
 | `POST` | `/chats/{id}/stop` | Cancel a queued/running turn; `409` when nothing is running. |
 
 #### Guardrails
@@ -304,7 +314,7 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 - **Runaway guard.** A queued or running turn older than `turn_timeout_seconds` (env `SUPERAGENT_TURN_TIMEOUT_SECONDS`, default `1800`; `0` disables) is cancelled by `Runner.reap()`. `GET /chats` calls `reap()` before answering, so the status becomes `cancelled` and a `cancelled` event records the reason — `turn timed out after Ns while queued` or `... while running` — followed by `(limit Ns)`, even if the server restarted and no process handle is left.
 - **Consistent triage.** `POST /ask` runs the same `sa_assessor.assess(..., explicit=True)` rules as the router instead of hardcoding `accept`: a skip marker or acknowledgement is recorded as `ignored`, a design question becomes `blocked` (`needs_human`), and an actionable request becomes `observed` (`accept`). The verdict and reason are stored on the ticket and in its `assessed` event.
 
-### 9. GitHub connect & PR watch (v0.3)
+### 9. GitHub connect & PR watch
 
 Connect one repository and Superagent watches its pull requests. A comment that mentions the agent (`@<login>`, `@superagent`, `/superagent`, or a line starting `superagent:`) from an allowed user becomes a session; when `github_watch_new_prs` is on, a new head commit on a watched PR starts a review session once per SHA.
 
@@ -428,7 +438,7 @@ Run the test suite from the repository root:
 pytest -q
 ```
 
-The suite is hermetic: `tests/test_runner.py` and `tests/test_hardening.py` replace `Popen` with a fake, so no real `hermes` process is spawned. `tests/test_hardening.py` covers repo containment (missing/file/dot-dot/symlink escape), secret redaction, the 20k/2k caps, every `POST /ask` triage branch, and the runaway watchdog. The v0.3 GitHub tests are also offline: `tests/test_github.py` replaces the HTTP call at the `_urlopen` seam and git at the `git_runner` parameter, `tests/test_watcher.py` uses a canned client and a fake runner, and `tests/test_github_api.py` writes settings to a throwaway `HERMES_HOME` and patches the watcher/client singletons. The handoff tests use a real temporary git repository (`tests/test_diff.py` for status/stat/patch, staged changes and truncation; `tests/test_handoff_api.py` for the endpoints; `tests/test_cli_handoff.py` for `diff`/`comment`) and fake the GitHub client, so nothing reaches the network.
+The suite is hermetic: `tests/test_runner.py` and `tests/test_hardening.py` replace `Popen` with a fake, so no real `hermes` process is spawned. `tests/test_hardening.py` covers repo containment (missing/file/dot-dot/symlink escape), secret redaction, the 20k/2k caps, every `POST /ask` triage branch, and the runaway watchdog. The GitHub tests are also offline: `tests/test_github.py` replaces the HTTP call at the `_urlopen` seam and git at the `git_runner` parameter, `tests/test_watcher.py` uses a canned client and a fake runner, and `tests/test_github_api.py` writes settings to a throwaway `HERMES_HOME` and patches the watcher/client singletons. The handoff tests use a real temporary git repository (`tests/test_diff.py` for status/stat/patch, staged changes and truncation; `tests/test_handoff_api.py` for the endpoints; `tests/test_cli_handoff.py` for `diff`/`comment`) and fake the GitHub client, so nothing reaches the network.
 
 Validate the plugin manifest and its registrations before shipping:
 

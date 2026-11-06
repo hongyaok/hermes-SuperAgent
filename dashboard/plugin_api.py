@@ -64,7 +64,7 @@ except ImportError:  # loaded standalone by the gateway / pytest
 
 router = APIRouter()
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # Server-side caps (mirrored in sa_runner so the runner enforces them too).
 MAX_PROMPT_CHARS = sa_runner.MAX_PROMPT_CHARS

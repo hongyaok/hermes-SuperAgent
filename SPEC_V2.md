@@ -1,8 +1,8 @@
-# Superagent v0.2/v0.3 — chat sessions, headless workers and GitHub PR watch
+# Superagent v0.4 — chat sessions, headless workers and GitHub PR watch
 
 Superagent 0.1 treated every request as a ticket: a rule-based router decided
-whether work was worth doing, and a Hermes subagent did it. v0.2 keeps that
-path and adds the missing half — a **chat you can actually talk to**, with one
+whether work was worth doing, and a Hermes subagent did it. v0.2–v0.4 keep that
+path and add the missing half — a **chat you can actually talk to**, with one
 live session per topic and a worker you can watch.
 
 ## Why subprocess workers
@@ -39,9 +39,9 @@ Ids are readable and sequential (`S-0001`) and allocated from the existing
 first line of the prompt (80 chars) unless one is supplied.
 
 Statuses: `queued` (waiting for a worker slot), `running`, `review` (a turn
-finished; a human should look at the work), `idle` (turn finished, waiting for
-the next message), `observed` (a recorded GitHub request nobody launched yet),
-`failed`, `cancelled`.
+finished; a human should look at the work), `observed` (a recorded GitHub
+request nobody launched yet), `failed`, `cancelled`. `idle` is defined in the
+enum but not currently emitted by the runner; a successful turn is `review`.
 
 ## Runner (`sa_runner.py`)
 
@@ -87,7 +87,7 @@ for lists, and every handler returns JSON.
 
 `GET /sessions` keeps its 0.1 meaning (ticket rows for the desktop sessions
 grid) because `desktop/plugin.js` still reads it; chats therefore live under
-`/chats` instead of replacing it. The v0.2 desktop work will read `/chats`.
+`/chats` instead of replacing it. The desktop work reads `/chats`.
 
 The Runner is a lazy module-level singleton keyed by database path
 (`_get_runner()`), so repeated requests share one semaphore and one set of
@@ -226,16 +226,22 @@ for. The flat `models` list still names the configured `default_model`.
    status-bar chip, the failed session's error in the transcript header and
    worker mini-feed, and phase-accurate reap wording (`while queued` /
    `while running`). The README now opens with a five-minute quick start and a
-   feature list, the operator skill covers every v0.2/v0.3 surface plus the
-   ticket path, and `CHANGELOG.md` records 0.3.0.)*
+   feature list, the operator skill covers every v0.4 surface plus the ticket
+   path, and `CHANGELOG.md` records the 0.4.0 release.)*
 10. **Final polish** — performance pass (polling, DB indexes), full test sweep,
     release notes and a version bump everywhere. *(Done: list polling 2 s while
     live / 8 s quiet, detail 1.5 s / 6 s, diff 4 s only while its panel is open
     on a running turn, GitHub 20 s only while its panel or a PR badge is
     visible; `chat_sessions`, `chat_messages` and `chat_events` indexes;
-    `CHANGELOG.md` and `plugin.yaml`/`VERSION` at 0.3.0; full pytest sweep
-    green. Triage routing — a cheap model for assessment and a strong one for
+    `plugin.yaml`, `dashboard/manifest.json` and `dashboard/plugin_api.py` at
+    0.4.0 with `tests/test_release.py` guarding the published version
+    locations plus the manifest description; full pytest sweep green (401
+    tests). Triage routing — a cheap model for assessment and a strong one for
     implementation — remains future work.)*
+
+## Where it landed (v0.4.0)
+
+All ten build-plan items shipped. `sa_chats.py` and `sa_runner.py` provide the chat schema and the headless `hermes chat` runner; `desktop/plugin.js` provides the rail, transcript, live-worker grid, ⚙ Settings, GitHub panel and diff/comment flow over `/chats`, `/settings`, `/models` and `/github/*`; `sa_settings.py`, `sa_github.py`, `sa_watcher.py` and `sa_diff.py` provide presets and merged settings, the REST client, the baseline/dedupe PR watcher with isolated worktrees, and the capped review handoff; `sa_cli.py` and `dashboard/plugin_api.py` expose the same state to the terminal and to HTTP; and `tests/` (401 hermetic tests, including `test_release.py`) cover the runner, chat store, settings, GitHub watcher, diff/comment and release consistency. The ticket path, `/tickets`, `/sessions` and the deterministic router were left intact beside the chat surface. Rationale lives in `DESIGN.md`; the operational map lives in `HANDOVER.md`.
 
 ## Guardrails
 

@@ -1,7 +1,7 @@
 ---
 name: superagent-operator
 description: Operate Superagent chats, workers and GitHub watch.
-version: 0.3.0
+version: 0.4.0
 platforms: [linux, macos, windows]
 metadata:
   hermes:
@@ -15,9 +15,9 @@ Use this guide when operating, triaging, or tuning the `superagent` plugin in He
 `superagent` has two execution paths that share one SQLite database and one
 attention budget:
 
-- **Chat sessions (v0.2)** — the desktop **Superagent** tab starts one headless
+- **Chat sessions** — the desktop **Superagent** tab starts one headless
   `hermes chat` process per turn. You watch the transcript, resume it, stop it.
-- **Tickets (v0.1)** — a deterministic, zero-token router turns accepted
+- **Tickets** — a deterministic, zero-token router turns accepted
   requests into tickets; worker subagents run inside a Hermes agent turn.
 
 Neither path commits or pushes for you. Both end in `review` with the changes
@@ -66,7 +66,7 @@ router's real traffic.
 
 ---
 
-## 3. Run a Chat Session (v0.2)
+## 3. Run a Chat Session
 
 The chat path is the normal way to ask for work; it needs no ticket and no
 GitHub connection.
@@ -133,7 +133,7 @@ queries on save, so chips and new sessions agree immediately.
 
 ---
 
-## 5. GitHub Connect & PR Watch (v0.3)
+## 5. GitHub Connect & PR Watch
 
 Header → **GitHub**, or the CLI:
 
@@ -168,8 +168,8 @@ session per SHA.
   are recorded as seen, so connecting a busy repository does not replay history.
 - Dedupe lives in `gh_seen`, so restarts do not duplicate work.
 - Bots and the agent's own comments are ignored. Empty allow-list = nobody.
-- Poll interval is `github_poll_seconds` (15–3600 s, default 90); each poll is
-  capped by `github_pr_limit`.
+- Poll interval is `github_poll_seconds` (minimum 5, default 90; the desktop/API
+  form accepts 15–3600); each poll is capped by `github_pr_limit`.
 
 ---
 
@@ -193,7 +193,7 @@ exits `1` without a PR, repo or saved token, and `2` for bad usage.
 
 ---
 
-## 7. Tickets (v0.1, still supported)
+## 7. Tickets (still supported)
 
 ### Daily triage inside a Hermes chat turn
 
