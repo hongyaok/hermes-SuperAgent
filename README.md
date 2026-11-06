@@ -2,14 +2,41 @@
 
 `superagent` is an attention-frugal router/worker coding plugin for Hermes, inspired by DeepSeek's `dsh-superagent`.
 
-It separates **routing** from **execution**:
+It separates **routing** from **execution**.
+
+## Quick start (5 minutes)
+
+1. **Enable the plugin** and reload desktop plugins:
+   ```bash
+   hermes plugins enable superagent
+   ```
+   Then **Desktop → Settings → Plugins → Superagent** → enable, and run **Reload desktop plugins** from ⌘K if the tab is not there yet.
+2. **Open the Superagent tab** (sidebar → Superagent, or `/superagent`).
+3. **Pick a model or preset.** Use the composer's model picker, click a preset chip if one is configured, or open **⚙ Settings** to save a default model and named presets. With nothing configured the chip row stays hidden — the picker still works and a new chat follows the CLI default.
+4. **Chat.** Describe the work, optionally set a repo path, press Enter. The turn runs as a headless `hermes chat` worker; the rail, transcript and **Live workers** grid update while it runs, and a toast tells you when it finishes or fails.
+5. **(Optional) Connect GitHub.** Header → **GitHub** → repository, token, allowed users → **Connect**. `observe` records PR mentions as sessions; `auto` launches a worker on each one. **Work on this PR** starts one by hand.
+6. **Review before anything leaves your machine.** Open a finished session → **Diff** shows `git status`, `--stat` and the patch → **Comment on PR** previews an editable summary and posts only when you press **Post**. Nothing is committed, pushed or merged.
+
+## What you get
+
+- **A real chat workspace** — a session rail, a live transcript that interleaves messages with tool events, and a composer with model picker, optional repo path and stop button. Follow-ups resume the same Hermes session.
+- **Live workers** — every queued/running chat as a card with status, model, elapsed timer, tokens and a three-event mini-feed, so parallel work fits on one screen.
+- **Model presets and defaults** — named `(model, provider)` pairs saved from the ⚙ Settings panel, CLI or `config.yaml`, offered as composer chips; `GET /models` reports only what you configured plus your default model.
+- **Completion toasts** — one desktop notification per turn that ends in `review` or `failed` (no replay on page load, silent for cancelled turns).
+- **GitHub connect & PR watch** — one repository, an allow-list, `observe` or `auto` mode, open-PR list with **Work on this PR**, and one isolated `git worktree` per pull request.
+- **Review handoff** — a lazy diff panel and a human-confirmed PR comment, plus `hermes superagent diff|comment`.
+- **Tickets for everything else** — deterministic zero-token triage, `superagent_ask/tick/status/run` tools, `/superagent`, and the **Superagent watch** cron blueprint.
+- **A CLI for the same state** — `hermes superagent status|chat|sessions|models|settings|diff|comment|github|doctor`, all with `--json` and stable exit codes.
+
+## How it works
+
 - **Sources** (`LocalSource` for chat/CLI requests and `GitHubSource` for GitHub issue comment mentions) produce inbound requests.
 - A **deterministic, zero-token router** (`sa_assessor.py`) classifies each request (`accept`, `ignore`, `needs_human`).
 - **SQLite** (`<HERMES_HOME>/plugin-data/superagent/superagent.db`) persists tickets (`T-0001`, `T-0002`, ...), event history, source deduplication, and polling cursors.
 - **Isolated Hermes worker subagents** launched via `ctx.subagent_lifecycle` perform the coding work inside your repository and leave uncommitted changes in the working tree for human review (`review` state).
 - **Headless chat workers (v0.2)** — the desktop **Chat** tab starts one `hermes chat` process per turn, streams its JSON output into the session transcript, and lets you resume, watch or stop it. Chat workers follow the same rule as ticket workers: changes stay uncommitted for review.
 - **GitHub PR watch (v0.3)** — connect a repository, and pull-request comments that mention the agent become sessions. `auto` mode checks each PR out as an isolated `git worktree` and launches a worker on it; `observe` (the default) only records the request.
-- **Session handoff (v0.5)** — a finished session can show exactly what the worker changed (`git status`/`--stat`/patch, capped) and post one human-reviewed summary comment back to its pull request. Nothing is committed, pushed or merged.
+- **Session handoff (v0.3)** — a finished session can show exactly what the worker changed (`git status`/`--stat`/patch, capped) and post one human-reviewed summary comment back to its pull request. Nothing is committed, pushed or merged.
 
 Router-side work (polling, triage, ticket state) runs no LLM and starts no subprocess. Chat turns are explicit `hermes chat` workers launched from a user message and bounded by the caps and watchdog described in [Chat and models API](#8-chat-and-models-api-v02). By default, the plugin runs in `observe` mode so it only records tickets until you explicitly approve them or switch to `auto`.
 
@@ -25,7 +52,7 @@ hermes plugins doctor .
 hermes plugins validate .
 ```
 
- Note: New agent tools (`superagent_ask`, `superagent_tick`, `superagent_status`, `superagent_run`) become available in **new** Hermes chat or cron sessions started after enabling the plugin.
+ Note: New agent tools (`superagent_ask`, `superagent_tick`, `superagent_status`, `superagent_run`) become available in **new** Hermes chat or cron sessions started after enabling the plugin. Release notes live in [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
@@ -58,7 +85,7 @@ model_presets:
   - {name: local, model: qwen3-8b, provider: ollama}
 ```
 
-At most **12** presets are kept, names must be unique (case-insensitive), and every preset needs a `model`. An empty list falls back to the built-in picker list. `GET /models` returns the names plus the flat `models` list, the composer shows one chip per preset before a chat starts, and `POST /chats` accepts `preset: "<name>"` (an explicit `model`/`provider` still wins). `hermes superagent chat --preset <name>` resolves the same catalog from the terminal.
+At most **12** presets are kept, names must be unique (case-insensitive), and every preset needs a `model`. An empty list means **no presets**: the composer hides its chip row and you choose with the model picker (or the configured default). You are never shown a hardcoded model you may have no credentials for. `GET /models` returns `presets` plus a flat `models` list — the preset models in configured order, then the configured `default_model` if it is not already there. The composer shows one chip per preset before a chat starts, and `POST /chats` accepts `preset: "<name>"` (an explicit `model`/`provider` still wins). `hermes superagent chat --preset <name>` resolves the same catalog from the terminal.
 
 ### All Settings (`plugin.yaml`)
 
@@ -77,7 +104,7 @@ At most **12** presets are kept, names must be unique (case-insensitive), and ev
 | `poll_limit` | `int` | `30` | Maximum number of GitHub issue comments fetched per polling pass (`1`–`100`). |
 | `default_model` | `str` | `""` | Model used by desktop chat sessions when the request does not pick one. Empty means the CLI default. Env: `SUPERAGENT_DEFAULT_MODEL`. |
 | `default_provider` | `str` | `""` | Provider for the default chat model (for example `opencode-go`). Empty means the CLI default. Env: `SUPERAGENT_DEFAULT_PROVIDER`. |
-| `model_presets` | `list` | built-in list | Models offered in the per-session picker. Empty uses the built-in list. Env: `SUPERAGENT_MODEL_PRESETS` (comma separated). |
+| `model_presets` | `list` | `[]` | Named models offered as composer chips. Empty means no chips (the model picker still works). Env: `SUPERAGENT_MODEL_PRESETS` (comma separated). |
 | `worker_yolo` | `bool` | `true` | Pass `--yolo` to headless chat workers so they do not wait for approval prompts. Env: `SUPERAGENT_WORKER_YOLO`. |
 | `chat_max_turns` | `int` | `120` | Maximum agent turns for one headless chat worker. Env: `SUPERAGENT_CHAT_MAX_TURNS`. |
 | `github_watch_mode` | `str` (`observe` \| `auto`) | `observe` | `observe` records PR mentions as `observed` sessions only; `auto` queues and launches a worker for each one. Env: `SUPERAGENT_GITHUB_WATCH_MODE`. |
@@ -209,7 +236,7 @@ The plugin ships a unified desktop extension (`desktop/plugin.js`) and a FastAPI
 - `GET /api/plugins/superagent/health` — plugin version and SQLite database status.
 - `GET /api/plugins/superagent/tickets?limit=30` — status counts, `"Needs you"` attention list, and recent tickets.
 - `GET /api/plugins/superagent/tickets/{ticket_id}` — full ticket details and event log.
-- `GET /api/plugins/superagent/models` — default model/provider and the picker presets.
+- `GET /api/plugins/superagent/models` — default model/provider and the configured presets (`[]` when none are configured).
 - `GET|POST /api/plugins/superagent/chats` — list chat sessions / start a new headless chat.
 - `GET /api/plugins/superagent/chats/{session_id}` — one chat with its transcript and events.
 - `POST /api/plugins/superagent/chats/{session_id}/messages` — send a follow-up and resume the Hermes session.
@@ -218,13 +245,13 @@ The plugin ships a unified desktop extension (`desktop/plugin.js`) and a FastAPI
 - `GET /api/plugins/superagent/chats/{session_id}/comment-preview` — the comment body a post would send (no network, no write).
 - `POST /api/plugins/superagent/chats/{session_id}/comment` — post one human-confirmed comment to the session's pull request.
 
-The desktop page at `/superagent` now leads with the v0.2 chat workspace (see [Desktop chat tab](#7-desktop-chat-tab-v02)) and keeps the ticket views beside it:
+The desktop page at `/superagent` leads with the v0.2 chat workspace (see [Desktop chat tab](#7-desktop-chat-tab-v02)); the ticket surface lives beside it:
 
-- **Chat tab** — a chat rail, a live transcript, and a composer with a model picker and an optional repo path. The first prompt starts a headless `hermes chat` worker; follow-ups resume it; **Stop** cancels it.
-- **Attention tab** — `observed` / `blocked` / `review` / `failed` tickets that need a human decision.
-- **Sessions tab** — the full sessions list (`Engine.sessions()`), with status, requester, request/result previews, event count, timestamps and elapsed time, plus `running` / `queued` counts. Selecting a row calls the ticket-detail view (`Engine.get_ticket_detail()` / `GET /tickets/{id}`).
+- **Chat workspace** — a chat rail, a live transcript, a composer with model picker and optional repo path, and the **Live workers** grid. The first prompt starts a headless `hermes chat` worker; follow-ups resume it; **Stop** cancels it.
+- **Ticket pane** (right dock) — the `"Needs you"` attention list (`observed` / `blocked` / `review` / `failed`) and recent tickets from `GET /tickets`. The status-bar chip only falls back to this list when the chats query has no data.
+- **Settings and GitHub panels** — full-width collapsible panels above the workspace, opened from the header.
 
-Enable the desktop view under **Desktop -> Settings -> Plugins -> Superagent** (then reload desktop plugins) to see the status bar chip and attention panel.
+Enable the desktop view under **Desktop → Settings → Plugins → Superagent** (then reload desktop plugins) to see the status bar chip and the Superagent pane.
 
 ### 6. Sessions Enrichment API (`Engine.sessions` / `get_ticket_detail`)
 
@@ -246,8 +273,10 @@ The Superagent page (`/superagent`) is chat-first. Everything in the tab is back
 - **Chat rail (left)** — the newest chats, each with status, model, age (or elapsed time while a turn runs). Selecting a row opens its transcript; **New chat** clears the composer.
 - **Transcript (centre)** — the session prompt followed by `chat_messages` and `chat_events` merged in order, so assistant text interleaves with tool calls, errors and result lines. A failed turn shows the stored error.
 - **Composer** — a model picker fed by `/models` (presets plus **Default model**), an optional repo path (defaults to the configured repo) and Enter-to-send / Shift+Enter newline. While a turn is queued or running the composer is disabled and **Stop** cancels the turn.
-- **Chat header** — status, model/provider, tokens, duration, and **Open in Hermes** when `hermes_session_id` is known.
-- **Live workers (right)** — every queued or running chat as a card, so parallel workers stay visible without opening each chat.
+- **Chat header** — status, model/provider, tokens, duration, and **Open in Hermes** when `hermes_session_id` is known. A `failed` session puts its stored `error` in the header (prefixed `error:`) instead of leaving the status pill to imply it.
+- **Live workers (right)** — every queued or running chat as a card, so parallel workers stay visible without opening each chat. A failed card with no recent event feed shows the first line of the stored error.
+- **Completion toasts** — when a chat moves from `queued`/`running` to `review` or `failed` while the page is mounted, one `host.notify` toast says `<title> finished` (`info`) or `<title> failed` (`error`). The first poll only seeds the status map, so opening the page never replays old completions; `cancelled` is silent.
+- **Status-bar chip** — speaks for chats: `▶ N` while N run and `◆ M` when M sessions sit in `review`/`failed`. Ticket attention is used only while the chats query has no data at all (backend disabled or first paint).
 - **Polling** — the rail refreshes from `/chats` on a timer (faster while anything is running); the open chat refreshes from `/chats/{id}` at the same time. No WebSocket is required.
 
 A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `cancelled`). `review` means the worker finished and its changes are waiting in the working tree; sending another message resumes the same Hermes session when `hermes_session_id` is known.
@@ -258,7 +287,7 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 
 | Method | Path | Behaviour |
 | :--- | :--- | :--- |
-| `GET` | `/models` | `{default_model, default_provider, models, presets}` from settings/env; `presets` is `[{name, model, provider}]` and `models` stays the flat model list. |
+| `GET` | `/models` | `{default_model, default_provider, models, presets}` from settings/env. `presets` is `[{name, model, provider}]` and is `[]` when none are configured; `models` is the flat list of preset models in order plus the configured `default_model`, never a hardcoded catalogue. |
 | `GET` | `/settings` | Merged, public settings (`mode`, `repo_path`, defaults, normalised `model_presets`, worker limits, GitHub watch fields) plus `github_token_set`; never the token. |
 | `POST` | `/settings` | Validate and save `mode`, `repo_path`, `default_model`, `default_provider`, `model_presets`, `max_workers` (1–8), `worker_yolo`, `chat_max_turns` (1–500); unknown keys and out-of-range values are `400`. Drops the Runner singleton so the next turn uses the new values. Returns `{ok, settings}`. |
 | `GET` | `/chats?limit=50` | `{db_exists, sessions, counts, running}`; also runs the runaway watchdog before answering. |
@@ -272,7 +301,7 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 - **Repository containment.** Before a turn is queued, the target repo is resolved with `Path.resolve(strict=True)`. A path that does not exist, is not a directory, contains `..`, or resolves (including through a symlink/junction) outside `SUPERAGENT_REPO_ROOT` (which defaults to `SUPERAGENT_REPO`) raises `ValueError`, which the handlers turn into `400`. Only the resolved path is passed to `--in` and used as the subprocess `cwd`; the raw request string never reaches `argv`.
 - **Caps.** Prompts are limited to 20 000 characters (checked by the runner and by `POST /chats` / `POST /chats/{id}/messages`), stored assistant text is clipped to 20 000, and every event detail is clipped to 2 000. Over-limit prompts are rejected with `400`; over-limit output is truncated before the write, so a runaway worker cannot bloat the database.
 - **Secret redaction.** `ghp_`, `gho_` and `github_pat_` tokens, `sk-` and `xoxb-`/`xoxp-` style keys, `Authorization:` header values and bare `Bearer` tokens are replaced with `[redacted]` before chat messages, events, errors, prompts and ticket fields are persisted. The same scrub runs on the preview strings the UI reads.
-- **Runaway guard.** A queued or running turn older than `turn_timeout_seconds` (env `SUPERAGENT_TURN_TIMEOUT_SECONDS`, default `1800`; `0` disables) is cancelled by `Runner.reap()`. `GET /chats` calls `reap()` before answering, so the status becomes `cancelled` and a `cancelled` event records the reason (`turn timed out after Ns (limit Ns)`) even if the server restarted and no process handle is left.
+- **Runaway guard.** A queued or running turn older than `turn_timeout_seconds` (env `SUPERAGENT_TURN_TIMEOUT_SECONDS`, default `1800`; `0` disables) is cancelled by `Runner.reap()`. `GET /chats` calls `reap()` before answering, so the status becomes `cancelled` and a `cancelled` event records the reason — `turn timed out after Ns while queued` or `... while running` — followed by `(limit Ns)`, even if the server restarted and no process handle is left.
 - **Consistent triage.** `POST /ask` runs the same `sa_assessor.assess(..., explicit=True)` rules as the router instead of hardcoding `accept`: a skip marker or acknowledgement is recorded as `ignored`, a design question becomes `blocked` (`needs_human`), and an actionable request becomes `observed` (`accept`). The verdict and reason are stored on the ticket and in its `assessed` event.
 
 ### 9. GitHub connect & PR watch (v0.3)
@@ -344,7 +373,7 @@ A new user should be able to choose models and get started without reading the d
 - **Max parallel workers** (`1–8`), **Max turns per worker** (`1–500`) and **Run workers unattended (`--yolo`)** with help text.
 - **Save** posts `POST /settings` and invalidates the settings, models and chats queries so the chips and every new session agree; **Refresh** re-reads and **Cancel** closes.
 
-**Composer preset chips.** Before a chat starts, one chip per preset sits above the textarea. Clicking a chip fills the model/provider and highlights it; the normal ModelPicker stays available for an ad-hoc choice (which clears the chip). The selected name is sent as `preset` with `POST /chats`, together with the resolved `model`/`provider`.
+**Composer preset chips.** Before a chat starts, one chip per preset sits above the textarea. Clicking a chip fills the model/provider and highlights it; the normal ModelPicker stays available for an ad-hoc choice (which clears the chip). The selected name is sent as `preset` with `POST /chats`, together with the resolved `model`/`provider`. With **no presets configured the chip row is not rendered at all** — there is no built-in fallback list, because a chip for a model you have no credentials for can only start a failed worker. The picker and the default model still work.
 
 **First-run onboarding.** While there are no chat sessions yet, a compact **Get started** card lists three numbered steps: *Pick a model / preset* (opens Settings), *Connect a GitHub repo to watch PRs* (opens the GitHub panel; the hint states that an empty allow-list means nobody can trigger work and the agent ignores its own comments), and *Start a chat below*. Dismissing it writes `onboarded` through `ctx.storage`, so it does not come back.
 

@@ -505,7 +505,8 @@ class Runner:
         except Exception:
             return expired
         for row in sessions:
-            if row.get("status") not in (sa_chats.QUEUED, sa_chats.RUNNING):
+            status = str(row.get("status") or "")
+            if status not in (sa_chats.QUEUED, sa_chats.RUNNING):
                 continue
             started = row.get("started_at") or row.get("created_at") or 0
             try:
@@ -514,7 +515,9 @@ class Runner:
                 continue
             if age <= timeout:
                 continue
-            reason = f"turn timed out after {int(age)}s (limit {timeout}s)"
+            # Say which phase timed out: a queued turn waited for a worker
+            # slot, a running one held it. Same cancellation either way.
+            reason = f"turn timed out after {int(age)}s while {status} (limit {timeout}s)"
             self._cancel(str(row["id"]), reason)
             expired.append({"id": row["id"], "status": sa_chats.CANCELLED, "reason": reason})
         return expired

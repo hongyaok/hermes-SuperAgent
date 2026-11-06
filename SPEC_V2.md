@@ -71,7 +71,7 @@ hermes chat -q <prompt> -Q --format stream-json --source tool \
 
 | method | path                          | behaviour |
 |--------|-------------------------------|-----------|
-| GET    | `/models`                     | default model/provider + preset list |
+| GET    | `/models`                     | default model/provider + configured presets; `presets` is `[]` when none are set and `models` is preset models in order plus the default model (never a hardcoded list) |
 | GET    | `/chats?limit=50&status=`      | `{db_exists, sessions, counts, running}`; live rows add `recent_events` (last 3, newest first, detail 160 chars) and `elapsed_seconds` (running/queued, else `null`); `status=running,queued` narrows rows only |
 | POST   | `/chats`                      | create + launch a chat; 400 on empty/oversized prompt, 200 `{ok:false}` when the worker cannot start (session is stored as `failed`) |
 | GET    | `/chats/{id}`                 | session + messages + events; 404 unknown |
@@ -168,6 +168,11 @@ New `plugin.yaml` settings: `default_model`, `default_provider`,
 `SUPERAGENT_CHAT_SOURCE`, `SUPERAGENT_WORKER_TOOLSETS`, `SUPERAGENT_REPO`,
 `SUPERAGENT_MAX_WORKERS`.
 
+`model_presets` defaults to `[]`. An empty list is not replaced by a built-in
+catalogue: `GET /models` returns `presets: []` and the composer hides its chip
+row, so a user is never offered a model id the machine may have no credentials
+for. The flat `models` list still names the configured `default_model`.
+
 ## Build plan
 
 1. **Backend runner** — `sa_chats.py`, `sa_runner.py`, `/chats` + `/models`,
@@ -215,13 +220,22 @@ New `plugin.yaml` settings: `default_model`, `default_provider`,
    `POST /chats/{id}/comment` caps the body at 20 000, never echoes the token
    and never commits, pushes or edits the PR.)*
 9. **UX and docs** — onboarding, empty states, README/SPEC refresh, skill
-   update for operators. *(A finished session now closes the loop: a lazy
-   `Diff` panel in the chat header shows status/stat/patch and a
-   `Comment on PR` button opens an inline, editable confirm prefilled from
-   `GET /chats/{id}/comment-preview`; `hermes superagent diff|comment` do the
-   same from a terminal. Nothing is posted without a human pressing Post.)*
+   update for operators. *(Done: the three-step first-run card, honest empty
+   presets (no chip row and no hardcoded fallback catalogue), one completion
+   toast per `queued`/`running` → `review`/`failed` transition, a chat-aware
+   status-bar chip, the failed session's error in the transcript header and
+   worker mini-feed, and phase-accurate reap wording (`while queued` /
+   `while running`). The README now opens with a five-minute quick start and a
+   feature list, the operator skill covers every v0.2/v0.3 surface plus the
+   ticket path, and `CHANGELOG.md` records 0.3.0.)*
 10. **Final polish** — performance pass (polling, DB indexes), full test sweep,
-    release notes and a 0.2.0 version bump everywhere.
+    release notes and a version bump everywhere. *(Done: list polling 2 s while
+    live / 8 s quiet, detail 1.5 s / 6 s, diff 4 s only while its panel is open
+    on a running turn, GitHub 20 s only while its panel or a PR badge is
+    visible; `chat_sessions`, `chat_messages` and `chat_events` indexes;
+    `CHANGELOG.md` and `plugin.yaml`/`VERSION` at 0.3.0; full pytest sweep
+    green. Triage routing — a cheap model for assessment and a strong one for
+    implementation — remains future work.)*
 
 ## Guardrails
 

@@ -124,7 +124,17 @@ def chat_api(tmp_path, monkeypatch):
     runner = FakeRunner(store=module.sa_chats.ChatStore(db))
     monkeypatch.setattr(module, "_db_path", lambda: db)
     monkeypatch.setattr(module, "_get_runner", lambda: runner)
-    return module, runner
+    # Same hermetic HERMES_HOME as settings_api: a developer's real
+    # settings.json must not leak default_model into these assertions.
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setattr(module.sa_settings, "_hermes_home", lambda: home)
+    monkeypatch.setattr(module.sa_settings, "config_path", lambda: home / "config.yaml")
+    for name in module.sa_settings.ENV_VARS.values():
+        monkeypatch.delenv(name, raising=False)
+    module.sa_settings.clear_cache()
+    yield module, runner
+    module.sa_settings.clear_cache()
 
 
 def test_models_endpoint_reports_defaults(chat_api, monkeypatch):
@@ -135,7 +145,9 @@ def test_models_endpoint_reports_defaults(chat_api, monkeypatch):
     body = api.list_models()
     assert body["default_model"] == "deepseek-v4.1-flash"
     assert body["default_provider"] == "opencode-go"
-    assert api.MODEL_PRESETS[0] in body["models"]
+    # No presets configured -> no chips; the flat list carries the default only.
+    assert body["presets"] == []
+    assert body["models"] == ["deepseek-v4.1-flash"]
 
 
 def test_models_presets_can_come_from_env(chat_api, monkeypatch):
@@ -564,11 +576,32 @@ def test_models_reports_named_presets_and_the_flat_list(settings_api):
     ]
 
 
-def test_models_falls_back_to_the_builtin_list(settings_api):
+def test_models_without_presets_advertises_nothing(settings_api):
     api, _ = settings_api
     body = api.list_models()
-    assert body["models"] == list(api.MODEL_PRESETS)
-    assert [preset["name"] for preset in body["presets"]] == list(api.MODEL_PRESETS)
+    assert body["presets"] == []
+    assert body["models"] == []
+    assert body["default_model"] == ""
+
+
+def test_models_appends_the_default_model_to_the_flat_list(settings_api):
+    api, _ = settings_api
+    api.update_settings({"default_model": "solo", "default_provider": "prov"})
+    body = api.list_models()
+    assert body["presets"] == []
+    assert body["models"] == ["solo"]
+
+
+def test_models_keeps_preset_order_then_the_default(settings_api):
+    api, _ = settings_api
+    api.update_settings(
+        {
+            "default_model": "zzz-default",
+            "model_presets": ["fast=prov:one", {"name": "strong", "model": "two"}],
+        }
+    )
+    body = api.list_models()
+    assert body["models"] == ["one", "two", "zzz-default"]
 
 
 def test_create_chat_resolves_a_named_preset(settings_api):
@@ -616,6 +649,16 @@ def test_create_chat_unknown_preset_lists_the_available_names(settings_api):
     assert excinfo.value.status_code == 400
     assert "missing" in excinfo.value.detail
     assert "fast" in excinfo.value.detail and "strong" in excinfo.value.detail
+
+
+def test_create_chat_unknown_preset_without_configuration_says_none(settings_api):
+    api, _ = settings_api
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        api.create_chat({"prompt": "work", "preset": "missing"})
+    assert excinfo.value.status_code == 400
+    assert "none configured" in excinfo.value.detail
 
 
 def test_create_chat_without_a_preset_uses_the_saved_defaults(settings_api):

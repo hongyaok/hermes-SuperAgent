@@ -73,13 +73,16 @@ MAX_EVENT_CHARS = sa_runner.MAX_EVENT_CHARS
 # Ticket asks keep their own, shorter limit: a ticket is a request, not a chat.
 MAX_ASK_CHARS = 2000
 
-# Models offered in the per-session model picker. Extend as providers change;
-# SUPERAGENT_MODEL_PRESETS (comma separated) overrides this list.
+# Historical built-in picker list, kept as a reference for the legacy
+# SUPERAGENT_MODEL_PRESETS spelling only. It is never advertised on its own:
+# a model id the user has no credentials for turns a preset chip into a
+# guaranteed failed worker, which is worse than showing no chip at all.
 MODEL_PRESETS = [
     "deepseek-v4.1-flash",
     "qwen/qwen3.8-27b",
     "z-ai/glm-5.3-flash",
 ]
+LEGACY_PRESETS_ENV = "SUPERAGENT_MODEL_PRESETS"
 
 # Settings the panel may change. Everything else (the GitHub token in
 # particular) is written by its own endpoint or read-only here.
@@ -663,12 +666,23 @@ def tick(body: dict | None = None) -> dict[str, Any]:
 
 
 def _preset_catalog(settings: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    """Normalised presets, or the built-in picker list when none are configured."""
+    """The presets this user configured — never a hardcoded catalogue.
+
+    An empty list is a valid answer: the desktop composer then hides its preset
+    chip row and the model picker falls back to the configured default model.
+    Advertising :data:`MODEL_PRESETS` here used to hand users model ids they may
+    have no credentials for, so a chip could only ever start a failed worker.
+    The env spelling still wins through :func:`sa_settings.load_settings`.
+    """
     data = settings if settings is not None else sa_settings.load_settings()
     presets = sa_settings.normalize_presets(data.get("model_presets") or [])
-    if not presets:
-        presets = [{"name": name, "model": name, "provider": ""} for name in MODEL_PRESETS]
-    return presets
+    if presets:
+        return presets
+    # The legacy env spelling is the only opt-in that may surface the built-in
+    # list (e.g. an env value that normalises to nothing). No env, no chips.
+    if os.environ.get(LEGACY_PRESETS_ENV):
+        return [{"name": name, "model": name, "provider": ""} for name in MODEL_PRESETS]
+    return []
 
 
 def _settings_payload() -> dict[str, Any]:
@@ -795,11 +809,15 @@ def update_settings(body: dict | None = None) -> dict[str, Any]:
 def list_models() -> dict[str, Any]:
     settings = sa_settings.load_settings()
     presets = _preset_catalog(settings)
-    # `models` stays the historical flat list of model ids; `presets` is the
-    # named view the composer chips and the settings editor use.
-    models = list(dict.fromkeys(preset["model"] for preset in presets))
+    default_model = str(settings.get("default_model") or "").strip()
+    # `models` stays the historical flat list the fallback <select> reads:
+    # preset models in configured order, then the default model if it is not
+    # already covered. Never the hardcoded list.
+    models = list(dict.fromkeys(
+        [preset["model"] for preset in presets] + ([default_model] if default_model else [])
+    ))
     return {
-        "default_model": str(settings.get("default_model") or ""),
+        "default_model": default_model,
         "default_provider": str(settings.get("default_provider") or ""),
         "models": models,
         "presets": presets,

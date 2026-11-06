@@ -509,7 +509,7 @@ def test_models_json_shape(sa, monkeypatch, capsys):
     assert rc == 0
     assert data["default_model"] == "m1"
     assert data["default_provider"] == "p1"
-    assert data["models"] == ["a", "b"]
+    assert data["models"] == ["a", "b", "m1"]
     # Presets keep the historical flat list working but add the named view.
     assert data["presets"] == [
         {"name": "a", "model": "a", "provider": ""},
@@ -591,7 +591,7 @@ def test_models_falls_back_to_plugin_config(sa, monkeypatch, capsys):
     assert rc == 0
     assert data["default_model"] == "from-config"
     assert data["default_provider"] == "cfg-provider"
-    assert data["models"] == ["x-model", "y-model"]
+    assert data["models"] == ["x-model", "y-model", "from-config"]
 
 
 def test_chat_blocks_by_default_so_the_turn_actually_runs(
