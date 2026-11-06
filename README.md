@@ -136,6 +136,21 @@ hermes superagent show T-0001
 hermes superagent doctor
 ```
 
+| Command | Behaviour |
+| :--- | :--- |
+| `hermes superagent status` | Mode, running/queued counts, the "Needs you" list and recent tickets. |
+| `hermes superagent tick` | One routing pass: polls sources and records tickets (never launches a worker from the CLI). |
+| `hermes superagent ask "<request>"` | Record a request as a ticket. |
+| `hermes superagent run <ticket-id>` | Promote an `observed`/`blocked`/`failed` ticket to `queued`. |
+| `hermes superagent show <id>` | A ticket's full detail, or a chat session (`S-…`) with messages and events. |
+| `hermes superagent chat "<prompt>"` | Start a headless chat turn (blocking; `--detach` returns immediately). |
+| `hermes superagent sessions` / `stop <id>` | List chat sessions / cancel a queued or running turn. |
+| `hermes superagent models` | Default model/provider and the picker presets. |
+| `hermes superagent github [status\|test\|connect\|disconnect\|prs\|poll\|work <n>]` | Connect a repository, manage the watch settings, list open PRs, and start work on one (see [GitHub connect & PR watch](#9-github-connect--pr-watch-v03)). |
+| `hermes superagent doctor` | Configuration, repository and worker-lifecycle checks. |
+
+Every subcommand accepts `--json`. Exit codes: `0` ok, `1` runtime error, `2` usage error.
+
 ### 3. Slash Command (`/superagent`)
 
 Inside Hermes chat interfaces, use `/superagent` for quick inspection and queueing:
@@ -230,13 +245,45 @@ Connect one repository and Superagent watches its pull requests. A comment that 
 
 | Method | Path | Behaviour |
 | :--- | :--- | :--- |
-| `GET` | `/github/status` | `{configured, repo, login, token_set, open_prs, last_poll, last_error, watching, watch_mode, poll_seconds, sessions_created}`; also starts the background poller (idempotent). |
+| `GET` | `/github/status` | `{configured, repo, login, token_set, open_prs, last_poll, last_error, watching, watch_mode, watch_new_prs, allowed_users, poll_seconds, sessions_created}`; also starts the background poller (idempotent). |
 | `POST` | `/github/test` | `{repo?, token?}` — validate a token/repository pair without saving. Returns `{ok, login, full_name, default_branch, private, open_pr_count}`; `400` on a bad repo or rejected token. |
-| `POST` | `/github/connect` | `{repo, token?}` — validate with the supplied or saved token, save `github_repo` (and the token and resolved login), reset the baseline, start watching, return the status. `400` on a malformed repo or an auth failure. |
+| `POST` | `/github/connect` | `{repo, token?, allowed_users?, watch_mode?, watch_new_prs?, poll_seconds?}` — validate with the supplied or saved token, save the connection and the optional watch settings in one write, reset the baseline, start watching, return the status. `400` on a malformed repo/setting or an auth failure. |
+| `POST` | `/github/settings` | `{allowed_users?, watch_mode?, watch_new_prs?, poll_seconds?, agent_login?}` — save watch settings without touching the repository or token; the watcher is rebuilt so the next poll uses them. `400` on an unknown mode, a `poll_seconds` outside `15`–`3600`, or a malformed login. Returns `{ok, status}` (never the token). |
 | `POST` | `/github/disconnect` | Clear `github_repo` and `github_token` in `settings.json`, stop the poller. |
 | `POST` | `/github/poll` | One polling pass now: `{configured, polled, created, errors}`. |
 | `GET` | `/github/prs` | `{configured, prs}` — the cached open PR list. |
 | `POST` | `/github/prs/{number}/work` | `{request?}` — create a session for that PR and launch a worker (an explicit human action always launches). `400` when GitHub is not connected, `404` for an unknown PR. |
+
+**Desktop panel.** The Superagent page has a **GitHub** button in the header with a status dot (green when a repository and token are configured) and the repository's short name. It opens a full-width panel above the chat workspace:
+
+- **Connection (left)** — repository (`owner/name`), a password field for the token (blank keeps the saved one; the placeholder says `saved token`), the comma-separated allowed-user list, and an Observe/Auto segmented control. **Connect** saves the whole form in one `POST /github/connect`; **Save settings** sends only the watch fields to `POST /github/settings`; **Poll now** runs one pass; **Disconnect** forgets the repository and token. The panel shows the resolved login, open-PR count, watching state, poll interval and the watcher's `last_error`. The token is never rendered.
+- **Open pull requests (right)** — the repository's open PRs with `#number`, a two-line title, author, updated age, and **Work on this PR** (`POST /github/prs/{n}/work`). The returned session is selected immediately, so the transcript opens in the centre column.
+- **PR badges** — a session created from a PR carries `pr_number`/`pr_url`, shown as a `#123` badge in the chat header, the session rail and the live-worker cards. Clicking it opens the PR in the browser.
+- **Polling** — `/github/prs` refreshes every 20 s only while the panel is open; `/github/status` refreshes at the same interval only while the panel is open or a session with a PR badge is on screen. Otherwise the status is fetched once for the header dot, so the chat workspace keeps its existing polling budget.
+
+**CLI.** `hermes superagent github ...` uses `sa_settings`/`sa_github`/`GitHubWatcher` directly (no HTTP, no dashboard needed):
+
+```bash
+# Status (default action), open PRs and one polling pass
+hermes superagent github
+hermes superagent github prs
+hermes superagent github poll
+
+# Validate a token/repository pair without saving anything
+hermes superagent github test --repo owner/name --token <token>
+
+# Connect (saves repo/token/login and optional watch settings)
+hermes superagent github connect --repo owner/name --token <token> \
+  --allowed alice,bob --watch-mode observe
+
+# Start work on a PR (blocking turn; prints the session id and transcript)
+hermes superagent github work 7 --request "add a regression test"
+
+# Forget the repository and token
+hermes superagent github disconnect
+```
+
+`--json` works on every action. Exit codes are `0` (ok), `1` (runtime or configuration error) and `2` (usage: unknown action, missing/invalid `--repo`, bad `--watch-mode`, missing PR number). The token is written to `settings.json` and never echoed.
 
 **Settings precedence.** `DEFAULTS` (matching `plugin.yaml`) < `plugins.entries.superagent.settings` in `config.yaml` < `<HERMES_HOME>/plugin-data/superagent/settings.json` (what the connect form writes) < environment variables. A token that is empty or a `${...}` placeholder falls back to `SUPERAGENT_GITHUB_TOKEN`. `settings.json` is written atomically and chmod `600` where the platform supports it; the token is never returned by an endpoint (`token_set: true` says whether one exists).
 

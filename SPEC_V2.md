@@ -137,6 +137,7 @@ HTTP surface (`dashboard/plugin_api.py`):
 | GET    | `/github/status` | watcher status; lazily starts the poller |
 | POST   | `/github/test` | `{repo?, token?}` -> masked `{login, full_name, default_branch, private, open_pr_count}` |
 | POST   | `/github/connect` | `{repo, token?}` -> validate, save, reset the baseline, return status |
+| POST   | `/github/settings` | `{allowed_users?, watch_mode?, watch_new_prs?, poll_seconds?, agent_login?}` -> validate + save watch settings, rebuild the watcher, return `{ok, status}` |
 | POST   | `/github/disconnect` | clear repo + token, stop polling |
 | POST   | `/github/poll` | one pass: `{configured, polled, created, errors}` |
 | GET    | `/github/prs` | `{configured, prs}` |
@@ -179,8 +180,16 @@ New `plugin.yaml` settings: `default_model`, `default_provider`,
    requests and comments, store `github_repo`/`pr_number`/`pr_url` on sessions,
    and check a PR out as an isolated worktree. *(done: `sa_settings.py`,
    `sa_github.py`, `sa_watcher.py`, `/github/*`)*
-5. **GitHub UI + CLI** — connect/pin a repo from the panel, `/superagent pr`
-   and a CLI subcommand to open the PR for a reviewed session.
+5. **GitHub UI + CLI** — a **GitHub** header button (status dot + repo), a
+   connect/settings panel with the open-PR list and "Work on this PR", `#123`
+   PR badges on the transcript, rail and worker cards, and
+   `hermes superagent github status|test|connect|disconnect|prs|poll|work`.
+   *(done: `/github/settings` validates the allow-list, mode and 15–3600 s
+   poll interval; the PR list polls at 20 s only while the panel is open and
+   the status only while the panel or a PR badge is visible. The CLI uses
+   `sa_settings`/`sa_github`/`GitHubWatcher` directly — no HTTP — and `work`
+   creates a `github_pr` session, prepares the PR checkout when `repo_path` is
+   set, launches blocking and prints the session/transcript id.)*
 6. **CLI polish** — `hermes superagent chat`, `sessions`, `show`, `stop`,
    `models`, all with `--json`; stable exit codes.
 7. **Presets and routing** — named model presets, per-session defaults, cheap
