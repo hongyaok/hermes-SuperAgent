@@ -16,7 +16,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Sequence
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -108,6 +108,13 @@ MAX_MESSAGE_CHARS = 20000
 MAX_EVENT_CHARS = 2000
 MAX_TITLE_CHARS = 80
 
+# Statuses that are doing something right now. Only these rows get the live
+# extras in list_sessions(); a board of 50 historical chats stays slim.
+LIVE_STATUSES = (QUEUED, RUNNING)
+# The per-card activity feed: the last few events, clipped for a single line.
+RECENT_EVENT_LIMIT = 3
+RECENT_EVENT_CHARS = 160
+
 
 def derive_title(prompt: str, limit: int = MAX_TITLE_CHARS) -> str:
     """First non-empty line of the prompt, clipped to ``limit`` characters."""
@@ -124,6 +131,21 @@ def derive_title(prompt: str, limit: int = MAX_TITLE_CHARS) -> str:
 def _clip(text: Any, limit: int) -> str:
     value = "" if text is None else str(text)
     return value if len(value) <= limit else value[:limit]
+
+
+def _elapsed_seconds(row: dict, now: float) -> Optional[int]:
+    """Age of the current turn in whole seconds, or None for a finished one.
+
+    A queued turn has no start of its own: the runner records ``started_at``
+    only when the process actually spawns, so a value left over from an earlier
+    turn must not be reported as the current wait.
+    """
+    if row.get("status") not in LIVE_STATUSES:
+        return None
+    started = row.get("started_at")
+    if not started or row.get("status") == QUEUED:
+        return 0
+    return max(0, int(now - started))
 
 
 class ChatStore:
@@ -239,13 +261,31 @@ class ChatStore:
         session["events"] = self.get_events(session_id, limit=event_limit)
         return session
 
-    def list_sessions(self, limit: int = 50) -> dict:
-        """Recent sessions plus status counts for the live session grid."""
+    def list_sessions(
+        self, limit: int = 50, statuses: Optional[Sequence[str]] = None
+    ) -> dict:
+        """Recent sessions plus status counts for the live session grid.
+
+        Live rows (queued/running) carry ``elapsed_seconds`` and the last
+        ``RECENT_EVENT_LIMIT`` events, so a grid of cards can draw a per-card
+        feed from one poll instead of a detail request per card. Historical rows
+        stay slim on purpose. ``statuses`` filters the rows only; ``counts``
+        keep describing the whole board so the header still tells the truth.
+        """
+        limit = max(1, int(limit))
+        wanted = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+        clause = ""
+        params: list[Any] = []
+        if wanted:
+            clause = " WHERE s.status IN (%s)" % ", ".join("?" for _ in wanted)
+            params.extend(wanted)
+        params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT s.*, (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id)"
-                " AS message_count FROM chat_sessions s ORDER BY s.updated_at DESC LIMIT ?",
-                (max(1, int(limit)),),
+                " AS message_count FROM chat_sessions s" + clause +
+                " ORDER BY s.updated_at DESC LIMIT ?",
+                params,
             ).fetchall()
             counts = {
                 row["status"]: row["n"]
@@ -253,11 +293,49 @@ class ChatStore:
                     "SELECT status, COUNT(*) AS n FROM chat_sessions GROUP BY status"
                 )
             }
-        return {
-            "sessions": [dict(row) for row in rows],
-            "counts": counts,
-            "running": counts.get(RUNNING, 0),
-        }
+            sessions = [dict(row) for row in rows]
+            live_ids = [row["id"] for row in sessions if row["status"] in LIVE_STATUSES]
+            feeds = self._recent_events(conn, live_ids)
+        now = time.time()
+        for session in sessions:
+            session["elapsed_seconds"] = _elapsed_seconds(session, now)
+            if session["id"] in feeds:
+                session["recent_events"] = feeds[session["id"]]
+        return {"sessions": sessions, "counts": counts, "running": counts.get(RUNNING, 0)}
+
+    def _recent_events(
+        self,
+        conn: sqlite3.Connection,
+        session_ids: Sequence[str],
+        per_session: int = RECENT_EVENT_LIMIT,
+    ) -> dict[str, list[dict]]:
+        """Newest ``per_session`` events for every id, in one query.
+
+        Grouping happens here, not in SQL, so the query stays a plain index
+        scan: the results arrive newest-first and each bucket stops at
+        ``per_session``.
+        """
+        ids = [str(session_id) for session_id in session_ids if session_id]
+        if not ids:
+            return {}
+        rows = conn.execute(
+            "SELECT session_id, kind, detail, created_at FROM chat_events"
+            " WHERE session_id IN (%s) ORDER BY id DESC" % ", ".join("?" for _ in ids),
+            ids,
+        ).fetchall()
+        feeds: dict[str, list[dict]] = {session_id: [] for session_id in ids}
+        for row in rows:
+            bucket = feeds[row["session_id"]]
+            if len(bucket) >= per_session:
+                continue
+            bucket.append(
+                {
+                    "kind": row["kind"],
+                    "detail": _clip(row["detail"], RECENT_EVENT_CHARS),
+                    "created_at": row["created_at"],
+                }
+            )
+        return feeds
 
     # -- messages --------------------------------------------------------
 

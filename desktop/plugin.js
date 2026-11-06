@@ -2,11 +2,12 @@
  * Superagent desktop surface — a chat-first workspace over headless chats.
  *
  * Data path: ctx.rest('/chats'), '/chats/{id}', '/models', POST /chats,
- * POST /chats/{id}/messages, POST /chats/{id}/stop → dashboard/plugin_api.py.
- * The list query polls at 2s while a worker runs and 8s when the board is
- * quiet; the open transcript polls at 1.5s while its own turn is live. Every
- * mutation invalidates both so the rail, the transcript, and the live grid
- * agree on the next paint.
+ * POST /chats/{id}/messages, POST /chats/{id}/model, POST /chats/{id}/stop →
+ * dashboard/plugin_api.py. The list query polls at 2s while a worker runs and
+ * 8s when the board is quiet; the open transcript polls at 1.5s while its own
+ * turn is live. Every mutation invalidates both so the rail, the transcript,
+ * and the live grid agree on the next paint. The per-card elapsed timer ticks
+ * on local state only — it must never add a request to those budgets.
  *
  * The ticket pane and the status-bar chip stay (they answer "does a human need
  * to look at anything?"); the route page is chat-only.
@@ -110,6 +111,52 @@ function fmtDuration(ms) {
   const minutes = Math.floor(total / 60)
   if (minutes < 60) return total % 60 ? `${minutes}m ${total % 60}s` : `${minutes}m`
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+/** Same shape as fmtDuration but from seconds, and 0 renders as '0s'. */
+function fmtSeconds(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0))
+  if (total < 60) return `${total}s`
+  const minutes = Math.floor(total / 60)
+  if (minutes < 60) return total % 60 ? `${minutes}m ${total % 60}s` : `${minutes}m`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+/** Token count for a finished card: '812 tok' / '4.2k tok' / '1.3M tok'. */
+function fmtTokens(tokens) {
+  const n = Number(tokens)
+  if (!isFinite(n) || n <= 0) return ''
+  if (n < 1000) return `${Math.round(n)} tok`
+  if (n < 1000000) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k tok`
+  return `${(n / 1000000).toFixed(1)}M tok`
+}
+
+/** Seconds the current turn has been alive, recomputed against `nowMs`.
+ *
+ * The server sends `elapsed_seconds` for live rows, but a value frozen at the
+ * last poll would make the timer stutter; ticking from `started_at` locally
+ * keeps it smooth without a request. A queued turn has no start of its own, so
+ * its wait is measured from `created_at`.
+ */
+function liveElapsedSeconds(session, nowMs) {
+  if (!session) return 0
+  const start = session.started_at ||
+    (session.status === 'queued' ? session.created_at : 0)
+  if (start) return Math.max(0, Math.floor(nowMs / 1000 - start))
+  const reported = Number(session.elapsed_seconds)
+  return isFinite(reported) && reported > 0 ? Math.floor(reported) : 0
+}
+
+/** Re-render once a second while `active`; purely local, never a refetch. */
+function useNow(active) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return undefined
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [active])
+  return now
 }
 
 /** Elapsed for a live turn, duration for a finished one, age otherwise. */
@@ -305,20 +352,70 @@ function SessionRow({ session, selected, onSelect }) {
   })
 }
 
+const RAIL_FILTERS = [
+  { id: 'all', label: 'All' },
+  { id: 'live', label: 'Live' },
+  { id: 'review', label: 'Review' },
+]
+
+/** Segment predicates. Filtering never clears the selection: the page keeps
+ *  `selectedId`, so a hidden session still has its transcript on screen. */
+function railFilterMatch(session, filter) {
+  if (filter === 'live') return isBusy(session)
+  if (filter === 'review') return session.status === 'review' || session.status === 'failed'
+  return true
+}
+
+const RAIL_EMPTY = {
+  all: 'No chats yet.',
+  live: 'Nothing running.',
+  review: 'Nothing to review.',
+}
+
+function RailFilter({ value, onChange }) {
+  return jsx('div', {
+    role: 'group',
+    'aria-label': 'Filter chats',
+    className: 'flex shrink-0 items-center gap-0.5',
+    children: RAIL_FILTERS.map((option) => jsx('button', {
+      key: option.id,
+      type: 'button',
+      'aria-pressed': value === option.id,
+      onClick: () => onChange(option.id),
+      className: cn('rounded px-1.5 py-0.5 text-[0.6875rem]',
+        value === option.id
+          ? 'bg-(--chrome-action-hover) text-(--ui-text-secondary)'
+          : 'text-(--ui-text-quaternary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)'),
+      children: option.label,
+    })),
+  })
+}
+
 function SessionsRail({ sessions, selectedId, onSelect }) {
+  const [filter, setFilter] = useState('all')
+  const shown = useMemo(
+    () => (filter === 'all' ? sessions : sessions.filter((session) => railFilterMatch(session, filter))),
+    [sessions, filter],
+  )
   return jsxs('div', {
     className: 'flex min-h-0 w-full flex-col gap-2 md:w-[17rem] md:shrink-0',
     children: [
-      jsx('div', {
-        key: 'label', className: 'text-xs font-medium text-(--ui-text-tertiary)',
-        children: sessions.length ? `Chats (${sessions.length})` : 'Chats',
+      jsxs('div', {
+        key: 'head', className: 'flex items-center justify-between gap-2',
+        children: [
+          jsx('div', {
+            key: 'label', className: 'text-xs font-medium text-(--ui-text-tertiary)',
+            children: sessions.length ? `Chats (${sessions.length})` : 'Chats',
+          }),
+          jsx(RailFilter, { key: 'filter', value: filter, onChange: setFilter }),
+        ],
       }),
       jsx('div', {
         key: 'list', className: 'flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-1',
-        children: sessions.length
-          ? sessions.map((session) =>
+        children: shown.length
+          ? shown.map((session) =>
               jsx(SessionRow, { key: session.id, session, selected: session.id === selectedId, onSelect }))
-          : jsx('div', { className: 'px-2 py-1 text-xs text-(--ui-text-tertiary)', children: 'No chats yet.' }),
+          : jsx('div', { className: 'px-2 py-1 text-xs text-(--ui-text-tertiary)', children: RAIL_EMPTY[filter] }),
       }),
     ],
   })
@@ -475,11 +572,47 @@ function ModelPicker({ value, models, onChange, disabled }) {
   })
 }
 
+/** Existing chats keep their model, but a small button swaps it for the next
+ *  turn via POST /chats/{id}/model. Same ModelPicker, opened on demand. */
+function SessionModelControl({ session, models, onChange, pending }) {
+  const [editing, setEditing] = useState(false)
+  const busy = isBusy(session)
+  const disabled = busy || pending
+  if (!editing) {
+    return jsxs('span', {
+      className: 'flex min-w-0 items-center gap-1',
+      children: [
+        jsx('span', { key: 'l', className: 'min-w-0 truncate', children: sessionModelLabel(session) }),
+        jsx(GhostButton, {
+          key: 'b',
+          className: 'shrink-0',
+          disabled,
+          title: busy
+            ? 'The model can change when this turn finishes'
+            : 'Change the model for future turns of this chat',
+          onClick: () => setEditing(true),
+          children: pending ? 'Saving…' : 'Change model',
+        }),
+      ],
+    })
+  }
+  return jsx(ModelPicker, {
+    value: { model: session.model || '', provider: session.provider || '' },
+    models,
+    disabled: pending,
+    onChange: (next) => {
+      setEditing(false)
+      if (onChange) onChange(next)
+    },
+  })
+}
+
 // -- composer ---------------------------------------------------------------
 
 function Composer(props) {
   const { mode, session, draft, onDraft, onSend, onStop, pending, stopPending, error,
-    model, onModelChange, repo, onRepoChange, models, inputRef } = props
+    model, onModelChange, repo, onRepoChange, models, inputRef,
+    onSessionModel, modelPending } = props
   const busy = isBusy(session)
   const canSend = !!String(draft || '').trim() && !pending && !busy
   const placeholder = mode === 'session'
@@ -487,8 +620,9 @@ function Composer(props) {
     : 'Describe the work…'
   const meta = mode === 'session'
     ? [
-        jsx('span', { key: 'model', className: 'min-w-0 truncate', children: sessionModelLabel(session) }),
-        jsx('span', { key: 'note', className: 'shrink-0', children: 'model fixed for this chat' }),
+        jsx(SessionModelControl, {
+          key: 'model', session, models, pending: modelPending, onChange: onSessionModel,
+        }),
       ]
     : [
         jsx(ModelPicker, { key: 'picker', value: model, models, disabled: pending, onChange: onModelChange }),
@@ -669,8 +803,42 @@ function openChatTile(session) {
 
 // -- live workers -----------------------------------------------------------
 
+/** Three dim event lines, oldest first — the last thing this worker did. */
+function WorkerFeed({ session }) {
+  const events = Array.isArray(session.recent_events) ? session.recent_events.filter(Boolean) : []
+  const lines = events.length
+    ? events.slice(0, 3).reverse().map((event) => {
+        const kind = String(event.kind || '').trim()
+        const detail = String(event.detail || '').replace(/\s+/g, ' ').trim()
+        return clip(detail ? `${kind}: ${detail}` : kind, 120)
+      })
+    : (() => {
+        const fallback = String(session.last_event || '').replace(/\s+/g, ' ').trim()
+        return fallback ? [clip(fallback, 120)] : []
+      })()
+  if (!lines.length) return null
+  return jsx('div', {
+    className: 'flex min-w-0 flex-col gap-0.5 text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
+    children: lines.map((line, index) => jsx('div', {
+      key: `${index}:${line.slice(0, 16)}`,
+      className: 'min-w-0 truncate',
+      title: line,
+      children: line,
+    })),
+  })
+}
+
 function WorkerCard({ session, onSelect }) {
-  const event = String(session.last_event || '').trim()
+  const busy = isBusy(session)
+  // Client-only ticker: it repaints this card every second and touches no
+  // query, so polling budgets stay exactly as configured.
+  const now = useNow(busy)
+  const timing = busy
+    ? (session.status === 'queued'
+        ? `queued ${fmtSeconds(liveElapsedSeconds(session, now))}`
+        : fmtSeconds(liveElapsedSeconds(session, now)))
+    : timingLabel(session)
+  const tokens = busy ? '' : fmtTokens(session.tokens)
   return jsxs('button', {
     type: 'button',
     onClick: () => onSelect(session.id),
@@ -689,14 +857,17 @@ function WorkerCard({ session, onSelect }) {
         key: 'meta', className: 'flex min-w-0 items-baseline justify-between gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
         children: [
           jsx('span', { key: 'm', className: 'min-w-0 truncate', children: sessionModelLabel(session) }),
-          jsx('span', { key: 't', className: 'shrink-0 tabular-nums', children: timingLabel(session) }),
+          jsxs('span', {
+            key: 't', className: 'flex shrink-0 items-baseline gap-1 tabular-nums',
+            children: [
+              tokens ? jsx('span', { key: 'k', children: tokens }) : null,
+              tokens && timing ? jsx('span', { key: 'd', children: '·' }) : null,
+              jsx('span', { key: 'v', children: timing }),
+            ],
+          }),
         ],
       }),
-      event ? jsx('div', {
-        key: 'event',
-        className: 'line-clamp-2 break-words text-[0.6875rem] leading-snug text-(--ui-text-quaternary)',
-        children: event,
-      }) : null,
+      jsx(WorkerFeed, { key: 'feed', session }),
     ],
   })
 }
@@ -773,13 +944,29 @@ function SuperagentPage() {
     onSuccess: () => invalidateChats(queryClient, selectedId),
   })
 
+  // A chat's model is fixed at creation; this swaps it for future turns.
+  const setChatModel = useMutation({
+    mutationFn: (vars) => rest(`/chats/${encodeURIComponent(vars.id)}/model`, {
+      method: 'POST', body: { model: vars.model, provider: vars.provider },
+    }),
+    onSuccess: () => invalidateChats(queryClient, selectedId),
+  })
+
   const pending = createChat.isPending || sendChat.isPending
   const stopPending = stopChat.isPending
   const busyTurn = isBusy(selectedSession)
   const notice = (createChat.data && createChat.data.ok === false && createChat.data.error) ||
     (sendChat.data && sendChat.data.ok === false && sendChat.data.error) || ''
   const failure = errorText(createChat.error) || errorText(sendChat.error) ||
-    errorText(stopChat.error) || notice
+    errorText(stopChat.error) || errorText(setChatModel.error) || notice
+
+  const changeSessionModel = (next) => {
+    if (!selectedSession || !next) return
+    const pickedModel = String(next.model || '').trim()
+    const pickedProvider = String(next.provider || '').trim()
+    if (!pickedModel && !pickedProvider) return
+    setChatModel.mutate({ id: selectedSession.id, model: pickedModel, provider: pickedProvider })
+  }
 
   const submit = () => {
     const text = String(draft || '').trim()
@@ -868,6 +1055,7 @@ function SuperagentPage() {
             pending, stopPending, error: failure,
             model, onModelChange: setModel, repo, onRepoChange: setRepo,
             models: modelsQuery.data, inputRef,
+            onSessionModel: changeSessionModel, modelPending: setChatModel.isPending,
           }),
           jsx(LiveWorkers, { key: 'workers', sessions, onSelect: select }),
         ],

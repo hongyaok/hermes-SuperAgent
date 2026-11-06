@@ -287,3 +287,106 @@ def test_ticket_sessions_endpoint_is_unchanged(api):
     assert body["db_exists"] is True
     assert {row["id"] for row in body["sessions"]} == {"T-0001", "T-0002"}
 
+
+# -- live grid enrichment (v0.2, iteration 3) ------------------------------
+
+
+def test_list_chats_enriches_live_rows(chat_api):
+    api, _ = chat_api
+    api.create_chat({"prompt": "live work"})  # FakeRunner leaves it running
+
+    row = api.list_chats()["sessions"][0]
+    assert isinstance(row["recent_events"], list) and row["recent_events"]
+    assert set(row["recent_events"][0]) == {"kind", "detail", "created_at"}
+    assert row["recent_events"][0]["kind"] == "launched"  # newest first
+    assert isinstance(row["elapsed_seconds"], int)
+
+
+def test_list_chats_keeps_historical_rows_slim(chat_api):
+    api, _ = chat_api
+    created = api.create_chat({"prompt": "finished"})["session"]
+    store = api.sa_chats.ChatStore(api._db_path())
+    store.update_session(created["id"], status="idle", finished_at=api.time.time(), tokens=1200)
+
+    row = api.list_chats()["sessions"][0]
+    assert "recent_events" not in row
+    assert row["elapsed_seconds"] is None
+    assert row["tokens"] == 1200
+
+
+def test_list_chats_filters_by_status(chat_api):
+    api, _ = chat_api
+    live = api.create_chat({"prompt": "live"})["session"]
+    done = api.create_chat({"prompt": "done"})["session"]
+    store = api.sa_chats.ChatStore(api._db_path())
+    store.update_session(done["id"], status="idle")
+
+    body = api.list_chats(status="running")
+    assert [row["id"] for row in body["sessions"]] == [live["id"]]
+    assert body["counts"]["idle"] == 1  # counts stay board-wide
+    assert len(api.list_chats()["sessions"]) == 2  # empty filter = default
+
+
+def test_set_chat_model_applies_to_the_next_turn(chat_api):
+    api, runner = chat_api
+    created = api.create_chat({"prompt": "first", "model": "old-model"})["session"]
+    store = api.sa_chats.ChatStore(api._db_path())
+    store.update_session(created["id"], status="idle", hermes_session_id="local-77")
+
+    body = api.set_chat_model(
+        created["id"], {"model": "qwen/qwen3.8-27b", "provider": "opencode-go"}
+    )
+    assert body["ok"] is True
+    assert body["session"]["model"] == "qwen/qwen3.8-27b"
+    assert body["session"]["provider"] == "opencode-go"
+
+    detail = api.get_chat(created["id"])["session"]
+    assert detail["events"][-1]["kind"] == "model"
+    assert "qwen/qwen3.8-27b" in detail["events"][-1]["detail"]
+
+    api.post_chat_message(created["id"], {"content": "carry on"})
+    assert runner.launches[-1]["model"] == "qwen/qwen3.8-27b"
+    assert runner.launches[-1]["provider"] == "opencode-go"
+
+
+def test_set_chat_model_rejects_an_empty_choice(chat_api):
+    api, _ = chat_api
+    created = api.create_chat({"prompt": "first"})["session"]
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        api.set_chat_model(created["id"], {"model": "   ", "provider": ""})
+    assert excinfo.value.status_code == 400
+
+
+def test_set_chat_model_conflicts_while_a_turn_runs(chat_api):
+    api, _ = chat_api
+    created = api.create_chat({"prompt": "live"})["session"]
+    assert created["status"] == "running"
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        api.set_chat_model(created["id"], {"model": "qwen/qwen3.8-27b"})
+    assert excinfo.value.status_code == 409
+
+
+def test_set_chat_model_unknown_session_is_404(chat_api):
+    api, _ = chat_api
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as excinfo:
+        api.set_chat_model("S-9999", {"model": "qwen/qwen3.8-27b"})
+    assert excinfo.value.status_code == 404
+
+
+def test_set_chat_model_accepts_a_provider_only_change(chat_api):
+    api, _ = chat_api
+    created = api.create_chat({"prompt": "first", "model": "old-model"})["session"]
+    store = api.sa_chats.ChatStore(api._db_path())
+    store.update_session(created["id"], status="review")
+
+    body = api.set_chat_model(created["id"], {"provider": "opencode-go"})
+    assert body["ok"] is True
+    assert body["session"]["model"] == ""  # clearing the pin is explicit
+    assert body["session"]["provider"] == "opencode-go"
+

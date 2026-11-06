@@ -70,10 +70,11 @@ hermes chat -q <prompt> -Q --format stream-json --source tool \
 | method | path                          | behaviour |
 |--------|-------------------------------|-----------|
 | GET    | `/models`                     | default model/provider + preset list |
-| GET    | `/chats?limit=50`             | `{db_exists, sessions, counts, running}` |
+| GET    | `/chats?limit=50&status=`      | `{db_exists, sessions, counts, running}`; live rows add `recent_events` (last 3, newest first, detail 160 chars) and `elapsed_seconds` (running/queued, else `null`); `status=running,queued` narrows rows only |
 | POST   | `/chats`                      | create + launch a chat; 400 on empty/oversized prompt, 200 `{ok:false}` when the worker cannot start (session is stored as `failed`) |
 | GET    | `/chats/{id}`                 | session + messages + events; 404 unknown |
 | POST   | `/chats/{id}/messages`        | append the user message and resume the Hermes session; 409 while a turn runs; with no `hermes_session_id` a fresh chat is created and `previous_session_id` returned |
+| POST   | `/chats/{id}/model`           | set `{model, provider}` for future turns; 400 when both are empty, 409 while queued/running, 404 unknown |
 | POST   | `/chats/{id}/stop`            | cancel a queued/running turn; 409 when nothing is running |
 
 All chat routes are defensive: a missing database yields `db_exists: false`
@@ -100,11 +101,14 @@ the same meaning: `SUPERAGENT_DEFAULT_MODEL`, `SUPERAGENT_DEFAULT_PROVIDER`,
 ## Build plan
 
 1. **Backend runner** — `sa_chats.py`, `sa_runner.py`, `/chats` + `/models`,
-   settings, tests. *(this iteration)*
+   settings, tests. *(done)*
 2. **Desktop chat UI** — a real composer and transcript in `desktop/plugin.js`
    on `/chats`, per-session model/provider picker from `/models`, stop button.
+   *(done)*
 3. **Live session grid** — poll `/chats`, show status, tokens, elapsed time and
-   the last tool event per session; click through to the transcript.
+   the last tool event per session; click through to the transcript. *(done:
+   per-card 3-event feed with 1s client timers, All/Live/Review rail filter,
+   in-chat model switch via `POST /chats/{id}/model`)*
 4. **GitHub backend** — connect a repo (token + allowed users), watch pull
    requests and checks, store `github_repo`/`pr_number`/`pr_url` on sessions.
 5. **GitHub UI + CLI** — connect/pin a repo from the panel, `/superagent pr`
