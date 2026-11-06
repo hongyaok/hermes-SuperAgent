@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -30,6 +31,110 @@ except ImportError:  # top-level import (dashboard backend, pytest)
 STDERR_LIMIT = 4000
 # Tool arguments are shown in the session timeline; keep them one line.
 TOOL_DETAIL_LIMIT = 160
+
+# Server-side caps. The prompt is checked before a worker is launched, assistant
+# text is clipped before it is stored, and every event detail is clipped too.
+MAX_PROMPT_CHARS = 20000
+MAX_MESSAGE_CHARS = sa_chats.MAX_MESSAGE_CHARS
+MAX_EVENT_CHARS = sa_chats.MAX_EVENT_CHARS
+
+# A turn older than this is treated as runaway and cancelled by reap()/list.
+DEFAULT_TURN_TIMEOUT_SECONDS = 1800
+
+
+class RepoPathError(ValueError, RuntimeError):
+    """A repository path the runner refuses to use.
+
+    Subclasses ``ValueError`` so HTTP handlers can turn it into a 400, and
+    ``RuntimeError`` because launch failures have always raised that here.
+    """
+
+
+def resolve_repo_path(repo: str, *, root: str = "") -> str:
+    """Validate a worker repository path and return its resolved form.
+
+    Rejects paths that do not exist, are not directories, contain ``..``, or
+    resolve (through a symlink) outside ``root``. The returned string is what
+    may be passed to subprocess argv/cwd; callers must never use the raw input.
+    """
+    raw = (repo or "").strip()
+    if not raw:
+        return ""
+    if any(part == ".." for part in Path(raw).parts):
+        raise RepoPathError(f"repository path may not contain '..': {raw}")
+
+    path = Path(os.path.expanduser(raw))
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError:
+        raise RepoPathError(f"repository path does not exist: {raw}") from None
+    except OSError as exc:
+        raise RepoPathError(f"repository path is not usable: {raw} ({exc})") from None
+    if not resolved.is_dir():
+        raise RepoPathError(f"repository path is not a directory: {raw}")
+
+    if root:
+        root_path = Path(os.path.expanduser((root or "").strip())).resolve(strict=False)
+        if resolved != root_path and root_path not in resolved.parents:
+            raise RepoPathError(
+                f"repository path escapes the configured root {root}: {raw}"
+            )
+    return str(resolved)
+
+
+REDACTED = "[redacted]"
+
+# Token shapes and headers that must never reach the database: chat events,
+# messages and error text all pass through redact_secrets() first.
+_AUTH_HEADER = re.compile(
+    r"(?i)(\bauthorization\b[\"']?\s*[:=]\s*[\"']?)"
+    r"(?:(?:bearer|basic|token)\s+)?[^\s\"',;}]+"
+)
+_SECRET_PATTERNS = (
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{8,}"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{8,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{8,}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]{8,}=*"),
+)
+
+
+def redact_secrets(text: Any) -> str:
+    """Replace GitHub/Slack/OpenAI credentials and Authorization values.
+
+    Deliberately over-eager rather than clever: a false positive costs a few
+    characters in a log, a miss costs a leaked credential.
+    """
+    value = "" if text is None else str(text)
+    if not value:
+        return value
+    value = _AUTH_HEADER.sub(lambda match: match.group(1) + REDACTED, value)
+    for pattern in _SECRET_PATTERNS:
+        value = pattern.sub(REDACTED, value)
+    return value
+
+
+def _clip_event(detail: Any) -> str:
+    """Event details are capped at 2 000 chars after redaction."""
+    return redact_secrets(detail)[:MAX_EVENT_CHARS]
+
+
+def _clip_message(content: Any) -> str:
+    """Stored assistant/user text is capped at 20 000 chars after redaction."""
+    return redact_secrets(content)[:MAX_MESSAGE_CHARS]
+
+
+def _turn_timeout(explicit: Optional[int]) -> int:
+    """SUPERAGENT_TURN_TIMEOUT_SECONDS, default 1800; <= 0 disables the guard."""
+    if explicit is not None:
+        return int(explicit)
+    raw = (os.environ.get("SUPERAGENT_TURN_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return DEFAULT_TURN_TIMEOUT_SECONDS
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_TURN_TIMEOUT_SECONDS
 
 
 def parse_event(line: str) -> Optional[dict]:
@@ -232,7 +337,9 @@ class Runner:
         model: str = "",
         provider: str = "",
         repo: str = "",
+        repo_root: str = "",
         max_turns: int = 120,
+        turn_timeout_seconds: Optional[int] = None,
         env: Optional[dict] = None,
         source_tag: Optional[str] = None,
     ):
@@ -247,7 +354,11 @@ class Runner:
         self.model = model or ""
         self.provider = provider or ""
         self.repo = repo or ""
+        # The configured root every per-turn repo must resolve inside. Defaults
+        # to the configured repo, so a chat cannot wander into another tree.
+        self.repo_root = (repo_root or os.environ.get("SUPERAGENT_REPO_ROOT") or "").strip()
         self.max_turns = max(1, int(max_turns or 1))
+        self.turn_timeout_seconds = _turn_timeout(turn_timeout_seconds)
         self.env = dict(env or {})
         # The gateway only accepts source tags it advertises (cli/tool/oneshot
         # on this version), so `superagent` cannot be used here. "tool" is the
@@ -260,6 +371,7 @@ class Runner:
         self._started: dict[str, float] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._cancelled: set[str] = set()
+        self._cancel_reasons: dict[str, str] = {}
         self._resolved_bin: Optional[str] = None
 
     # -- public API ------------------------------------------------------
@@ -285,15 +397,21 @@ class Runner:
         model: Optional[str] = None,
         provider: Optional[str] = None,
         repo: Optional[str] = None,
+        block: bool = False,
     ) -> dict:
         """Start one turn in a daemon thread; raises RuntimeError if it cannot."""
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("prompt is required")
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise ValueError(f"prompt is too long (max {MAX_PROMPT_CHARS} chars)")
         binary = self.binary()
-        repo_path = (repo if repo is not None else self.repo) or ""
-        if repo_path and not Path(repo_path).is_dir():
-            raise RuntimeError(f"repository path does not exist: {repo_path}")
+        # Resolve before anything is persisted or queued: the resolved path is
+        # the only one that may reach subprocess argv/cwd.
+        repo_path = resolve_repo_path(
+            repo if repo is not None else self.repo,
+            root=self.repo_root or self.repo,
+        )
 
         session = self.chat.get_session(session_id, message_limit=0) or {}
         resume = (resume_session_id or "").strip() or None
@@ -317,7 +435,7 @@ class Runner:
         elif self.provider:
             fields["provider"] = self.provider
         self.chat.update_session(session_id, **fields)
-        self.chat.add_event(session_id, "queued", "waiting for a worker slot")
+        self._add_event(session_id, "queued", "waiting for a worker slot")
 
         thread = threading.Thread(
             target=self._run_turn,
@@ -332,6 +450,25 @@ class Runner:
             name=f"superagent-{session_id}",
             daemon=True,
         )
+        if block:
+            # A CLI process is short-lived: a daemon thread would be killed the
+            # moment the command returns, leaving the session queued forever
+            # with no error. Run the turn on this thread instead.
+            self._run_turn(
+                session_id,
+                worker_prompt,
+                binary=binary,
+                resume=resume,
+                model=model or self.model,
+                provider=provider or self.provider,
+                repo=repo_path,
+            )
+            return {
+                "session_id": session_id,
+                "resume": bool(resume),
+                "command": binary,
+                "blocked": True,
+            }
         with self._lock:
             self._threads[session_id] = thread
             self._started[session_id] = time.time()
@@ -340,25 +477,40 @@ class Runner:
 
     def stop(self, session_id: str) -> bool:
         """Cancel a running (or queued) turn. Returns True if a process was killed."""
-        with self._lock:
-            self._cancelled.add(session_id)
-            proc = self._procs.get(session_id)
-            thread = self._threads.get(session_id)
-            if proc is None and (thread is None or not thread.is_alive()):
-                self._cancelled.discard(session_id)  # nothing will consume the flag
-        killed = False
-        if proc is not None and proc.poll() is None:
-            _terminate_tree(proc)
-            killed = True
-        self.chat.update_session(
-            session_id,
-            status=sa_chats.CANCELLED,
-            error="cancelled by user",
-            finished_at=time.time(),
-            pid=None,
-        )
-        self.chat.add_event(session_id, "cancelled", "stop requested")
-        return killed
+        return self._cancel(session_id, "cancelled by user")
+
+    def reap(self, *, now: Optional[float] = None, timeout_seconds: Optional[int] = None) -> list[dict]:
+        """Cancel turns older than the timeout; returns the cancelled sessions.
+
+        Runaway guard: a queued/running turn whose start (or creation, while it
+        waits for a worker slot) is older than SUPERAGENT_TURN_TIMEOUT_SECONDS
+        (default 1800) is cancelled, with the reason recorded as an event. The
+        dashboard calls this on every chat-list read, so a forgotten turn cannot
+        hold a worker slot forever.
+        """
+        timeout = int(self.turn_timeout_seconds if timeout_seconds is None else timeout_seconds)
+        if timeout <= 0:
+            return []
+        moment = time.time() if now is None else float(now)
+        expired: list[dict] = []
+        try:
+            sessions = self.chat.list_sessions(limit=500).get("sessions", [])
+        except Exception:
+            return expired
+        for row in sessions:
+            if row.get("status") not in (sa_chats.QUEUED, sa_chats.RUNNING):
+                continue
+            started = row.get("started_at") or row.get("created_at") or 0
+            try:
+                age = moment - float(started)
+            except (TypeError, ValueError):
+                continue
+            if age <= timeout:
+                continue
+            reason = f"turn timed out after {int(age)}s (limit {timeout}s)"
+            self._cancel(str(row["id"]), reason)
+            expired.append({"id": row["id"], "status": sa_chats.CANCELLED, "reason": reason})
+        return expired
 
     def active(self) -> list[dict]:
         """Sessions with a live process, ready for a status chip or grid."""
@@ -378,6 +530,48 @@ class Runner:
 
     # -- internals -------------------------------------------------------
 
+    def _add_event(self, session_id: str, kind: str, detail: str = "") -> None:
+        """Persist one event with secrets scrubbed and the detail cap applied."""
+        self.chat.add_event(session_id, kind, _clip_event(detail))
+
+    def _add_message(self, session_id: str, role: str, content: str) -> None:
+        """Persist one message with secrets scrubbed and the 20k cap applied."""
+        self.chat.add_message(session_id, role, _clip_message(content))
+
+    def _cancel(self, session_id: str, reason: str) -> bool:
+        """Mark a turn cancelled, remember why, and kill its process if live."""
+        with self._lock:
+            self._cancelled.add(session_id)
+            self._cancel_reasons[session_id] = reason
+            proc = self._procs.get(session_id)
+            thread = self._threads.get(session_id)
+            if proc is None and (thread is None or not thread.is_alive()):
+                # Nothing will consume the flag; keep the reason for the audit
+                # event only, so later turns are not cancelled by a stale flag.
+                self._cancelled.discard(session_id)
+                thread_alive = False
+            else:
+                thread_alive = True
+        killed = False
+        if proc is not None and proc.poll() is None:
+            _terminate_tree(proc)
+            killed = True
+        self.chat.update_session(
+            session_id,
+            status=sa_chats.CANCELLED,
+            error=_clip_event(reason),
+            finished_at=time.time(),
+            pid=None,
+        )
+        self._add_event(session_id, "cancelled", reason)
+        if not thread_alive:
+            self._cancel_reasons.pop(session_id, None)
+        return killed
+
+    def _cancel_reason(self, session_id: str) -> str:
+        with self._lock:
+            return self._cancel_reasons.pop(session_id, "")
+
     def _run_turn(
         self,
         session_id: str,
@@ -391,7 +585,8 @@ class Runner:
     ) -> None:
         with self._sem:
             if self._take_cancelled(session_id):
-                self._finish(session_id, sa_chats.CANCELLED, error="cancelled before start")
+                reason = self._cancel_reason(session_id) or "cancelled before start"
+                self._finish(session_id, sa_chats.CANCELLED, error=reason)
                 return
             try:
                 self._execute(
@@ -420,7 +615,7 @@ class Runner:
         argv = self._build_argv(
             binary, prompt, resume_session_id=resume, model=model, provider=provider, repo=repo
         )
-        self.chat.add_event(session_id, "started", " ".join(argv))
+        self._add_event(session_id, "started", " ".join(argv))
 
         env = dict(os.environ)
         env.update({str(k): str(v) for k, v in self.env.items()})
@@ -459,17 +654,19 @@ class Runner:
         read_error = ""
         result: dict = {}
         buffer: list[str] = []
+        buffer_chars = 0
         wrote_text = False
 
         def flush_text() -> None:
             """Turn the buffered ``text`` deltas into one assistant message."""
-            nonlocal wrote_text
+            nonlocal wrote_text, buffer_chars
             if not buffer:
                 return
             text = "".join(buffer).strip()
             buffer.clear()
+            buffer_chars = 0
             if text:
-                self.chat.add_message(session_id, "assistant", text)
+                self._add_message(session_id, "assistant", text)
                 wrote_text = True
 
         try:
@@ -482,26 +679,34 @@ class Runner:
                     self._on_system(session_id, event)
                 elif kind == "text":
                     fragment = event.get("text")
-                    if isinstance(fragment, str) and fragment:
+                    if isinstance(fragment, str) and fragment and buffer_chars < MAX_MESSAGE_CHARS:
+                        # Stop buffering past the cap: a runaway worker must
+                        # not balloon memory before the store clips the text.
+                        fragment = fragment[: MAX_MESSAGE_CHARS - buffer_chars]
                         buffer.append(fragment)
+                        buffer_chars += len(fragment)
                 elif kind in ("assistant", "message"):
                     text = _text_of(event)
                     if text:
                         flush_text()
-                        self.chat.add_message(session_id, "assistant", text)
+                        self._add_message(session_id, "assistant", text)
                         wrote_text = True
                 elif kind in ("tool_use", "tool"):
                     flush_text()
-                    self.chat.add_event(session_id, "tool", _tool_detail(event))
+                    self._add_event(session_id, "tool", _tool_detail(event))
                 elif kind == "tool_result":
                     if event.get("is_error"):
                         flush_text()
-                        self.chat.add_event(session_id, "tool_error", _tool_detail(event))
+                        self._add_event(session_id, "tool_error", _tool_detail(event))
                 elif kind == "result":
                     result = event
                 elif kind == "error":
                     flush_text()
-                    self.chat.add_event(session_id, "error", _text_of(event) or str(event.get("error") or ""))
+                    self._add_event(
+                        session_id,
+                        "error",
+                        _text_of(event) or str(event.get("error") or ""),
+                    )
         except Exception as exc:
             read_error = str(exc)
         finally:
@@ -521,7 +726,7 @@ class Runner:
         if metrics.get("duration_ms") is not None:
             fields["duration_ms"] = metrics["duration_ms"]
         if not wrote_text and metrics.get("text"):
-            self.chat.add_message(session_id, "assistant", metrics["text"])
+            self._add_message(session_id, "assistant", metrics["text"])
 
         stderr_tail = "".join(stderr_lines)
         stderr_session_id = _session_id_from_stderr(stderr_tail)
@@ -531,7 +736,7 @@ class Runner:
         cancelled = self._take_cancelled(session_id)
         if cancelled:
             status = sa_chats.CANCELLED
-            error = "cancelled by user"
+            error = self._cancel_reason(session_id) or "cancelled by user"
         elif read_error:
             status = sa_chats.FAILED
             error = f"could not read worker output: {read_error}"
@@ -545,7 +750,7 @@ class Runner:
             error = reason[-STDERR_LIMIT:]
 
         if metrics.get("tokens") is not None or metrics.get("duration_ms") is not None:
-            self.chat.add_event(
+            self._add_event(
                 session_id,
                 "result",
                 f"exit={exit_code} tokens={metrics.get('tokens')} duration_ms={metrics.get('duration_ms')}",
@@ -562,7 +767,7 @@ class Runner:
             fields["model"] = model.strip()
         if fields:
             self.chat.update_session(session_id, **fields)
-        self.chat.add_event(session_id, "system", str(event.get("subtype") or "init"))
+        self._add_event(session_id, "system", str(event.get("subtype") or "init"))
 
     def _build_argv(
         self,
@@ -602,16 +807,18 @@ class Runner:
         return argv
 
     def _finish(self, session_id: str, status: str, *, error: Optional[str] = None, **extra: Any) -> None:
-        fields = {"status": status, "error": error, "pid": None}
+        clean_error = _clip_event(error) if error else None
+        fields = {"status": status, "error": clean_error, "pid": None}
         fields.update(extra)
         # Write the event first: once the new status is visible, its audit
         # trail already contains the line that explains it.
-        self.chat.add_event(session_id, status, (error or status)[:500])
+        self._add_event(session_id, status, error or status)
         self.chat.update_session(session_id, **fields)
         with self._lock:
             self._procs.pop(session_id, None)
             self._threads.pop(session_id, None)
             self._started.pop(session_id, None)
+            self._cancel_reasons.pop(session_id, None)
 
     def _take_cancelled(self, session_id: str) -> bool:
         with self._lock:
