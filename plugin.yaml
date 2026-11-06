@@ -1,5 +1,5 @@
 name: superagent
-version: 0.1.0
+version: 0.2.0
 description: >
   Router/worker coding agent for one repository. Polls GitHub (or takes local
   requests), turns accepted work into tickets, and runs each ticket in its own
@@ -67,3 +67,28 @@ config_schema:
     default: 30
     label: GitHub poll size
     description: Maximum comments fetched per poll.
+  default_model:
+    type: str
+    default: ""
+    label: Default chat model
+    description: Model used by desktop chat sessions when the request does not pick one. Empty means the CLI default.
+  default_provider:
+    type: str
+    default: ""
+    label: Default chat provider
+    description: Provider for the default chat model (for example opencode-go). Empty means the CLI default.
+  model_presets:
+    type: list
+    default: []
+    label: Model presets
+    description: Models offered in the per-session picker. Empty uses the built-in list.
+  worker_yolo:
+    type: bool
+    default: true
+    label: Workers run unattended
+    description: Pass --yolo to headless chat workers so they do not wait for approval prompts.
+  chat_max_turns:
+    type: int
+    default: 120
+    label: Chat turn limit
+    description: Maximum agent turns for one headless chat worker.

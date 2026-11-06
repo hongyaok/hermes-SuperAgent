@@ -1,28 +1,64 @@
 """Superagent dashboard backend, mounted at /api/plugins/superagent/.
 
 Ticket views plus desktop-initiated actions for the desktop tab.
-GET routes stay read-only; POST /ask records a ticket, POST /run queues
-an approved ticket, POST /tick returns a routing-pass summary (workers
-only launch from an agent turn, so this never launches). GET /sessions
-returns per-ticket enriched session rows for the desktop sessions grid.
+GET routes stay read-only for tickets; POST /ask records a ticket, POST /run
+queues an approved ticket, POST /tick returns a routing-pass summary.
+GET /sessions returns per-ticket enriched session rows for the desktop
+sessions grid.
+
+Chat sessions (v0.2) live under /chats: POST /chats starts one headless
+`hermes chat` worker, POST /chats/{id}/messages resumes it, and
+POST /chats/{id}/stop cancels it. They are kept in their own namespace so the
+existing ticket grid and this release's desktop UI keep working unchanged.
 
 Imported by the gateway on its own, outside the plugin package, so this
-module is self-contained: stdlib sqlite3 only, no relative imports.
+module is self-contained: stdlib sqlite3 only, no relative imports except the
+optional package import below.
 """
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+# The gateway loads this file standalone (no package), so the plugin root has
+# to be importable before `import sa_chats` / `import sa_runner` below.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+try:  # loaded as part of the plugin package
+    from .. import sa_chats, sa_runner
+except ImportError:  # loaded standalone by the gateway / pytest
+    import sa_chats  # type: ignore[no-redef]
+    import sa_runner  # type: ignore[no-redef]
+
 router = APIRouter()
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+
+MAX_PROMPT_CHARS = 8000
+MAX_CONTENT_CHARS = 8000
+
+# Models offered in the per-session model picker. Extend as providers change;
+# SUPERAGENT_MODEL_PRESETS (comma separated) overrides this list.
+MODEL_PRESETS = [
+    "deepseek-v4.1-flash",
+    "qwen/qwen3.8-27b",
+    "z-ai/glm-5.3-flash",
+]
+
+# One Runner per database path, created on first use so repeated requests reuse
+# the same worker threads and semaphore. Tests patch `_get_runner`.
+_RUNNERS: dict[str, Any] = {}
+_RUNNERS_LOCK = threading.Lock()
 
 _TICKET_COLUMNS = (
     "id", "source", "source_ref", "repo", "issue_number", "requester",
@@ -117,6 +153,93 @@ def _check_ticket_id(ticket_id: str) -> str:
     if not ticket_id or "/" in ticket_id or "\\" in ticket_id or ticket_id in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid ticket id")
     return ticket_id
+
+
+def _check_session_id(session_id: str) -> str:
+    session_id = (session_id or "").strip()
+    if not session_id or "/" in session_id or "\\" in session_id or session_id in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid session id")
+    return session_id
+
+
+# -- chat helpers --------------------------------------------------------
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    raw = os.environ.get(name)
+    if not raw:
+        return list(default)
+    items = [part.strip() for part in raw.split(",") if part.strip()]
+    return items or list(default)
+
+
+def _chat_store() -> Any:
+    """ChatStore on the plugin database (creates the file and tables if needed)."""
+    path = _db_path()
+    # A chat request may be the first thing that ever writes the file. Keep the
+    # ticket tables present too, so /tickets and /sessions keep working.
+    _ensure_ticket_schema(path)
+    return sa_chats.ChatStore(path)
+
+
+def _ensure_ticket_schema(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _connect_rw(path):
+        pass  # _connect_rw runs the idempotent ticket DDL
+
+
+def _get_runner() -> Any:
+    """Lazy Runner singleton keyed by database path (patched in tests)."""
+    path = _db_path()
+    key = str(path)
+    with _RUNNERS_LOCK:
+        runner = _RUNNERS.get(key)
+        if runner is None:
+            runner = sa_runner.Runner(
+                _chat_store(),
+                hermes_bin=os.environ.get("SUPERAGENT_HERMES_BIN") or None,
+                max_workers=_env_int("SUPERAGENT_MAX_WORKERS", 2),
+                toolsets=tuple(_env_list("SUPERAGENT_WORKER_TOOLSETS", ["file", "terminal"])),
+                yolo=_env_bool("SUPERAGENT_WORKER_YOLO", True),
+                model=os.environ.get("SUPERAGENT_DEFAULT_MODEL", ""),
+                provider=os.environ.get("SUPERAGENT_DEFAULT_PROVIDER", ""),
+                repo=os.environ.get("SUPERAGENT_REPO", ""),
+                max_turns=_env_int("SUPERAGENT_CHAT_MAX_TURNS", 120),
+            )
+            _RUNNERS[key] = runner
+        return runner
+
+
+def _fail_session(store: Any, session_id: str, message: str) -> dict[str, Any]:
+    """Mark a session failed when a launch cannot happen, and report it."""
+    store.update_session(
+        session_id, status=sa_chats.FAILED, error=message, finished_at=time.time(), pid=None
+    )
+    store.add_event(session_id, "failed", message)
+    return {
+        "ok": False,
+        "launched": False,
+        "error": message,
+        "session": store.get_session(session_id, message_limit=0),
+    }
+
 
 
 def _session_row(ticket: sqlite3.Row, last_event: dict[str, Any] | None) -> dict[str, Any]:
@@ -313,3 +436,185 @@ def tick(body: dict | None = None) -> dict[str, Any]:
             "launched": [], "finished": [], "warnings": [_TICK_LAUNCH_NOTE],
             "waiting": running, "counts": counts,
             "running": running, "queued": counts.get("queued", 0)}
+
+
+# -- chat sessions -------------------------------------------------------
+#
+# Each chat is one headless `hermes chat` worker (see sa_runner.py): the HTTP
+# request creates the record and starts a thread, then the grid polls
+# GET /chats for status, tokens and the last event.
+
+
+@router.get("/models")
+def list_models() -> dict[str, Any]:
+    presets = _env_list("SUPERAGENT_MODEL_PRESETS", MODEL_PRESETS)
+    return {
+        "default_model": os.environ.get("SUPERAGENT_DEFAULT_MODEL", "") or "",
+        "default_provider": os.environ.get("SUPERAGENT_DEFAULT_PROVIDER", "") or "",
+        "models": presets,
+    }
+
+
+@router.get("/chats")
+def list_chats(limit: int = 50) -> dict[str, Any]:
+    path = _db_path()
+    if not path.is_file():
+        return {"db_exists": False, "sessions": [], "counts": {}, "running": 0}
+    limit = max(1, min(int(limit or 50), 200))
+    data = _chat_store().list_sessions(limit=limit)
+    return {"db_exists": True, **data}
+
+
+@router.get("/chats/{session_id}")
+def get_chat(session_id: str) -> dict[str, Any]:
+    session_id = _check_session_id(session_id)
+    session = _chat_store().get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    return {"db_exists": True, "session": session}
+
+
+@router.post("/chats")
+def create_chat(body: dict) -> dict[str, Any]:
+    data = body or {}
+    prompt = str(data.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"prompt is too long (max {MAX_PROMPT_CHARS} chars)"
+        )
+    model = str(data.get("model") or os.environ.get("SUPERAGENT_DEFAULT_MODEL", "") or "").strip()
+    provider = str(data.get("provider") or os.environ.get("SUPERAGENT_DEFAULT_PROVIDER", "") or "").strip()
+    repo = str(data.get("repo") or os.environ.get("SUPERAGENT_REPO", "") or "").strip()
+    title = str(data.get("title") or "").strip()
+    source = str(data.get("source") or "desktop").strip() or "desktop"
+
+    store = _chat_store()
+    session = store.create_session(
+        prompt,
+        title=title[:200],
+        model=model[:200],
+        provider=provider[:200],
+        repo=repo[:1000],
+        source=source[:40],
+    )
+    session_id = session["id"]
+    try:
+        _get_runner().launch_turn(session_id, prompt, model=model, provider=provider, repo=repo)
+    except Exception as exc:  # missing binary, bad repo, ...
+        return _fail_session(store, session_id, str(exc) or exc.__class__.__name__)
+    store.add_event(session_id, "launched", "headless hermes chat worker")
+    return {
+        "ok": True,
+        "launched": True,
+        "session": store.get_session(session_id, message_limit=0),
+    }
+
+
+@router.post("/chats/{session_id}/messages")
+def post_chat_message(session_id: str, body: dict) -> dict[str, Any]:
+    session_id = _check_session_id(session_id)
+    content = str((body or {}).get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content is required")
+    if len(content) > MAX_CONTENT_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"content is too long (max {MAX_CONTENT_CHARS} chars)"
+        )
+
+    store = _chat_store()
+    session = store.get_session(session_id, message_limit=0)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    if session["status"] in (sa_chats.QUEUED, sa_chats.RUNNING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"session {session_id} is {session['status']}; wait for the turn to finish",
+        )
+
+    model = session.get("model") or ""
+    provider = session.get("provider") or ""
+    repo = session.get("repo") or ""
+    resume_id = (session.get("hermes_session_id") or "").strip()
+
+    if not resume_id:
+        # Nothing to resume (the first turn never started). Keep the user's
+        # message by starting a new chat instead of dropping it.
+        replacement = store.create_session(
+            content,
+            model=model,
+            provider=provider,
+            repo=repo,
+            source=session.get("source") or "desktop",
+        )
+        new_id = replacement["id"]
+        store.add_message(new_id, "user", content)
+        try:
+            _get_runner().launch_turn(new_id, content, model=model, provider=provider, repo=repo)
+        except Exception as exc:
+            return _fail_session(store, new_id, str(exc) or exc.__class__.__name__) | {
+                "previous_session_id": session_id,
+            }
+        store.add_event(new_id, "launched", f"new chat (nothing to resume in {session_id})")
+        return {
+            "ok": True,
+            "launched": True,
+            "resumed": False,
+            "previous_session_id": session_id,
+            "session": store.get_session(new_id),
+        }
+
+    store.add_message(session_id, "user", content)
+    try:
+        _get_runner().launch_turn(
+            session_id,
+            content,
+            resume_session_id=resume_id,
+            model=model,
+            provider=provider,
+            repo=repo,
+        )
+    except Exception as exc:
+        return _fail_session(store, session_id, str(exc) or exc.__class__.__name__) | {
+            "resumed": True,
+        }
+    store.add_event(session_id, "launched", f"resumed {resume_id}")
+    return {
+        "ok": True,
+        "launched": True,
+        "resumed": True,
+        "session": store.get_session(session_id),
+    }
+
+
+@router.post("/chats/{session_id}/stop")
+def stop_chat(session_id: str) -> dict[str, Any]:
+    session_id = _check_session_id(session_id)
+    store = _chat_store()
+    session = store.get_session(session_id, message_limit=0)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    if session["status"] not in (sa_chats.QUEUED, sa_chats.RUNNING):
+        raise HTTPException(
+            status_code=409,
+            detail=f"session {session_id} is {session['status']}; nothing to stop",
+        )
+    try:
+        stopped = bool(_get_runner().stop(session_id))
+    except Exception as exc:
+        store.update_session(
+            session_id,
+            status=sa_chats.CANCELLED,
+            error=str(exc),
+            finished_at=time.time(),
+            pid=None,
+        )
+        store.add_event(session_id, "cancelled", str(exc))
+        stopped = False
+    return {
+        "ok": True,
+        "stopped": stopped,
+        "session": store.get_session(session_id, message_limit=0),
+    }
+

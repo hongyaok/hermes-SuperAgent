@@ -29,6 +29,11 @@ def store(tmp_path, sa):
     return sa.sa_store.Store(tmp_path / "superagent.db")
 
 
+@pytest.fixture
+def chat(tmp_path, sa):
+    return sa.sa_chats.ChatStore(tmp_path / "superagent.db")
+
+
 class FakeExecutor:
     """Records launches and lets a test decide what workers report."""
 
