@@ -1,5 +1,5 @@
 name: superagent
-version: 0.3.0
+version: 0.4.0
 description: >
   Router/worker coding agent for one repository, plus a chat-first desktop
   workspace. Polls GitHub (or takes local requests), turns accepted work into
