@@ -35,8 +35,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 try:  # loaded as part of the plugin package
-    from .. import sa_chats, sa_runner
+    from .. import sa_assessor, sa_chats, sa_runner
 except ImportError:  # loaded standalone by the gateway / pytest
+    import sa_assessor  # type: ignore[no-redef]
     import sa_chats  # type: ignore[no-redef]
     import sa_runner  # type: ignore[no-redef]
 
@@ -44,8 +45,12 @@ router = APIRouter()
 
 VERSION = "0.2.0"
 
-MAX_PROMPT_CHARS = 8000
-MAX_CONTENT_CHARS = 8000
+# Server-side caps (mirrored in sa_runner so the runner enforces them too).
+MAX_PROMPT_CHARS = sa_runner.MAX_PROMPT_CHARS
+MAX_CONTENT_CHARS = sa_runner.MAX_MESSAGE_CHARS
+MAX_EVENT_CHARS = sa_runner.MAX_EVENT_CHARS
+# Ticket asks keep their own, shorter limit: a ticket is a request, not a chat.
+MAX_ASK_CHARS = 2000
 
 # Models offered in the per-session model picker. Extend as providers change;
 # SUPERAGENT_MODEL_PRESETS (comma separated) overrides this list.
@@ -135,15 +140,15 @@ def _connect_rw(path: Path) -> sqlite3.Connection:
 
 
 def _brief(row: sqlite3.Row) -> dict[str, Any]:
-    request = (row["request"] or "").strip().replace("\n", " ")
+    request = _scrub((row["request"] or "").strip().replace("\n", " "))
     return {
         "id": row["id"],
         "status": row["status"],
         "source": row["source"],
         "requester": row["requester"],
         "request": request[:160] + ("…" if len(request) > 160 else ""),
-        "reason": row["reason"],
-        "error": row["error"],
+        "reason": _maybe_scrub(row["reason"]),
+        "error": _maybe_scrub(row["error"]),
         "updated_at": row["updated_at"],
     }
 
@@ -190,6 +195,41 @@ def _env_list(name: str, default: list[str]) -> list[str]:
     return items or list(default)
 
 
+# -- hardening helpers ---------------------------------------------------
+
+
+def _scrub(text: Any) -> str:
+    """Strip credentials before anything is written to SQLite."""
+    return sa_runner.redact_secrets(text)
+
+
+def _maybe_scrub(value: Any) -> Any:
+    """Scrub a nullable column without turning None into an empty string."""
+    return None if value is None else _scrub(value)
+
+
+def _scrub_event(text: Any) -> str:
+    """Scrub and apply the 2 000-char event detail cap."""
+    return _scrub(text)[:MAX_EVENT_CHARS]
+
+
+def _repo_root() -> str:
+    """The configured root every chat repo must stay inside."""
+    return (
+        os.environ.get("SUPERAGENT_REPO_ROOT")
+        or os.environ.get("SUPERAGENT_REPO")
+        or ""
+    ).strip()
+
+
+def _validated_repo(repo: str) -> str:
+    """Resolve a repo path or fail the request with a 400 (never 500)."""
+    try:
+        return sa_runner.resolve_repo_path(repo, root=_repo_root())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _chat_store() -> Any:
     """ChatStore on the plugin database (creates the file and tables if needed)."""
     path = _db_path()
@@ -222,13 +262,27 @@ def _get_runner() -> Any:
                 provider=os.environ.get("SUPERAGENT_DEFAULT_PROVIDER", ""),
                 repo=os.environ.get("SUPERAGENT_REPO", ""),
                 max_turns=_env_int("SUPERAGENT_CHAT_MAX_TURNS", 120),
+                turn_timeout_seconds=_env_int(
+                    "SUPERAGENT_TURN_TIMEOUT_SECONDS", sa_runner.DEFAULT_TURN_TIMEOUT_SECONDS
+                ),
             )
             _RUNNERS[key] = runner
         return runner
 
 
+def _reap_turns() -> list[dict]:
+    """Cancel runaway turns before the chat list answers; never break the read."""
+    try:
+        runner = _get_runner()
+        reap = getattr(runner, "reap", None)
+        return list(reap() or []) if callable(reap) else []
+    except Exception:
+        return []
+
+
 def _fail_session(store: Any, session_id: str, message: str) -> dict[str, Any]:
     """Mark a session failed when a launch cannot happen, and report it."""
+    message = _scrub_event(message) or "launch failed"
     store.update_session(
         session_id, status=sa_chats.FAILED, error=message, finished_at=time.time(), pid=None
     )
@@ -243,7 +297,7 @@ def _fail_session(store: Any, session_id: str, message: str) -> dict[str, Any]:
 
 
 def _session_row(ticket: sqlite3.Row, last_event: dict[str, Any] | None) -> dict[str, Any]:
-    request = (ticket["request"] or "").strip().replace("\n", " ")
+    request = _scrub((ticket["request"] or "").strip().replace("\n", " "))
     worker_id: str | None = None
     has_handle = False
     try:
@@ -265,13 +319,13 @@ def _session_row(ticket: sqlite3.Row, last_event: dict[str, Any] | None) -> dict
         "source": ticket["source"],
         "requester": ticket["requester"],
         "request": request[:160] + ("…" if len(request) > 160 else ""),
-        "reason": ticket["reason"],
-        "error": ticket["error"],
+        "reason": _maybe_scrub(ticket["reason"]),
+        "error": _maybe_scrub(ticket["error"]),
         "updated_at": ticket["updated_at"],
         "created_at": ticket["created_at"],
         "mode": ticket["mode"] if "mode" in keys else None,
         "verdict": ticket["verdict"] if "verdict" in keys else None,
-        "result": ticket["result"] if "result" in keys else None,
+        "result": _maybe_scrub(ticket["result"]) if "result" in keys else None,
         "worker_id": worker_id,
         "has_handle": has_handle,
         "last_event": last_event,
@@ -340,12 +394,31 @@ def list_sessions(limit: int = 50) -> dict[str, Any]:
 
 @router.post("/ask")
 def ask_ticket(body: dict) -> dict[str, Any]:
-    request = str((body or {}).get("request") or "").strip()
-    if not request:
+    """Record a desktop ask as a ticket, using the same rules as the router.
+
+    A skip marker or acknowledgement is still recorded (as ``ignored``), a
+    design question becomes ``blocked`` for a human, and only an actionable
+    request becomes ``observed`` work.
+    """
+    raw_request = str((body or {}).get("request") or "").strip()
+    if not raw_request:
         raise HTTPException(status_code=400, detail="request is required")
-    requester = str((body or {}).get("requester") or "desktop").strip() or "desktop"
-    if len(request) > 2000:
-        raise HTTPException(status_code=400, detail="request is too long (max 2000 chars)")
+    if len(raw_request) > MAX_ASK_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"request is too long (max {MAX_ASK_CHARS} chars)"
+        )
+    request = _scrub(raw_request)
+    requester = _scrub(str((body or {}).get("requester") or "desktop").strip() or "desktop")
+
+    decision = sa_assessor.assess(request, explicit=True, allow_proactive=False)
+    if decision.verdict == sa_assessor.NEEDS_HUMAN:
+        status = "blocked"
+    elif decision.verdict == sa_assessor.IGNORE:
+        status = "ignored"
+    else:
+        status = "observed"
+    reason = _scrub(decision.reason)
+
     path = _db_path()
     now = time.time()
     with _connect_rw(path) as conn:
@@ -363,17 +436,22 @@ def ask_ticket(body: dict) -> dict[str, Any]:
             "INSERT INTO tickets (id, source, source_ref, repo, issue_number, requester,"
             " request, status, verdict, reason, mode, handle, result, error,"
             " created_at, updated_at, started_at)"
-            " VALUES (?, 'desktop', NULL, NULL, NULL, ?, ?, 'observed', 'accept',"
-            " 'desktop ask', 'observe', NULL, NULL, NULL, ?, ?, NULL)",
-            (ticket_id, requester, request, now, now),
+            " VALUES (?, 'desktop', NULL, NULL, NULL, ?, ?, ?, ?, ?,"
+            " 'observe', NULL, NULL, NULL, ?, ?, NULL)",
+            (ticket_id, requester, request, status, decision.verdict, reason, now, now),
         )
         conn.execute(
             "INSERT INTO events(ticket_id, kind, detail, created_at) VALUES (?, ?, ?, ?)",
-            (ticket_id, "created", "desktop request -> observed", now),
+            (ticket_id, "created", _scrub_event(f"desktop request -> {status}"), now),
         )
         conn.execute(
             "INSERT INTO events(ticket_id, kind, detail, created_at) VALUES (?, ?, ?, ?)",
-            (ticket_id, "assessed", "accept: desktop ask", now),
+            (
+                ticket_id,
+                "assessed",
+                _scrub_event(f"{decision.verdict}: {decision.reason}"),
+                now,
+            ),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
@@ -461,7 +539,11 @@ def list_chats(limit: int = 50) -> dict[str, Any]:
     if not path.is_file():
         return {"db_exists": False, "sessions": [], "counts": {}, "running": 0}
     limit = max(1, min(int(limit or 50), 200))
-    data = _chat_store().list_sessions(limit=limit)
+    store = _chat_store()
+    # A list read is also the supervisor: turns past the timeout are cancelled
+    # here, so a forgotten chat cannot hold a worker slot forever.
+    _reap_turns()
+    data = store.list_sessions(limit=limit)
     return {"db_exists": True, **data}
 
 
@@ -477,17 +559,18 @@ def get_chat(session_id: str) -> dict[str, Any]:
 @router.post("/chats")
 def create_chat(body: dict) -> dict[str, Any]:
     data = body or {}
-    prompt = str(data.get("prompt") or "").strip()
-    if not prompt:
+    raw_prompt = str(data.get("prompt") or "").strip()
+    if not raw_prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
-    if len(prompt) > MAX_PROMPT_CHARS:
+    if len(raw_prompt) > MAX_PROMPT_CHARS:
         raise HTTPException(
             status_code=400, detail=f"prompt is too long (max {MAX_PROMPT_CHARS} chars)"
         )
-    model = str(data.get("model") or os.environ.get("SUPERAGENT_DEFAULT_MODEL", "") or "").strip()
-    provider = str(data.get("provider") or os.environ.get("SUPERAGENT_DEFAULT_PROVIDER", "") or "").strip()
-    repo = str(data.get("repo") or os.environ.get("SUPERAGENT_REPO", "") or "").strip()
-    title = str(data.get("title") or "").strip()
+    prompt = _scrub(raw_prompt)
+    model = _scrub(str(data.get("model") or os.environ.get("SUPERAGENT_DEFAULT_MODEL", "") or "").strip())
+    provider = _scrub(str(data.get("provider") or os.environ.get("SUPERAGENT_DEFAULT_PROVIDER", "") or "").strip())
+    repo = _validated_repo(str(data.get("repo") or os.environ.get("SUPERAGENT_REPO", "") or "").strip())
+    title = _scrub(str(data.get("title") or "").strip())
     source = str(data.get("source") or "desktop").strip() or "desktop"
 
     store = _chat_store()
@@ -515,13 +598,14 @@ def create_chat(body: dict) -> dict[str, Any]:
 @router.post("/chats/{session_id}/messages")
 def post_chat_message(session_id: str, body: dict) -> dict[str, Any]:
     session_id = _check_session_id(session_id)
-    content = str((body or {}).get("content") or "").strip()
-    if not content:
+    raw_content = str((body or {}).get("content") or "").strip()
+    if not raw_content:
         raise HTTPException(status_code=400, detail="content is required")
-    if len(content) > MAX_CONTENT_CHARS:
+    if len(raw_content) > MAX_CONTENT_CHARS:
         raise HTTPException(
             status_code=400, detail=f"content is too long (max {MAX_CONTENT_CHARS} chars)"
         )
+    content = _scrub(raw_content)
 
     store = _chat_store()
     session = store.get_session(session_id, message_limit=0)
@@ -533,9 +617,11 @@ def post_chat_message(session_id: str, body: dict) -> dict[str, Any]:
             detail=f"session {session_id} is {session['status']}; wait for the turn to finish",
         )
 
-    model = session.get("model") or ""
-    provider = session.get("provider") or ""
-    repo = session.get("repo") or ""
+    model = _scrub(session.get("model") or "")
+    provider = _scrub(session.get("provider") or "")
+    # The stored repo was validated at creation; validate again so a deleted
+    # or replaced directory fails as a 400 instead of reaching argv.
+    repo = _validated_repo(session.get("repo") or "")
     resume_id = (session.get("hermes_session_id") or "").strip()
 
     if not resume_id:
@@ -603,14 +689,15 @@ def stop_chat(session_id: str) -> dict[str, Any]:
     try:
         stopped = bool(_get_runner().stop(session_id))
     except Exception as exc:
+        detail = _scrub_event(str(exc)) or "stop failed"
         store.update_session(
             session_id,
             status=sa_chats.CANCELLED,
-            error=str(exc),
+            error=detail,
             finished_at=time.time(),
             pid=None,
         )
-        store.add_event(session_id, "cancelled", str(exc))
+        store.add_event(session_id, "cancelled", detail)
         stopped = False
     return {
         "ok": True,

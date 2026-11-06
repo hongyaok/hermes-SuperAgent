@@ -7,8 +7,9 @@ It separates **routing** from **execution**:
 - A **deterministic, zero-token router** (`sa_assessor.py`) classifies each request (`accept`, `ignore`, `needs_human`).
 - **SQLite** (`<HERMES_HOME>/plugin-data/superagent/superagent.db`) persists tickets (`T-0001`, `T-0002`, ...), event history, source deduplication, and polling cursors.
 - **Isolated Hermes worker subagents** launched via `ctx.subagent_lifecycle` perform the coding work inside your repository and leave uncommitted changes in the working tree for human review (`review` state).
+- **Headless chat workers (v0.2)** — the desktop **Chat** tab starts one `hermes chat` process per turn, streams its JSON output into the session transcript, and lets you resume, watch or stop it. Chat workers follow the same rule as ticket workers: changes stay uncommitted for review.
 
-Nothing inside the plugin runs its own LLM or spawns rogue subprocesses. By default, the plugin runs in `observe` mode so it only records tickets until you explicitly approve them or switch to `auto`.
+Router-side work (polling, triage, ticket state) runs no LLM and starts no subprocess. Chat turns are explicit `hermes chat` workers launched from a user message and bounded by the caps and watchdog described in [Chat and models API](#8-chat-and-models-api-v02). By default, the plugin runs in `observe` mode so it only records tickets until you explicitly approve them or switch to `auto`.
 
 ---
 
@@ -56,12 +57,37 @@ hermes config set plugins.entries.superagent.settings.mode observe
 | `allow_proactive` | `bool` | `false` | Let the router pick up unaddressed GitHub comments that match an actionable verb or code/error pattern. |
 | `max_runtime_seconds` | `int` | `1800` | Worker runtime limit in seconds (minimum `60`). Workers exceeding this limit are cancelled by the watchdog. |
 | `poll_limit` | `int` | `30` | Maximum number of GitHub issue comments fetched per polling pass (`1`–`100`). |
+| `default_model` | `str` | `""` | Model used by desktop chat sessions when the request does not pick one. Empty means the CLI default. Env: `SUPERAGENT_DEFAULT_MODEL`. |
+| `default_provider` | `str` | `""` | Provider for the default chat model (for example `opencode-go`). Empty means the CLI default. Env: `SUPERAGENT_DEFAULT_PROVIDER`. |
+| `model_presets` | `list` | built-in list | Models offered in the per-session picker. Empty uses the built-in list. Env: `SUPERAGENT_MODEL_PRESETS` (comma separated). |
+| `worker_yolo` | `bool` | `true` | Pass `--yolo` to headless chat workers so they do not wait for approval prompts. Env: `SUPERAGENT_WORKER_YOLO`. |
+| `chat_max_turns` | `int` | `120` | Maximum agent turns for one headless chat worker. Env: `SUPERAGENT_CHAT_MAX_TURNS`. |
+| `turn_timeout_seconds` | `int` | `1800` | A queued or running chat turn older than this is cancelled by the next reap or chat-list read. `0` disables the guard. Env: `SUPERAGENT_TURN_TIMEOUT_SECONDS`. |
+
+### Environment overrides
+
+The dashboard backend is loaded outside the plugin package, so it reads these variables directly. They mirror the settings above and win when both are present:
+
+| Variable | Meaning |
+| :--- | :--- |
+| `SUPERAGENT_DEFAULT_MODEL` | Default chat model. |
+| `SUPERAGENT_DEFAULT_PROVIDER` | Default chat provider. |
+| `SUPERAGENT_MODEL_PRESETS` | Comma-separated model picker presets. |
+| `SUPERAGENT_WORKER_YOLO` | `1`/`true`/`yes`/`on` to pass `--yolo`. |
+| `SUPERAGENT_CHAT_MAX_TURNS` | Maximum agent turns per chat worker. |
+| `SUPERAGENT_TURN_TIMEOUT_SECONDS` | Runaway-turn limit; `0` disables it. |
+| `SUPERAGENT_REPO_ROOT` | Root directory every per-session repo must stay inside (defaults to `SUPERAGENT_REPO`). |
+| `SUPERAGENT_REPO` | Default repository for chat workers and the containment root. |
+| `SUPERAGENT_MAX_WORKERS` | Parallel chat workers per database. |
+| `SUPERAGENT_WORKER_TOOLSETS` | Comma-separated toolsets for chat workers. |
+| `SUPERAGENT_HERMES_BIN` | `hermes` executable used for chat workers. |
+| `SUPERAGENT_CHAT_SOURCE` | Source tag passed to `hermes chat` (default `tool`). |
 
 ---
 
 ## Usage Across Surfaces
 
-> **Important Architectural Rule:** Worker subagents can **only** be launched from an active Hermes agent turn (an interactive chat session or a scheduled cron turn). `ctx.subagent_lifecycle` requires an active parent session (`bind_subagent_parent`). The CLI, slash commands, and REST endpoints can inspect state and queue tickets, but they never launch workers directly (`launch=False`).
+> **Important Architectural Rule:** Ticket worker subagents can **only** be launched from an active Hermes agent turn (an interactive chat session or a scheduled cron turn). `ctx.subagent_lifecycle` requires an active parent session (`bind_subagent_parent`). The CLI, slash commands, and ticket REST endpoints can inspect state and queue tickets, but they never launch ticket workers directly (`launch=False`). The v0.2 chat endpoints are separate: they start a headless `hermes chat` process, which needs no parent turn and is not a subagent.
 
 ### 1. Agent Tools (Chat Session or Cron Turn)
 
@@ -119,14 +145,20 @@ Because cron automations execute as full Hermes agent turns, `Superagent watch` 
 
 ### 5. Desktop Panel & Dashboard API
 
-The plugin ships a unified desktop extension (`desktop/plugin.js`) and a read-only FastAPI backend (`dashboard/plugin_api.py` mounted at `/api/plugins/superagent`):
+The plugin ships a unified desktop extension (`desktop/plugin.js`) and a FastAPI backend (`dashboard/plugin_api.py` mounted at `/api/plugins/superagent`). Ticket routes stay read-only; the chat routes below them drive the v0.2 Chat tab:
 
 - `GET /api/plugins/superagent/health` — plugin version and SQLite database status.
 - `GET /api/plugins/superagent/tickets?limit=30` — status counts, `"Needs you"` attention list, and recent tickets.
 - `GET /api/plugins/superagent/tickets/{ticket_id}` — full ticket details and event log.
+- `GET /api/plugins/superagent/models` — default model/provider and the picker presets.
+- `GET|POST /api/plugins/superagent/chats` — list chat sessions / start a new headless chat.
+- `GET /api/plugins/superagent/chats/{session_id}` — one chat with its transcript and events.
+- `POST /api/plugins/superagent/chats/{session_id}/messages` — send a follow-up and resume the Hermes session.
+- `POST /api/plugins/superagent/chats/{session_id}/stop` — cancel the running turn.
 
-The desktop side shows two views over the same data:
+The desktop page at `/superagent` now leads with the v0.2 chat workspace (see [Desktop chat tab](#7-desktop-chat-tab-v02)) and keeps the ticket views beside it:
 
+- **Chat tab** — a chat rail, a live transcript, and a composer with a model picker and an optional repo path. The first prompt starts a headless `hermes chat` worker; follow-ups resume it; **Stop** cancels it.
 - **Attention tab** — `observed` / `blocked` / `review` / `failed` tickets that need a human decision.
 - **Sessions tab** — the full sessions list (`Engine.sessions()`), with status, requester, request/result previews, event count, timestamps and elapsed time, plus `running` / `queued` counts. Selecting a row calls the ticket-detail view (`Engine.get_ticket_detail()` / `GET /tickets/{id}`).
 
@@ -145,10 +177,55 @@ Each session row contains `id`, `status`, `source`, `requester`, `request` (160-
 
 ---
 
+### 7. Desktop chat tab (v0.2)
+
+The Superagent page (`/superagent`) is chat-first. Everything in the tab is backed by `/chats` and `/models`; ticket state is shown alongside but a chat turn never creates a ticket.
+
+- **Chat rail (left)** — the newest chats, each with status, model, age (or elapsed time while a turn runs). Selecting a row opens its transcript; **New chat** clears the composer.
+- **Transcript (centre)** — the session prompt followed by `chat_messages` and `chat_events` merged in order, so assistant text interleaves with tool calls, errors and result lines. A failed turn shows the stored error.
+- **Composer** — a model picker fed by `/models` (presets plus **Default model**), an optional repo path (defaults to the configured repo) and Enter-to-send / Shift+Enter newline. While a turn is queued or running the composer is disabled and **Stop** cancels the turn.
+- **Chat header** — status, model/provider, tokens, duration, and **Open in Hermes** when `hermes_session_id` is known.
+- **Live workers (right)** — every queued or running chat as a card, so parallel workers stay visible without opening each chat.
+- **Polling** — the rail refreshes from `/chats` on a timer (faster while anything is running); the open chat refreshes from `/chats/{id}` at the same time. No WebSocket is required.
+
+A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `cancelled`). `review` means the worker finished and its changes are waiting in the working tree; sending another message resumes the same Hermes session when `hermes_session_id` is known.
+
+---
+
+### 8. Chat and models API (v0.2)
+
+| Method | Path | Behaviour |
+| :--- | :--- | :--- |
+| `GET` | `/models` | `{default_model, default_provider, models}` from settings/env. |
+| `GET` | `/chats?limit=50` | `{db_exists, sessions, counts, running}`; also runs the runaway watchdog before answering. |
+| `POST` | `/chats` | Validate, create and launch a chat. `400` on an empty/oversized prompt or an invalid repo; `200 {ok:false}` when the worker cannot start (the session is stored as `failed`). |
+| `GET` | `/chats/{id}` | Session with `messages` and `events`; `404` for an unknown id. |
+| `POST` | `/chats/{id}/messages` | Append the user message and resume the Hermes session. `409` while a turn is queued/running; `400` when the stored repo is no longer valid; with no `hermes_session_id` a fresh chat is created and `previous_session_id` is returned. |
+| `POST` | `/chats/{id}/stop` | Cancel a queued/running turn; `409` when nothing is running. |
+
+#### Guardrails
+
+- **Repository containment.** Before a turn is queued, the target repo is resolved with `Path.resolve(strict=True)`. A path that does not exist, is not a directory, contains `..`, or resolves (including through a symlink/junction) outside `SUPERAGENT_REPO_ROOT` (which defaults to `SUPERAGENT_REPO`) raises `ValueError`, which the handlers turn into `400`. Only the resolved path is passed to `--in` and used as the subprocess `cwd`; the raw request string never reaches `argv`.
+- **Caps.** Prompts are limited to 20 000 characters (checked by the runner and by `POST /chats` / `POST /chats/{id}/messages`), stored assistant text is clipped to 20 000, and every event detail is clipped to 2 000. Over-limit prompts are rejected with `400`; over-limit output is truncated before the write, so a runaway worker cannot bloat the database.
+- **Secret redaction.** `ghp_`, `gho_` and `github_pat_` tokens, `sk-` and `xoxb-`/`xoxp-` style keys, `Authorization:` header values and bare `Bearer` tokens are replaced with `[redacted]` before chat messages, events, errors, prompts and ticket fields are persisted. The same scrub runs on the preview strings the UI reads.
+- **Runaway guard.** A queued or running turn older than `turn_timeout_seconds` (env `SUPERAGENT_TURN_TIMEOUT_SECONDS`, default `1800`; `0` disables) is cancelled by `Runner.reap()`. `GET /chats` calls `reap()` before answering, so the status becomes `cancelled` and a `cancelled` event records the reason (`turn timed out after Ns (limit Ns)`) even if the server restarted and no process handle is left.
+- **Consistent triage.** `POST /ask` runs the same `sa_assessor.assess(..., explicit=True)` rules as the router instead of hardcoding `accept`: a skip marker or acknowledgement is recorded as `ignored`, a design question becomes `blocked` (`needs_human`), and an actionable request becomes `observed` (`accept`). The verdict and reason are stored on the ticket and in its `assessed` event.
+
+---
+
 ## Testing
 
 Run the test suite from the repository root:
 
 ```bash
 pytest -q
+```
+
+The suite is hermetic: `tests/test_runner.py` and `tests/test_hardening.py` replace `Popen` with a fake, so no real `hermes` process is spawned. `tests/test_hardening.py` covers repo containment (missing/file/dot-dot/symlink escape), secret redaction, the 20k/2k caps, every `POST /ask` triage branch, and the runaway watchdog.
+
+Validate the plugin manifest and its registrations before shipping:
+
+```bash
+hermes plugins doctor .
+hermes plugins validate .
 ```
