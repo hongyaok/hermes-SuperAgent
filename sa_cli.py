@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import sa_chats, sa_engine, sa_github, sa_runner, sa_settings, sa_watcher
+    from . import sa_chats, sa_diff, sa_engine, sa_github, sa_runner, sa_settings, sa_watcher
 except ImportError:  # top-level import (root __init__ loaded as `__init__` by pytest)
     import sa_chats  # type: ignore[no-redef]
+    import sa_diff  # type: ignore[no-redef]
     import sa_engine  # type: ignore[no-redef]
     import sa_github  # type: ignore[no-redef]
     import sa_runner  # type: ignore[no-redef]
@@ -35,6 +36,8 @@ STATUS_ICONS = {
 # Mirrors dashboard/plugin_api.py (the chat routes are the reference
 # implementation this CLI drives): same prompt cap, same preset defaults.
 MAX_PROMPT_CHARS = 8000
+# Same comment cap the dashboard enforces; GitHub truncates silently past 65 536.
+MAX_COMMENT_CHARS = 20000
 DEFAULT_MODEL_PRESETS = [
     "deepseek-v4.1-flash",
     "qwen/qwen3.8-27b",
@@ -50,7 +53,8 @@ _RUNNERS_LOCK = threading.Lock()
 USAGE = (
     "usage: hermes superagent "
     "<status|tick|ask <request>|run <ticket-id>|show <ticket-id|session-id>|"
-    "chat <prompt>|sessions|stop <session-id>|models|settings|"
+    "chat <prompt>|sessions|stop <session-id>|diff <session-id>|"
+    "comment <session-id> [--body TEXT]|models|settings|"
     "github <status|test|connect|disconnect|prs|poll|work <number>>|doctor> [--json]"
 )
 
@@ -890,9 +894,171 @@ def _stop_session(session_id: str, engine: Any, want_json: bool) -> int:
     return 0
 
 
+def _session_store() -> Any:
+    """ChatStore on the plugin database (diff/comment need no ticket engine)."""
+    return sa_chats.ChatStore(_db_path())
+
+
 def _github_store() -> Any:
     """ChatStore on the plugin database (settings and sessions share it)."""
-    return sa_chats.ChatStore(_db_path())
+    return _session_store()
+
+
+# -- session handoff: diff + comment ---------------------------------------
+#
+# Both commands read the same SQLite rows the dashboard uses and need no ticket
+# engine: `hermes superagent diff S-0001` works before anyone opened the page.
+# `comment` posts exactly one issue comment — it never commits or pushes.
+
+COMMENT_USAGE = (
+    "usage: hermes superagent comment <session-id> [--body TEXT | --body-file PATH] [--json]"
+)
+
+
+def render_diff(diff: dict, session_id: str = "") -> str:
+    """Text view: header, stat, the file list, then the patch."""
+    if not isinstance(diff, dict):
+        return str(diff)
+    if not diff.get("ok"):
+        return f"error: {diff.get('error') or 'could not read the diff'}"
+    files = diff.get("files") or []
+    lines = [f"{session_id}  {diff.get('repo') or '-'}".strip()]
+    label = f"  files:     {len(files)}"
+    if diff.get("truncated"):
+        label += "   (patch truncated)"
+    lines.append(label)
+    stat = str(diff.get("stat") or "").strip()
+    if stat:
+        lines += ["", _indent(stat, "  ")]
+    if files:
+        lines.append("")
+        width = max(len(str(item.get("status") or "")) for item in files)
+        for item in files:
+            lines.append(
+                f"  {str(item.get('status') or ''):<{width}}  {item.get('path') or '?'}"
+            )
+    lines.append("")
+    patch = str(diff.get("patch") or "").strip()
+    lines.append(patch if patch else "(no changes)")
+    return "\n".join(lines)
+
+
+def _diff_session(session_id: str, want_json: bool) -> int:
+    """`diff <id>`: what this session changed in its repository."""
+    try:
+        session = _session_store().get_session(session_id, message_limit=0)
+    except Exception as exc:
+        print(f"error: diff failed: {exc}")
+        return 1
+    if session is None:
+        print(f"error: unknown chat session {session_id}")
+        return 1
+    repo = str(session.get("repo") or "").strip()
+    if not repo:
+        message = f"session {session_id} has no repository; start a chat with --repo"
+        print(
+            json.dumps({"ok": False, "session_id": session_id, "error": message}, indent=2)
+            if want_json
+            else f"error: {message}"
+        )
+        return 1
+
+    diff = sa_diff.collect_diff(repo)
+    if want_json:
+        print(json.dumps(
+            {"ok": bool(diff.get("ok")), "session_id": session_id, "diff": diff},
+            indent=2, default=str,
+        ))
+    else:
+        print(render_diff(diff, session_id))
+    return 0 if diff.get("ok") else 1
+
+
+def _comment_session(args: Any, want_json: bool) -> int:
+    """`comment <id>`: post the summary (or --body) to the session's PR."""
+    session_id = _session_id_arg(getattr(args, "session_id", ""))
+    if not session_id:
+        print(COMMENT_USAGE)
+        return 2
+    body_text = str(getattr(args, "body", "") or "")
+    body_file = str(getattr(args, "body_file", "") or "").strip()
+    if body_text.strip() and body_file:
+        print("error: use --body or --body-file, not both")
+        return 2
+    if body_file:
+        try:
+            body_text = Path(body_file).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"error: cannot read {body_file}: {exc}")
+            return 2
+        if not body_text.strip():
+            print(f"error: {body_file} is empty")
+            return 2
+    if len(body_text) > MAX_COMMENT_CHARS:
+        print(f"error: comment is too long (max {MAX_COMMENT_CHARS} chars)")
+        return 2
+
+    try:
+        store = _session_store()
+        session = store.get_session(session_id)
+    except Exception as exc:
+        print(f"error: comment failed: {exc}")
+        return 1
+    if session is None:
+        print(f"error: unknown chat session {session_id}")
+        return 1
+    declared = session.get("pr_number")
+    if not declared:
+        print(f"error: session {session_id} has no pull request; nothing to comment on")
+        return 1
+    try:
+        pr_number = int(declared)
+    except (TypeError, ValueError):
+        print("error: the session's pull request number is invalid")
+        return 1
+
+    settings = sa_settings.load_settings()
+    repo = str(session.get("github_repo") or settings.get("github_repo") or "").strip()
+    token = str(settings.get("github_token") or "").strip()
+    if not sa_settings.valid_repo_name(repo):
+        print("error: no GitHub repository is configured (see `hermes superagent github connect`)")
+        return 1
+    if not token:
+        print("error: a GitHub token is required (`hermes superagent github connect --token ...`)")
+        return 1
+
+    diff = sa_diff.collect_diff(str(session.get("repo") or ""))
+    text = body_text.strip() or sa_diff.default_comment_body(
+        session, diff if diff.get("ok") else None
+    )
+    try:
+        posted = sa_github.GitHubClient(token, repo).post_comment(pr_number, text)
+    except sa_github.GitHubError as exc:
+        print(f"error: {_mask(exc, token)}")
+        return 1
+    except Exception as exc:
+        print(f"error: comment failed: {_mask(exc, token)}")
+        return 1
+
+    url = str((posted or {}).get("html_url") or "")
+    try:
+        store.add_event(
+            session_id, "commented", f"PR #{pr_number}: {url}" if url else f"PR #{pr_number}"
+        )
+    except Exception:
+        pass  # the comment is already public; a local audit write must not fail it
+
+    if want_json:
+        print(json.dumps({
+            "ok": True,
+            "url": url,
+            "pr_number": pr_number,
+            "github_repo": repo,
+            "body_preview": text if len(text) <= 280 else text[:279] + "…",
+        }, indent=2, default=str))
+    else:
+        print(f"commented on {repo}#{pr_number}" + (f"\n  {url}" if url else ""))
+    return 0
 
 
 def _github_watcher(store: Any = None) -> Any:
@@ -1240,6 +1406,22 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
     stop_p = subs.add_parser("stop", help="Cancel a queued or running chat turn")
     stop_p.add_argument("session_id", help="Chat session id (e.g. S-0001)")
     _add_json_flag(stop_p)
+    diff_p = subs.add_parser(
+        "diff", help="Show git status, stat and patch for a chat session's repository"
+    )
+    diff_p.add_argument("session_id", help="Chat session id (e.g. S-0001)")
+    _add_json_flag(diff_p)
+    comment_p = subs.add_parser(
+        "comment", help="Post a finished session's summary to its pull request"
+    )
+    comment_p.add_argument("session_id", help="Chat session id (e.g. S-0001)")
+    comment_p.add_argument(
+        "--body", default="", help="Comment text (default: generated summary with diff totals)"
+    )
+    comment_p.add_argument(
+        "--body-file", dest="body_file", default="", help="Read the comment text from a file"
+    )
+    _add_json_flag(comment_p)
     models_p = subs.add_parser("models", help="Show the default model, provider and presets")
     _add_json_flag(models_p)
     settings_p = subs.add_parser("settings", help="Show merged settings (read-only)")
@@ -1288,6 +1470,18 @@ def run(args: argparse.Namespace, ctx: Any) -> int:
     # started the dashboard.
     if command == "github":
         return run_github(args, want_json)
+
+    # `diff`/`comment` read the chat tables directly for the same reason: the
+    # handoff commands must work from a plain terminal.
+    if command == "diff":
+        session_id = _session_id_arg(getattr(args, "session_id", ""))
+        if not session_id:
+            print(USAGE)
+            return 2
+        return _diff_session(session_id, want_json)
+
+    if command == "comment":
+        return _comment_session(args, want_json)
 
     try:
         engine = sa_engine.build_engine(ctx)
