@@ -555,3 +555,121 @@ def test_models_endpoint_uses_plugin_settings(api, tmp_path):
         "default_provider": "config-provider",
         "models": ["m-one", "m-two"],
     }
+
+
+# -- watch settings ------------------------------------------------------
+
+
+def test_settings_cleans_the_allow_list_and_saves_the_mode(api, monkeypatch):
+    api.sa_settings.save_settings({"github_repo": REPO, "github_token": TOKEN})
+    watcher = install_watcher(api, monkeypatch)
+
+    body = api.github_settings(
+        {"allowed_users": " Alice, bob ,@carol,,ALICE ", "watch_mode": "auto"}
+    )
+
+    saved = json.loads(api.sa_settings.settings_path().read_text(encoding="utf-8"))
+    assert saved["github_allowed_users"] == ["Alice", "bob", "carol"]
+    assert saved["github_watch_mode"] == "auto"
+    assert body["ok"] is True
+    assert body["status"]["repo"] == REPO
+    assert watcher.stopped == 1  # the watcher is rebuilt with the new settings
+    assert_no_token(body)
+
+
+def test_settings_accepts_a_list_and_coerces_the_flags(api, monkeypatch):
+    api.sa_settings.save_settings({"github_repo": REPO, "github_token": TOKEN})
+    install_watcher(api, monkeypatch)
+
+    body = api.github_settings(
+        {
+            "allowed_users": ["@alice", "Bob", "alice"],
+            "watch_new_prs": "on",
+            "poll_seconds": "45",
+            "agent_login": "@superagent-bot",
+        }
+    )
+
+    saved = json.loads(api.sa_settings.settings_path().read_text(encoding="utf-8"))
+    assert saved["github_allowed_users"] == ["alice", "Bob"]
+    assert saved["github_watch_new_prs"] is True
+    assert saved["github_poll_seconds"] == 45
+    assert saved["github_agent_login"] == "superagent-bot"
+    assert body["ok"] is True
+
+
+def test_settings_rejects_an_unknown_watch_mode(api, monkeypatch):
+    from fastapi import HTTPException
+
+    install_watcher(api, monkeypatch)
+    with pytest.raises(HTTPException) as excinfo:
+        api.github_settings({"watch_mode": "yolo"})
+    assert excinfo.value.status_code == 400
+    assert "watch_mode" in excinfo.value.detail
+    assert not api.sa_settings.settings_path().exists()
+
+
+@pytest.mark.parametrize("seconds", [10, 3601, "soon", True])
+def test_settings_rejects_a_bad_poll_interval(api, monkeypatch, seconds):
+    from fastapi import HTTPException
+
+    install_watcher(api, monkeypatch)
+    with pytest.raises(HTTPException) as excinfo:
+        api.github_settings({"poll_seconds": seconds})
+    assert excinfo.value.status_code == 400
+    assert "poll_seconds" in excinfo.value.detail
+    assert not api.sa_settings.settings_path().exists()
+
+
+def test_settings_rejects_a_malformed_agent_login(api, monkeypatch):
+    from fastapi import HTTPException
+
+    install_watcher(api, monkeypatch)
+    with pytest.raises(HTTPException) as excinfo:
+        api.github_settings({"agent_login": "not a login"})
+    assert excinfo.value.status_code == 400
+    assert "agent_login" in excinfo.value.detail
+
+
+def test_settings_without_a_patch_only_reports_status(api, monkeypatch):
+    api.sa_settings.save_settings({"github_repo": REPO, "github_token": TOKEN})
+    install_watcher(api, monkeypatch)
+
+    body = api.github_settings({})
+
+    assert body["ok"] is True
+    assert body["status"]["token_set"] is True
+    assert_no_token(body)
+
+
+def test_connect_applies_the_form_settings_in_one_write(api, monkeypatch):
+    install_client(api, monkeypatch)
+    install_watcher(api, monkeypatch)
+
+    body = api.github_connect(
+        {
+            "repo": REPO,
+            "token": TOKEN,
+            "allowed_users": "@alice, bob",
+            "watch_mode": "auto",
+            "poll_seconds": 30,
+        }
+    )
+
+    saved = json.loads(api.sa_settings.settings_path().read_text(encoding="utf-8"))
+    assert saved["github_allowed_users"] == ["alice", "bob"]
+    assert saved["github_watch_mode"] == "auto"
+    assert saved["github_poll_seconds"] == 30
+    assert saved["github_agent_login"] == "agent"
+    assert body["ok"] is True
+    assert_no_token(body)
+
+
+def test_connect_rejects_a_bad_setting_before_saving(api, monkeypatch):
+    from fastapi import HTTPException
+
+    install_client(api, monkeypatch)
+    with pytest.raises(HTTPException) as excinfo:
+        api.github_connect({"repo": REPO, "token": TOKEN, "watch_mode": "always"})
+    assert excinfo.value.status_code == 400
+    assert not api.sa_settings.settings_path().exists()

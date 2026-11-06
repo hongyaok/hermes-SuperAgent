@@ -143,6 +143,10 @@ class GitHubWatcher:
         configured = bool(repo and token)
         watch_mode = _text(_field(settings, "github_watch_mode", "observe")) or "observe"
         login = _text(_field(settings, "github_agent_login", "")) or self._login
+        allowed_raw = _field(settings, "github_allowed_users", []) or []
+        if isinstance(allowed_raw, str):
+            allowed_raw = [part for part in allowed_raw.split(",") if part.strip()]
+        allowed_users = [str(name).strip() for name in allowed_raw if str(name).strip()]
 
         prs: list[dict[str, Any]] = list(self._last_prs) if configured else []
         if configured:
@@ -173,6 +177,8 @@ class GitHubWatcher:
             "last_error": self.last_error,
             "watching": watching,
             "watch_mode": watch_mode,
+            "watch_new_prs": bool(_field(settings, "github_watch_new_prs", False)),
+            "allowed_users": allowed_users,
             "poll_seconds": self._poll_seconds(settings),
             "sessions_created": self.sessions_created,
         }

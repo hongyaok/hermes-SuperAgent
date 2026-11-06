@@ -37,6 +37,9 @@ const LIST_POLL_QUIET = 8000
 const DETAIL_POLL_RUNNING = 1500
 const DETAIL_POLL_QUIET = 6000
 const TICKET_POLL = 15000
+// GitHub is a secondary surface: its status/PR list is only worth a request
+// while the panel is open or a session on screen carries a PR badge.
+const GITHUB_POLL = 20000
 
 // The live-workers column shows chats that are doing something (or that a
 // human should look at). Idle/cancelled chats stay in the rail only.
@@ -101,6 +104,13 @@ function fmtAge(seconds) {
   if (delta < 3600) return `${Math.max(1, Math.round(delta / 60))}m`
   if (delta < 86400) return `${Math.round(delta / 3600)}h`
   return `${Math.round(delta / 86400)}d`
+}
+
+/** The same age for a GitHub ISO-8601 timestamp (e.g. a PR's updated_at). */
+function fmtIsoAge(value) {
+  const stamp = Date.parse(String(value || ''))
+  if (!isFinite(stamp)) return ''
+  return fmtAge(stamp / 1000)
 }
 
 /** Compact duration from milliseconds: '12s' / '3m 04s' / '1h 12m'. */
@@ -239,6 +249,14 @@ function fetchModels() {
   return rest ? rest('/models') : Promise.reject(new Error('backend not ready'))
 }
 
+function fetchGithubStatus() {
+  return rest ? rest('/github/status') : Promise.reject(new Error('backend not ready'))
+}
+
+function fetchGithubPrs() {
+  return rest ? rest('/github/prs') : Promise.reject(new Error('backend not ready'))
+}
+
 function useTickets() {
   return useQuery({
     queryKey: [ID, 'tickets'], queryFn: fetchTickets,
@@ -268,6 +286,26 @@ function useModels() {
   return useQuery({
     queryKey: [ID, 'models'], queryFn: fetchModels, staleTime: 60000, retry: false,
   })
+}
+
+/** GitHub connection state. One fetch on mount; polls only while `polling`. */
+function useGithubStatus(polling) {
+  return useQuery({
+    queryKey: [ID, 'github'], queryFn: fetchGithubStatus, retry: false,
+    staleTime: 10000, refetchInterval: polling ? GITHUB_POLL : false,
+  })
+}
+
+/** Open PRs are fetched only while the panel is open (20s while it is). */
+function useGithubPrs(enabled) {
+  return useQuery({
+    queryKey: [ID, 'github', 'prs'], queryFn: fetchGithubPrs, enabled, retry: false,
+    refetchInterval: enabled ? GITHUB_POLL : false,
+  })
+}
+
+function invalidateGithub(client) {
+  client.invalidateQueries({ queryKey: [ID, 'github'] })
 }
 
 function invalidateChats(client, id) {
@@ -302,6 +340,94 @@ function Pill({ children }) {
       'px-1.5 py-0.5 text-[0.6875rem] text-(--ui-text-tertiary)'),
     children,
   })
+}
+
+/** `#123` chip that opens the pull request in the browser.
+ *
+ * A span (role=link), not a button: the rail rows and worker cards are
+ * buttons themselves and a nested <button> is invalid DOM. */
+function PrBadge({ session, className }) {
+  const number = session && session.pr_number
+  if (!number) return null
+  const url = String((session && session.pr_url) || '')
+  const open = (event) => {
+    if (event) {
+      event.stopPropagation()
+      event.preventDefault()
+    }
+    openUrl(url)
+  }
+  return jsx('span', {
+    role: 'link',
+    tabIndex: 0,
+    title: url ? `Open PR #${number} on GitHub` : `PR #${number}`,
+    onClick: open,
+    onKeyDown: (event) => {
+      if (event && (event.key === 'Enter' || event.key === ' ')) open(event)
+    },
+    className: cn('inline-flex shrink-0 items-center rounded border border-(--ui-stroke-secondary)',
+      'px-1 text-[0.6875rem] tabular-nums text-(--ui-text-tertiary)',
+      'hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)', className),
+    children: `#${number}`,
+  })
+}
+
+/** GitHub status dot: green when a repo + token are configured. */
+function GithubDot({ configured }) {
+  if (StatusDot) return jsx(StatusDot, { tone: configured ? 'good' : 'muted' })
+  return jsx('span', {
+    'aria-hidden': 'true',
+    className: cn('inline-block shrink-0 leading-none',
+      configured ? 'text-(--ui-text-secondary)' : 'text-(--ui-text-quaternary)'),
+    children: '●',
+  })
+}
+
+function GithubButton({ open, status, onClick }) {
+  const configured = !!(status && status.configured)
+  const repo = configured ? String(status.repo || '') : ''
+  const short = repo ? repo.split('/').filter(Boolean).pop() : ''
+  return jsxs('button', {
+    type: 'button',
+    onClick,
+    'aria-expanded': !!open,
+    'aria-label': 'GitHub connection',
+    className: cn('flex items-center gap-1 rounded px-2 py-1 text-xs',
+      'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
+      open && 'bg-(--chrome-action-hover)'),
+    children: [
+      jsx(GithubDot, { key: 'dot', configured }),
+      jsx('span', { key: 'label', children: 'GitHub' }),
+      short
+        ? jsx('span', {
+            key: 'repo', className: 'max-w-[7rem] truncate text-(--ui-text-quaternary)',
+            title: repo, children: short,
+          })
+        : null,
+      jsx('span', { key: 'chevron', className: 'text-(--ui-text-quaternary)', children: '▾' }),
+    ],
+  })
+}
+
+function ModeButton({ label, active, onClick }) {
+  return jsx('button', {
+    type: 'button',
+    'aria-pressed': !!active,
+    onClick,
+    className: cn('rounded px-1.5 py-0.5 text-[0.6875rem]',
+      active
+        ? 'bg-(--chrome-action-hover) text-(--ui-text-secondary)'
+        : 'text-(--ui-text-quaternary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)'),
+    children: label,
+  })
+}
+
+/** Comma separated input -> trimmed non-empty strings (the server dedupes). */
+function splitList(text) {
+  return String(text || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
 }
 
 function GhostButton({ children, onClick, disabled, title, className }) {
@@ -345,6 +471,7 @@ function SessionRow({ session, selected, onSelect }) {
         key: 'meta', className: 'flex min-w-0 items-baseline gap-1.5 pl-4 text-[0.6875rem] text-(--ui-text-quaternary)',
         children: [
           jsx('span', { key: 'm', className: 'min-w-0 flex-1 truncate', children: sessionModelLabel(session) }),
+          jsx(PrBadge, { key: 'pr', session }),
           jsx('span', { key: 'a', className: 'shrink-0 tabular-nums', children: age }),
         ],
       }),
@@ -698,11 +825,13 @@ function ChatHeader({ session, onStop, stopPending, tile }) {
       children: session.repo,
     }))
   }
-  if (session.pr_url) {
+  if (session.pr_number) {
+    meta.push(jsx(PrBadge, { key: 'pr', session }))
+  } else if (session.pr_url) {
     meta.push(jsx('button', {
       key: 'pr', type: 'button', onClick: () => openUrl(session.pr_url),
       className: 'shrink-0 text-(--ui-text-secondary) underline',
-      children: session.pr_number ? `PR #${session.pr_number}` : 'Pull request',
+      children: 'Pull request',
     }))
   }
   if (session.error) {
@@ -850,6 +979,7 @@ function WorkerCard({ session, onSelect }) {
         children: [
           jsx(ChatDot, { key: 'dot', status: session.status }),
           jsx('span', { key: 't', className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)', children: sessionTitle(session) }),
+          jsx(PrBadge, { key: 'pr', session }),
           jsx('span', { key: 's', className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)', children: session.status }),
         ],
       }),
@@ -891,6 +1021,294 @@ function LiveWorkers({ sessions, onSelect }) {
   })
 }
 
+// -- GitHub panel -----------------------------------------------------------
+
+const GITHUB_FIELD = cn('min-w-0 rounded border border-(--ui-stroke-secondary) bg-transparent',
+  'px-1.5 py-1 text-[0.6875rem] text-(--ui-text-secondary)',
+  'placeholder:text-(--ui-text-quaternary) focus:outline-none')
+
+/** One open PR: number, two-line title, author, age, and a work button. */
+function GithubPrRow({ pr, onWork, pending }) {
+  const number = pr && pr.number
+  const title = String((pr && pr.title) || '').trim() || '(untitled)'
+  return jsxs('div', {
+    className: 'flex min-w-0 items-start gap-2 rounded px-1 py-1 hover:bg-(--chrome-action-hover)',
+    children: [
+      jsx('button', {
+        key: 'n', type: 'button', onClick: () => openUrl(pr && pr.html_url),
+        title: 'Open this pull request on GitHub',
+        className: 'shrink-0 font-mono text-[0.6875rem] text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)',
+        children: `#${number}`,
+      }),
+      jsxs('div', {
+        key: 'body', className: 'flex min-w-0 flex-1 flex-col gap-0.5',
+        children: [
+          jsx('span', {
+            key: 'title', className: 'line-clamp-2 break-words text-xs text-(--ui-text-secondary)',
+            title, children: title,
+          }),
+          jsxs('span', {
+            key: 'meta', className: 'flex min-w-0 items-baseline gap-1.5 text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: [
+              jsx('span', { key: 'a', className: 'min-w-0 truncate', children: (pr && pr.author) || 'unknown' }),
+              jsx('span', { key: 'd', children: '·' }),
+              jsx('span', { key: 't', className: 'shrink-0 tabular-nums', children: fmtIsoAge(pr && pr.updated_at) || '—' }),
+            ],
+          }),
+        ],
+      }),
+      jsx(GhostButton, {
+        key: 'work', className: 'shrink-0 self-center', disabled: pending,
+        title: 'Start a Superagent worker on this pull request',
+        onClick: () => onWork(number),
+        children: pending ? 'Starting…' : 'Work on this PR',
+      }),
+    ],
+  })
+}
+
+/** Connect/settings form on the left, the open PR list on the right. */
+function GithubPanel({ status, prs, prsLoading, onSelectSession }) {
+  const queryClient = useQueryClient()
+  const configured = !!(status && status.configured)
+  const tokenSet = !!(status && status.token_set)
+  const statusRepo = (status && status.repo) || ''
+  const statusAllowed = status && Array.isArray(status.allowed_users)
+    ? status.allowed_users.join(', ')
+    : ''
+  const statusMode = (status && status.watch_mode) || 'observe'
+
+  const [repo, setRepo] = useState('')
+  const [token, setToken] = useState('')
+  const [allowed, setAllowed] = useState('')
+  const [mode, setMode] = useState('observe')
+  const [notice, setNotice] = useState('')
+
+  // Seed from the server when a value changes; typing never changes these
+  // inputs' server values, so a poll cannot overwrite an edit in progress.
+  useEffect(() => { setRepo(statusRepo) }, [statusRepo])
+  useEffect(() => { setAllowed(statusAllowed) }, [statusAllowed])
+  useEffect(() => { setMode(statusMode) }, [statusMode])
+
+  const connect = useMutation({
+    mutationFn: () => rest('/github/connect', {
+      method: 'POST',
+      body: {
+        repo: String(repo || '').trim(),
+        token: String(token || '').trim(),
+        allowed_users: splitList(allowed),
+        watch_mode: mode,
+      },
+    }),
+    onSuccess: (result) => {
+      setToken('')  // saved server-side; never keep it in component state
+      if (result && result.ok === false && result.error) setNotice(String(result.error))
+      else setNotice('')
+      invalidateGithub(queryClient)
+      invalidateChats(queryClient)
+    },
+  })
+
+  const save = useMutation({
+    mutationFn: () => rest('/github/settings', {
+      method: 'POST',
+      body: { allowed_users: splitList(allowed), watch_mode: mode },
+    }),
+    onSuccess: (result) => {
+      if (result && result.ok === false && result.error) setNotice(String(result.error))
+      else setNotice('')
+      invalidateGithub(queryClient)
+    },
+  })
+
+  const poll = useMutation({
+    mutationFn: () => rest('/github/poll', { method: 'POST' }),
+    onSuccess: (result) => {
+      const errors = (result && result.errors) || []
+      setNotice(errors.length ? String(errors[0]) : '')
+      invalidateGithub(queryClient)
+      invalidateChats(queryClient)
+    },
+  })
+
+  const disconnect = useMutation({
+    mutationFn: () => rest('/github/disconnect', { method: 'POST' }),
+    onSuccess: () => {
+      setToken('')
+      setNotice('')
+      invalidateGithub(queryClient)
+      invalidateChats(queryClient)
+    },
+  })
+
+  const work = useMutation({
+    mutationFn: (number) => rest(`/github/prs/${number}/work`, { method: 'POST', body: {} }),
+    onSuccess: (result) => {
+      if (result && result.ok === false) {
+        setNotice(String(result.error || 'could not start work on that PR'))
+        return
+      }
+      setNotice('')
+      invalidateGithub(queryClient)
+      invalidateChats(queryClient)
+      if (result && result.session && result.session.id && onSelectSession) {
+        onSelectSession(result.session.id)
+      }
+    },
+  })
+
+  const failure = notice ||
+    errorText(connect.error) || errorText(save.error) || errorText(poll.error) ||
+    errorText(disconnect.error) || errorText(work.error)
+
+  const openPrs = (prs && prs.prs) || (status && status.open_prs) || []
+  const lastError = (status && status.last_error) || ''
+  const statusLine = configured
+    ? [
+        status.login ? `@${status.login}` : 'connected',
+        `${openPrs.length} open PR${openPrs.length === 1 ? '' : 's'}`,
+        status.watching ? 'watching' : 'paused',
+        `${status.poll_seconds || '—'}s poll`,
+      ].join(' · ')
+    : 'not connected'
+
+  return jsxs('section', {
+    'aria-label': 'GitHub',
+    className: cn('flex shrink-0 flex-col gap-2 overflow-y-auto rounded border',
+      'border-(--ui-stroke-secondary) p-3 max-h-[24rem]'),
+    children: [
+      jsxs('div', {
+        key: 'head', className: 'flex flex-wrap items-baseline justify-between gap-2',
+        children: [
+          jsxs('div', {
+            key: 'title', className: 'flex min-w-0 items-baseline gap-2',
+            children: [
+              jsx('span', { key: 'l', className: 'text-xs font-medium text-(--ui-text-secondary)', children: 'GitHub' }),
+              jsx('span', {
+                key: 'r', className: 'min-w-0 truncate text-[0.6875rem] text-(--ui-text-quaternary)',
+                title: statusRepo, children: statusRepo || 'no repository',
+              }),
+            ],
+          }),
+          jsx('span', {
+            key: 'status', className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: statusLine,
+          }),
+        ],
+      }),
+      failure
+        ? jsx('div', { key: 'failure', className: 'truncate text-[0.6875rem] text-(--ui-text-quaternary)', children: failure })
+        : null,
+      lastError && lastError !== failure
+        ? jsx('div', {
+            key: 'last-error', className: 'truncate text-[0.6875rem] text-(--ui-text-quaternary)',
+            title: lastError, children: `last error: ${clip(lastError, 200)}`,
+          })
+        : null,
+      jsxs('div', {
+        key: 'columns', className: 'flex min-h-0 flex-col gap-3 md:flex-row',
+        children: [
+          jsxs('div', {
+            key: 'connection', className: 'flex min-w-0 flex-col gap-1.5 md:w-[21rem] md:shrink-0',
+            children: [
+              jsx('div', {
+                key: 'label', className: 'text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
+                children: 'Connection',
+              }),
+              jsx('input', {
+                key: 'repo', type: 'text', value: repo, placeholder: 'owner/name',
+                'aria-label': 'GitHub repository', autoComplete: 'off',
+                onChange: (event) => setRepo(event.target.value),
+                className: GITHUB_FIELD,
+              }),
+              jsx('input', {
+                key: 'token', type: 'password', value: token,
+                placeholder: tokenSet ? 'saved token' : 'GitHub token',
+                'aria-label': 'GitHub token', autoComplete: 'off',
+                onChange: (event) => setToken(event.target.value),
+                className: GITHUB_FIELD,
+              }),
+              jsx('input', {
+                key: 'allowed', type: 'text', value: allowed,
+                placeholder: 'allowed users (comma separated)',
+                'aria-label': 'Allowed GitHub users', autoComplete: 'off',
+                onChange: (event) => setAllowed(event.target.value),
+                className: GITHUB_FIELD,
+              }),
+              jsxs('div', {
+                key: 'mode', className: 'flex items-center gap-1 text-[0.6875rem] text-(--ui-text-quaternary)',
+                children: [
+                  jsx('span', { key: 'l', className: 'mr-1', children: 'Watch' }),
+                  jsx(ModeButton, { key: 'observe', label: 'Observe', active: mode === 'observe', onClick: () => setMode('observe') }),
+                  jsx(ModeButton, { key: 'auto', label: 'Auto', active: mode === 'auto', onClick: () => setMode('auto') }),
+                ],
+              }),
+              jsxs('div', {
+                key: 'actions', className: 'flex flex-wrap items-center gap-1',
+                children: [
+                  jsx(GhostButton, {
+                    key: 'connect', disabled: connect.isPending || !String(repo || '').trim(),
+                    onClick: () => connect.mutate(),
+                    children: connect.isPending ? 'Connecting…' : 'Connect',
+                  }),
+                  jsx(GhostButton, {
+                    key: 'save', disabled: save.isPending, onClick: () => save.mutate(),
+                    children: save.isPending ? 'Saving…' : 'Save settings',
+                  }),
+                  jsx(GhostButton, {
+                    key: 'poll', disabled: poll.isPending, onClick: () => poll.mutate(),
+                    children: poll.isPending ? 'Polling…' : 'Poll now',
+                  }),
+                  jsx(GhostButton, {
+                    key: 'disconnect', disabled: disconnect.isPending || !configured,
+                    onClick: () => disconnect.mutate(),
+                    children: disconnect.isPending ? 'Disconnecting…' : 'Disconnect',
+                  }),
+                ],
+              }),
+            ],
+          }),
+          jsxs('div', {
+            key: 'prs', className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-1',
+            children: [
+              jsxs('div', {
+                key: 'label', className: 'flex items-baseline justify-between gap-2',
+                children: [
+                  jsx('span', {
+                    key: 'l', className: 'text-[0.6875rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
+                    children: 'Open pull requests',
+                  }),
+                  jsx('span', {
+                    key: 'n', className: 'text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
+                    children: openPrs.length ? String(openPrs.length) : '',
+                  }),
+                ],
+              }),
+              openPrs.length
+                ? jsx('div', {
+                    key: 'list', className: 'flex min-h-0 flex-col gap-0.5 overflow-y-auto pr-1',
+                    children: openPrs.map((pr) => jsx(GithubPrRow, {
+                      key: String(pr.number),
+                      pr,
+                      onWork: (number) => work.mutate(number),
+                      pending: work.isPending && work.variables === pr.number,
+                    })),
+                  })
+                : jsx('div', {
+                    key: 'empty', className: 'px-1 py-2 text-xs text-(--ui-text-tertiary)',
+                    children: prsLoading
+                      ? 'Loading pull requests…'
+                      : configured
+                        ? 'No open pull requests.'
+                        : 'Connect a repository to watch its PRs.',
+                  }),
+            ],
+          }),
+        ],
+      }),
+    ],
+  })
+}
+
 // -- page -------------------------------------------------------------------
 
 function SuperagentPage() {
@@ -903,6 +1321,7 @@ function SuperagentPage() {
     model: readStored('lastModel', ''), provider: readStored('lastProvider', ''),
   }))
   const [repo, setRepo] = useState(() => readStored('lastRepo', ''))
+  const [githubOpen, setGithubOpen] = useState(false)
   const detail = useChat(selectedId)
   const inputRef = useRef(null)
 
@@ -919,6 +1338,15 @@ function SuperagentPage() {
     [sessions, selectedId],
   )
   const selectedSession = (detail.data && detail.data.session) || selectedSummary
+
+  // A PR badge anywhere on the board keeps the status fresh; the panel keeps
+  // it fresh while open. Otherwise the status is fetched once (header dot).
+  const hasPrBadge = useMemo(
+    () => sessions.some((session) => !!session.pr_number),
+    [sessions],
+  )
+  const githubQuery = useGithubStatus(githubOpen || hasPrBadge)
+  const githubPrsQuery = useGithubPrs(githubOpen)
 
   const createChat = useMutation({
     mutationFn: (body) => rest('/chats', { method: 'POST', body }),
@@ -1003,6 +1431,10 @@ function SuperagentPage() {
     chatsQuery.refetch()
     modelsQuery.refetch()
     if (selectedId) detail.refetch()
+    if (githubOpen) {
+      githubQuery.refetch()
+      githubPrsQuery.refetch()
+    }
   }
 
   const stop = () => {
@@ -1030,6 +1462,10 @@ function SuperagentPage() {
           jsxs('div', {
             key: 'actions', className: 'flex items-center gap-1',
             children: [
+              jsx(GithubButton, {
+                key: 'github', open: githubOpen, status: githubQuery.data,
+                onClick: () => setGithubOpen((value) => !value),
+              }),
               jsx(GhostButton, { key: 'new', onClick: newChat, children: 'New chat' }),
               jsx(GhostButton, { key: 'refresh', onClick: refresh, children: 'Refresh' }),
             ],
@@ -1043,6 +1479,13 @@ function SuperagentPage() {
               title: 'Superagent backend unavailable. Enable the plugin first.',
               error: chatsQuery.error, onRetry: () => chatsQuery.refetch(),
             }),
+          })
+        : null,
+      githubOpen
+        ? jsx(GithubPanel, {
+            key: 'github', status: githubQuery.data,
+            prs: githubPrsQuery.data, prsLoading: githubPrsQuery.isLoading,
+            onSelectSession: select,
           })
         : null,
       jsxs('div', {

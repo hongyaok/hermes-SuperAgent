@@ -393,6 +393,8 @@ def test_status_is_json_safe_and_never_contains_the_token(chat, tmp_path):
     assert status["token_set"] is True
     assert len(status["open_prs"]) == 1
     assert status["watch_mode"] == "observe"
+    assert status["watch_new_prs"] is False
+    assert status["allowed_users"] == ["alice"]
     assert status["poll_seconds"] == 90
     assert status["watching"] is False
     assert status["sessions_created"] == 0

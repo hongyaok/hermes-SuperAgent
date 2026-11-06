@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -832,6 +833,103 @@ def _github_settings() -> dict[str, Any]:
     return sa_settings.load_settings()
 
 
+# Settings the panel can change without reconnecting. Values are validated
+# here (not in sa_settings) so a bad form field is a 400 with a useful message
+# instead of a silent coercion.
+GITHUB_WATCH_MODES = ("observe", "auto")
+GITHUB_POLL_MIN_SECONDS = 15
+GITHUB_POLL_MAX_SECONDS = 3600
+_GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_TRUE = ("true", "1", "yes", "on")
+_FALSE = ("false", "0", "no", "off")
+
+
+def _clean_allowed_users(value: Any) -> list[str]:
+    """Normalise an allow-list: strip, drop empties/@handles, dedupe.
+
+    GitHub logins are case-insensitive, so the first spelling wins and later
+    duplicates are dropped. A leading `@` (how people paste a mention) is
+    removed rather than stored, because the watcher compares bare logins.
+    """
+    if isinstance(value, str):
+        parts: list[Any] = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        parts = list(value)
+    else:
+        raise ValueError("allowed_users must be a list or a comma-separated string")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        name = str(part if part is not None else "").strip()
+        if name.startswith("@"):
+            name = name[1:].strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(name)
+    return cleaned
+
+
+def _github_bool(value: Any, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value if value is not None else "").strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    raise HTTPException(status_code=400, detail=f"{field} must be true or false")
+
+
+def _github_settings_patch(data: dict) -> dict[str, Any]:
+    """Validate the optional settings keys shared by /connect and /settings.
+
+    Only keys present in the body are returned, so a patch never blanks a
+    value the caller did not mention. Raises 400 on anything malformed.
+    """
+    patch: dict[str, Any] = {}
+    if "allowed_users" in data:
+        try:
+            patch["github_allowed_users"] = _clean_allowed_users(data.get("allowed_users"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if "watch_mode" in data:
+        mode = str(data.get("watch_mode") or "").strip().lower()
+        if mode not in GITHUB_WATCH_MODES:
+            raise HTTPException(status_code=400, detail="watch_mode must be 'observe' or 'auto'")
+        patch["github_watch_mode"] = mode
+    if "watch_new_prs" in data:
+        patch["github_watch_new_prs"] = _github_bool(data.get("watch_new_prs"), "watch_new_prs")
+    if "poll_seconds" in data:
+        raw = data.get("poll_seconds")
+        try:
+            seconds = int(str(raw).strip()) if not isinstance(raw, bool) else 0
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds < GITHUB_POLL_MIN_SECONDS or seconds > GITHUB_POLL_MAX_SECONDS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"poll_seconds must be between {GITHUB_POLL_MIN_SECONDS}"
+                    f" and {GITHUB_POLL_MAX_SECONDS}"
+                ),
+            )
+        patch["github_poll_seconds"] = seconds
+    if "agent_login" in data:
+        login = str(data.get("agent_login") or "").strip()
+        if login.startswith("@"):
+            login = login[1:].strip()
+        if login and not _GITHUB_LOGIN_RE.match(login):
+            raise HTTPException(status_code=400, detail="agent_login is not a valid GitHub login")
+        patch["github_agent_login"] = login
+    return patch
+
+
 def _github_identity(client: Any) -> tuple[str, dict[str, Any]]:
     """Authenticated login + repository info; any failure is a 400."""
     try:
@@ -897,11 +995,17 @@ def github_test(body: dict | None = None) -> dict[str, Any]:
 
 @router.post("/github/connect")
 def github_connect(body: dict) -> dict[str, Any]:
-    """Validate a repository/token pair, save it, and start watching."""
+    """Validate a repository/token pair, save it, and start watching.
+
+    Optional `allowed_users`, `watch_mode`, `watch_new_prs`, `poll_seconds` and
+    `agent_login` keys are applied in the same write, so the panel's Connect
+    button saves the form in one round-trip.
+    """
     data = body or {}
     repo = str(data.get("repo") or "").strip()
     if not sa_settings.valid_repo_name(repo):
         raise HTTPException(status_code=400, detail="repository must be owner/name")
+    extra = _github_settings_patch(data)
     settings = _github_settings()
     supplied_token = str(data.get("token") or "").strip()
     token = supplied_token or str(settings.get("github_token") or "").strip()
@@ -912,9 +1016,10 @@ def github_connect(body: dict) -> dict[str, Any]:
     login, info = _github_identity(client)
 
     patch: dict[str, Any] = {"github_repo": repo}
+    patch.update(extra)
     if supplied_token:
         patch["github_token"] = supplied_token
-    if login:
+    if login and "github_agent_login" not in patch:
         patch["github_agent_login"] = login
     try:
         sa_settings.save_settings(patch)
@@ -938,6 +1043,27 @@ def github_connect(body: dict) -> dict[str, Any]:
         }
     )
     return result
+
+
+@router.post("/github/settings")
+def github_settings(body: dict) -> dict[str, Any]:
+    """Save watch settings without touching the token or the repository.
+
+    The watcher is dropped afterwards so the next status/poll reads the new
+    allowed list, mode and interval instead of the cached settings dict.
+    """
+    patch = _github_settings_patch(body or {})
+    try:
+        sa_settings.save_settings(patch)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=_scrub(str(exc))) from exc
+    _reset_watcher()
+    watcher = _get_watcher()
+    try:
+        watcher.start_background()
+    except Exception:
+        pass  # a status answer is still useful when the thread cannot start
+    return {"ok": True, "status": watcher.status()}
 
 
 @router.post("/github/disconnect")

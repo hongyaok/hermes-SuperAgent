@@ -7,15 +7,19 @@ import json
 import os
 import threading
 import time
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
 try:
-    from . import sa_chats, sa_engine, sa_runner
+    from . import sa_chats, sa_engine, sa_github, sa_runner, sa_settings, sa_watcher
 except ImportError:  # top-level import (root __init__ loaded as `__init__` by pytest)
     import sa_chats  # type: ignore[no-redef]
     import sa_engine  # type: ignore[no-redef]
+    import sa_github  # type: ignore[no-redef]
     import sa_runner  # type: ignore[no-redef]
+    import sa_settings  # type: ignore[no-redef]
+    import sa_watcher  # type: ignore[no-redef]
 
 STATUS_ICONS = {
     "observed": "·",
@@ -46,7 +50,17 @@ _RUNNERS_LOCK = threading.Lock()
 USAGE = (
     "usage: hermes superagent "
     "<status|tick|ask <request>|run <ticket-id>|show <ticket-id|session-id>|"
-    "chat <prompt>|sessions|stop <session-id>|models|doctor> [--json]"
+    "chat <prompt>|sessions|stop <session-id>|models|"
+    "github <status|test|connect|disconnect|prs|poll|work <number>>|doctor> [--json]"
+)
+
+GITHUB_ACTIONS = ("status", "test", "connect", "disconnect", "prs", "poll", "work")
+GITHUB_WATCH_MODES = ("observe", "auto")
+GITHUB_USAGE = (
+    "usage: hermes superagent github "
+    "<status|test|connect|disconnect|prs|poll|work <number>> "
+    "[--repo owner/name] [--token TOKEN] [--allowed alice,bob] "
+    "[--watch-mode observe|auto] [--request \"...\"] [--json]"
 )
 
 
@@ -187,6 +201,168 @@ def render_models(data: dict) -> str:
         lines.extend(f"  - {name}" for name in presets)
     else:
         lines.append("  (none)")
+    return "\n".join(lines)
+
+
+# -- GitHub CLI ------------------------------------------------------------
+
+
+def _format_age(seconds: Any) -> str:
+    """Compact age from a number of seconds: 'now' / '4m' / '3h' / '2d'."""
+    try:
+        delta = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if not isfinite(delta):
+        return ""
+    if delta < 45:
+        return "now"
+    if delta < 3600:
+        return f"{max(1, round(delta / 60))}m"
+    if delta < 86400:
+        return f"{round(delta / 3600)}h"
+    return f"{round(delta / 86400)}d"
+
+
+def _iso_age(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        from datetime import datetime, timezone
+
+        stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return _format_age(time.time() - stamp.timestamp())
+    except (TypeError, ValueError):
+        return ""
+
+
+def _clean_allowed(value: Any) -> list[str]:
+    """Strip, drop empties/@handles and dedupe case-insensitively."""
+    if isinstance(value, str):
+        parts: list[Any] = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        parts = list(value)
+    else:
+        raise ValueError("allowed users must be a list or a comma-separated string")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        name = str(part if part is not None else "").strip()
+        if name.startswith("@"):
+            name = name[1:].strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        cleaned.append(name)
+    return cleaned
+
+
+def _mask(text: Any, token: str = "") -> str:
+    value = "" if text is None else str(text)
+    return value.replace(token, "[redacted]") if token else value
+
+
+def render_github_status(data: dict) -> str:
+    if not isinstance(data, dict):
+        return str(data)
+    repo = str(data.get("repo") or "").strip()
+    lines = [f"GitHub   {repo or 'not connected'}"]
+    if not data.get("configured"):
+        lines.append("  status:    not connected (a repository and token are required)")
+        lines.append(
+            "  connect:   hermes superagent github connect --repo owner/name"
+            " --token <token> --allowed you"
+        )
+        if data.get("last_error"):
+            lines.append(f"  error:     {data['last_error']}")
+        return "\n".join(lines)
+    open_prs = data.get("open_prs") or []
+    allowed = data.get("allowed_users") or []
+    lines += [
+        f"  login:     {data.get('login') or '-'}",
+        f"  watching:  {'yes' if data.get('watching') else 'no'}"
+        f"   mode={data.get('watch_mode') or 'observe'}"
+        f"   poll={data.get('poll_seconds') or '-'}s",
+        f"  open PRs:  {len(open_prs)}   sessions created: {data.get('sessions_created') or 0}",
+        f"  allowed:   {', '.join(str(name) for name in allowed) if allowed else '(nobody)'}",
+    ]
+    if data.get("last_poll"):
+        lines.append(f"  last poll: {_stamp(data['last_poll'])}")
+    if data.get("last_error"):
+        lines.append(f"  error:     {data['last_error']}")
+    return "\n".join(lines)
+
+
+def render_github_account(data: dict) -> str:
+    """Masked result of `github test` / `github connect` (never the token)."""
+    if not isinstance(data, dict):
+        return str(data)
+    repo = str(data.get("repo") or data.get("full_name") or "")
+    privacy = "private" if data.get("private") else "public"
+    lines = [
+        f"GitHub   {repo}   connected as {data.get('login') or '-'}",
+        f"  repo:      {data.get('full_name') or repo} ({privacy},"
+        f" default {data.get('default_branch') or '-'})",
+        f"  open PRs:  {data.get('open_pr_count', 0)}",
+    ]
+    if data.get("token_set"):
+        lines.append("  token:     saved (value never shown)")
+    if data.get("watch_mode"):
+        lines.append(f"  mode:      {data['watch_mode']}   poll={data.get('poll_seconds') or '-'}s")
+    allowed = data.get("allowed_users") or []
+    if data.get("allowed_users") is not None:
+        lines.append(f"  allowed:   {', '.join(str(name) for name in allowed) if allowed else '(nobody)'}")
+    return "\n".join(lines)
+
+
+def render_github_prs(data: dict) -> str:
+    if not isinstance(data, dict):
+        return str(data)
+    if not data.get("configured"):
+        return (
+            "GitHub   not connected.\n"
+            "  connect: hermes superagent github connect --repo owner/name --token <token>"
+        )
+    prs = [pr for pr in (data.get("prs") or []) if isinstance(pr, dict)]
+    lines = [f"Open pull requests ({len(prs)})"]
+    if not prs:
+        lines.append("  (none)")
+        return "\n".join(lines)
+    for pr in prs:
+        title = " ".join(str(pr.get("title") or "").split())
+        if len(title) > 66:
+            title = title[:65] + "…"
+        meta = "   ".join(
+            part
+            for part in (
+                str(pr.get("author") or "-"),
+                _iso_age(pr.get("updated_at")) or "-",
+                str(pr.get("html_url") or ""),
+            )
+            if part
+        )
+        lines.append(f"  #{str(pr.get('number') or '?'):<5} {title}")
+        lines.append(f"         {meta}")
+    return "\n".join(lines)
+
+
+def render_github_poll(data: dict) -> str:
+    if not isinstance(data, dict):
+        return str(data)
+    if not data.get("configured"):
+        return "GitHub   not connected; nothing was polled."
+    created = data.get("created") or []
+    lines = [
+        f"Polled {data.get('polled', 0)} open pull request(s);"
+        f" created {len(created)} session(s)"
+    ]
+    if created:
+        lines.append("  new: " + ", ".join(str(item) for item in created))
+    for error in data.get("errors") or []:
+        lines.append(f"  error: {error}")
     return "\n".join(lines)
 
 
@@ -605,6 +781,313 @@ def _stop_session(session_id: str, engine: Any, want_json: bool) -> int:
     return 0
 
 
+def _github_store() -> Any:
+    """ChatStore on the plugin database (settings and sessions share it)."""
+    return sa_chats.ChatStore(_db_path())
+
+
+def _github_watcher(store: Any = None) -> Any:
+    """A watcher over the current settings (no HTTP layer, no background thread)."""
+    store = store if store is not None else _github_store()
+    return sa_watcher.GitHubWatcher(store, _get_runner(store), sa_settings.load_settings)
+
+
+def _clear_github_baseline(store: Any, repo: str) -> None:
+    """Forget dedupe state so a fresh connect starts a new baseline."""
+    if not repo:
+        return
+    for prefix in (f"gh_baseline:{repo}", f"gh_comment:{repo}:", f"gh_head:{repo}:"):
+        try:
+            store.clear_seen(prefix)
+        except Exception:
+            pass
+
+
+def _github_credentials(args: Any) -> tuple[str, str, str]:
+    """(repo, token, explicit token) from flags, falling back to settings."""
+    settings = sa_settings.load_settings()
+    repo = str(getattr(args, "repo", "") or "").strip() or str(settings.get("github_repo") or "").strip()
+    supplied = str(getattr(args, "token", "") or "").strip()
+    token = supplied or str(settings.get("github_token") or "").strip()
+    return repo, token, supplied
+
+
+def run_github(args: Any, want_json: bool = False) -> int:
+    """`hermes superagent github ...`. Returns a process exit code."""
+    action = str(getattr(args, "action", "") or "status").strip().lower()
+    if action not in GITHUB_ACTIONS:
+        print(GITHUB_USAGE)
+        return 2
+
+    watch_mode = str(getattr(args, "watch_mode", "") or "").strip().lower()
+    if watch_mode and watch_mode not in GITHUB_WATCH_MODES:
+        print("error: --watch-mode must be observe or auto")
+        return 2
+    raw_allowed = getattr(args, "allowed", None)
+    try:
+        allowed = None if raw_allowed is None else _clean_allowed(raw_allowed)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 2
+
+    if action == "status":
+        try:
+            data = _github_watcher().status()
+        except Exception as exc:
+            print(f"error: github status failed: {exc}")
+            return 1
+        print(json.dumps(data, indent=2, default=str) if want_json else render_github_status(data))
+        return 0
+
+    if action == "prs":
+        try:
+            status = _github_watcher().status()
+        except Exception as exc:
+            print(f"error: github prs failed: {exc}")
+            return 1
+        data = {"configured": bool(status.get("configured")), "prs": status.get("open_prs") or []}
+        print(json.dumps(data, indent=2, default=str) if want_json else render_github_prs(data))
+        return 0
+
+    if action == "poll":
+        try:
+            summary = _github_watcher().poll_once()
+        except Exception as exc:
+            print(f"error: github poll failed: {exc}")
+            return 1
+        data = {
+            "configured": bool(summary.get("configured")),
+            "polled": int(summary.get("polled") or 0),
+            "created": list(summary.get("created") or []),
+            "errors": [str(item) for item in (summary.get("errors") or [])],
+        }
+        print(json.dumps(data, indent=2, default=str) if want_json else render_github_poll(data))
+        return 0
+
+    if action == "disconnect":
+        try:
+            sa_settings.save_settings({"github_repo": "", "github_token": ""})
+        except (ValueError, OSError) as exc:
+            print(f"error: could not save settings: {exc}")
+            return 1
+        print(json.dumps({"ok": True, "configured": False}) if want_json else "GitHub   disconnected")
+        return 0
+
+    if action == "test":
+        repo, token, _ = _github_credentials(args)
+        if not sa_settings.valid_repo_name(repo):
+            print("error: --repo owner/name is required")
+            return 2
+        if not token:
+            print("error: a GitHub token is required (--token or saved settings)")
+            return 1
+        try:
+            client = sa_github.GitHubClient(token, repo)
+            login = str((client.me() or {}).get("login") or "")
+            info = client.repo_info()
+            try:
+                open_pr_count = len(client.list_open_prs(limit=100))
+            except sa_github.GitHubError:
+                open_pr_count = int(info.get("open_issues") or 0)
+        except sa_github.GitHubError as exc:
+            print(f"error: {_mask(exc, token)}")
+            return 1
+        except Exception as exc:
+            print(f"error: github test failed: {_mask(exc, token)}")
+            return 1
+        data = {
+            "ok": True,
+            "repo": repo,
+            "login": login,
+            "full_name": info.get("full_name") or repo,
+            "default_branch": info.get("default_branch") or "",
+            "private": bool(info.get("private")),
+            "open_pr_count": open_pr_count,
+            "token_set": True,
+        }
+        print(json.dumps(data, indent=2, default=str) if want_json else render_github_account(data))
+        return 0
+
+    if action == "connect":
+        repo, token, supplied = _github_credentials(args)
+        if not sa_settings.valid_repo_name(repo):
+            print("error: --repo owner/name is required")
+            return 2
+        if not token:
+            print("error: a GitHub token is required (--token or saved settings)")
+            return 1
+        try:
+            client = sa_github.GitHubClient(token, repo)
+            login = str((client.me() or {}).get("login") or "")
+            info = client.repo_info()
+        except sa_github.GitHubError as exc:
+            print(f"error: {_mask(exc, token)}")
+            return 1
+        except Exception as exc:
+            print(f"error: github connect failed: {_mask(exc, token)}")
+            return 1
+
+        patch: dict[str, Any] = {"github_repo": repo}
+        if supplied:
+            patch["github_token"] = supplied
+        if login:
+            patch["github_agent_login"] = login
+        if allowed is not None:
+            patch["github_allowed_users"] = allowed
+        if watch_mode:
+            patch["github_watch_mode"] = watch_mode
+        try:
+            sa_settings.save_settings(patch)
+        except (ValueError, OSError) as exc:
+            print(f"error: could not save settings: {exc}")
+            return 1
+        _clear_github_baseline(_github_store(), repo)
+
+        saved = sa_settings.load_settings()
+        data = {
+            "ok": True,
+            "configured": True,
+            "repo": repo,
+            "login": login,
+            "full_name": info.get("full_name") or repo,
+            "default_branch": info.get("default_branch") or "",
+            "private": bool(info.get("private")),
+            "open_pr_count": int(info.get("open_issues") or 0),
+            "token_set": True,
+            "watch_mode": saved.get("github_watch_mode") or "observe",
+            "allowed_users": saved.get("github_allowed_users") or [],
+            "poll_seconds": saved.get("github_poll_seconds"),
+        }
+        print(json.dumps(data, indent=2, default=str) if want_json else render_github_account(data))
+        return 0
+
+    # action == "work"
+    raw_number = getattr(args, "number", None)
+    try:
+        number = int(str(raw_number).strip()) if raw_number is not None else 0
+    except (TypeError, ValueError):
+        number = 0
+    if number <= 0:
+        print(GITHUB_USAGE)
+        return 2
+
+    settings = sa_settings.load_settings()
+    repo = str(getattr(args, "repo", "") or "").strip() or str(settings.get("github_repo") or "").strip()
+    token = str(getattr(args, "token", "") or "").strip() or str(settings.get("github_token") or "").strip()
+    if not repo or not token:
+        print("error: GitHub is not connected (run `hermes superagent github connect`)")
+        return 1
+
+    try:
+        client = sa_github.GitHubClient(token, repo)
+        pr = client.get_pr(number)
+    except sa_github.GitHubError as exc:
+        print(f"error: {_mask(exc, token)}")
+        return 1
+    except Exception as exc:
+        print(f"error: github work failed: {_mask(exc, token)}")
+        return 1
+
+    repo_path = str(settings.get("repo_path") or "").strip()
+    checkout = ""
+    warning = ""
+    if repo_path:
+        workspace = str(sa_settings.data_dir() / "workspaces")
+        try:
+            info = sa_github.prepare_pr_checkout(repo_path, repo, number, workspace, token)
+            checkout = str(info.get("path") or "")
+        except sa_github.GitHubError as exc:
+            warning = _mask(exc, token)
+
+    request_text = str(getattr(args, "request", "") or "").strip()
+    comment = {"author": "you", "body": request_text} if request_text else None
+    prompt = sa_github.build_pr_prompt(pr, comment=comment, checkout=checkout)
+    session_repo = checkout
+    if not session_repo and repo_path and Path(repo_path).expanduser().is_dir():
+        session_repo = repo_path
+    model = str(settings.get("default_model") or "")
+    provider = str(settings.get("default_provider") or "")
+
+    try:
+        store = _github_store()
+        session = store.create_session(
+            prompt,
+            title=f"PR #{number}: {pr.get('title') or ''}".strip(),
+            model=model,
+            provider=provider,
+            repo=session_repo,
+            source="github_pr",
+            github_repo=repo,
+            pr_number=number,
+            pr_url=str(pr.get("html_url") or ""),
+            status=sa_chats.QUEUED,
+        )
+        session_id = str(session["id"])
+        store.add_event(session_id, "github", f"CLI work on PR #{number}")
+        if warning:
+            store.add_event(session_id, "github", f"checkout failed: {warning}")
+    except Exception as exc:
+        print(f"error: could not create the session: {_mask(exc, token)}")
+        return 1
+
+    try:
+        _get_runner(store).launch_turn(
+            session_id,
+            prompt,
+            model=model or None,
+            provider=provider or None,
+            repo=session_repo,
+            block=True,
+        )
+    except KeyboardInterrupt:
+        try:
+            _get_runner(store).stop(session_id)
+        except Exception:
+            pass
+        print(f"\n{session_id} cancelled (interrupted)")
+        return 1
+    except Exception as exc:
+        message = _mask(str(exc) or exc.__class__.__name__, token)
+        try:
+            store.update_session(
+                session_id, status=sa_chats.FAILED, error=message,
+                finished_at=time.time(), pid=None,
+            )
+            store.add_event(session_id, "failed", message)
+        except Exception:
+            pass
+        if want_json:
+            print(json.dumps(
+                {"ok": False, "launched": False, "error": message, "session_id": session_id},
+                indent=2, default=str,
+            ))
+        else:
+            print(f"error: cannot launch worker for {session_id}: {message}")
+        return 1
+
+    try:
+        fresh = store.get_session(session_id, message_limit=50) or session
+    except Exception:
+        fresh = session
+    if want_json:
+        print(json.dumps({
+            "ok": True,
+            "launched": True,
+            "session": fresh,
+            "checkout": checkout,
+            "warning": warning,
+            "transcript": f"hermes superagent show {session_id}",
+        }, indent=2, default=str))
+    else:
+        print(render_chat(fresh, str(getattr(store, "path", ""))))
+        print(f"  work on:   PR #{number} in {repo}")
+        if checkout:
+            print(f"  checkout:  {checkout}")
+        if warning:
+            print(f"  warning:   {warning}")
+    return 0
+
+
 def setup_cli(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("--json", action="store_true", help="Print raw JSON")
     subs = subparser.add_subparsers(dest="superagent_command")
@@ -647,6 +1130,26 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
     _add_json_flag(stop_p)
     models_p = subs.add_parser("models", help="Show the default model, provider and presets")
     _add_json_flag(models_p)
+    github_p = subs.add_parser(
+        "github", help="Connect GitHub and work on pull requests from the terminal"
+    )
+    github_p.add_argument(
+        "action",
+        nargs="?",
+        default="status",
+        help="status|test|connect|disconnect|prs|poll|work",
+    )
+    github_p.add_argument("number", nargs="?", default=None, help="Pull request number for `work`")
+    github_p.add_argument("--repo", default="", help="Repository as owner/name")
+    github_p.add_argument("--token", default="", help="GitHub token (stored, never echoed)")
+    github_p.add_argument(
+        "--allowed", default=None, help="Comma-separated GitHub logins allowed to request work"
+    )
+    github_p.add_argument(
+        "--watch-mode", dest="watch_mode", default="", help="observe or auto"
+    )
+    github_p.add_argument("--request", default="", help="Extra instruction for `work`")
+    _add_json_flag(github_p)
     doctor_p = subs.add_parser("doctor", help="Check configuration and worker availability")
     _add_json_flag(doctor_p)
     subparser.set_defaults(func=run)
@@ -661,6 +1164,12 @@ def run(args: argparse.Namespace, ctx: Any) -> int:
         data = models_payload(ctx)
         print(json.dumps(data, indent=2) if want_json else render_models(data))
         return 0
+
+    # `github` talks to sa_settings/sa_github/GitHubWatcher directly: it needs
+    # no ticket engine (and no HTTP layer), so it also works before anyone has
+    # started the dashboard.
+    if command == "github":
+        return run_github(args, want_json)
 
     try:
         engine = sa_engine.build_engine(ctx)
