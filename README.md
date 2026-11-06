@@ -8,6 +8,7 @@ It separates **routing** from **execution**:
 - **SQLite** (`<HERMES_HOME>/plugin-data/superagent/superagent.db`) persists tickets (`T-0001`, `T-0002`, ...), event history, source deduplication, and polling cursors.
 - **Isolated Hermes worker subagents** launched via `ctx.subagent_lifecycle` perform the coding work inside your repository and leave uncommitted changes in the working tree for human review (`review` state).
 - **Headless chat workers (v0.2)** — the desktop **Chat** tab starts one `hermes chat` process per turn, streams its JSON output into the session transcript, and lets you resume, watch or stop it. Chat workers follow the same rule as ticket workers: changes stay uncommitted for review.
+- **GitHub PR watch (v0.3)** — connect a repository, and pull-request comments that mention the agent become sessions. `auto` mode checks each PR out as an isolated `git worktree` and launches a worker on it; `observe` (the default) only records the request.
 
 Router-side work (polling, triage, ticket state) runs no LLM and starts no subprocess. Chat turns are explicit `hermes chat` workers launched from a user message and bounded by the caps and watchdog described in [Chat and models API](#8-chat-and-models-api-v02). By default, the plugin runs in `observe` mode so it only records tickets until you explicitly approve them or switch to `auto`.
 
@@ -62,6 +63,10 @@ hermes config set plugins.entries.superagent.settings.mode observe
 | `model_presets` | `list` | built-in list | Models offered in the per-session picker. Empty uses the built-in list. Env: `SUPERAGENT_MODEL_PRESETS` (comma separated). |
 | `worker_yolo` | `bool` | `true` | Pass `--yolo` to headless chat workers so they do not wait for approval prompts. Env: `SUPERAGENT_WORKER_YOLO`. |
 | `chat_max_turns` | `int` | `120` | Maximum agent turns for one headless chat worker. Env: `SUPERAGENT_CHAT_MAX_TURNS`. |
+| `github_watch_mode` | `str` (`observe` \| `auto`) | `observe` | `observe` records PR mentions as `observed` sessions only; `auto` queues and launches a worker for each one. Env: `SUPERAGENT_GITHUB_WATCH_MODE`. |
+| `github_watch_new_prs` | `bool` | `false` | Start a review session whenever a watched pull request gets a new head commit. Env: `SUPERAGENT_GITHUB_WATCH_NEW_PRS`. |
+| `github_poll_seconds` | `int` | `90` | Seconds between background GitHub polls (minimum `5`). Env: `SUPERAGENT_GITHUB_POLL_SECONDS`. |
+| `github_pr_limit` | `int` | `10` | Maximum open pull requests checked per poll (`1`–`100`). Env: `SUPERAGENT_GITHUB_PR_LIMIT`. |
 | `turn_timeout_seconds` | `int` | `1800` | A queued or running chat turn older than this is cancelled by the next reap or chat-list read. `0` disables the guard. Env: `SUPERAGENT_TURN_TIMEOUT_SECONDS`. |
 
 ### Environment overrides
@@ -82,6 +87,14 @@ The dashboard backend is loaded outside the plugin package, so it reads these va
 | `SUPERAGENT_WORKER_TOOLSETS` | Comma-separated toolsets for chat workers. |
 | `SUPERAGENT_HERMES_BIN` | `hermes` executable used for chat workers. |
 | `SUPERAGENT_CHAT_SOURCE` | Source tag passed to `hermes chat` (default `tool`). |
+| `SUPERAGENT_GITHUB_REPO` | `owner/name` watched for pull requests. |
+| `SUPERAGENT_GITHUB_TOKEN` | GitHub token; also the fallback for a `${...}` placeholder in `plugin.yaml`. |
+| `SUPERAGENT_GITHUB_AGENT_LOGIN` | Login whose `@mention` requests work (otherwise resolved from the token). |
+| `SUPERAGENT_GITHUB_ALLOWED_USERS` | Comma-separated logins allowed to request work (empty = nobody). |
+| `SUPERAGENT_GITHUB_WATCH_MODE` | `observe` or `auto` for the GitHub watcher. |
+| `SUPERAGENT_GITHUB_WATCH_NEW_PRS` | `1`/`true` to review every new PR head commit. |
+| `SUPERAGENT_GITHUB_POLL_SECONDS` | Background poll interval (minimum `5`). |
+| `SUPERAGENT_GITHUB_PR_LIMIT` | Open pull requests checked per poll (`1`–`100`). |
 
 ---
 
@@ -211,6 +224,30 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 - **Runaway guard.** A queued or running turn older than `turn_timeout_seconds` (env `SUPERAGENT_TURN_TIMEOUT_SECONDS`, default `1800`; `0` disables) is cancelled by `Runner.reap()`. `GET /chats` calls `reap()` before answering, so the status becomes `cancelled` and a `cancelled` event records the reason (`turn timed out after Ns (limit Ns)`) even if the server restarted and no process handle is left.
 - **Consistent triage.** `POST /ask` runs the same `sa_assessor.assess(..., explicit=True)` rules as the router instead of hardcoding `accept`: a skip marker or acknowledgement is recorded as `ignored`, a design question becomes `blocked` (`needs_human`), and an actionable request becomes `observed` (`accept`). The verdict and reason are stored on the ticket and in its `assessed` event.
 
+### 9. GitHub connect & PR watch (v0.3)
+
+Connect one repository and Superagent watches its pull requests. A comment that mentions the agent (`@<login>`, `@superagent`, `/superagent`, or a line starting `superagent:`) from an allowed user becomes a session; when `github_watch_new_prs` is on, a new head commit on a watched PR starts a review session once per SHA.
+
+| Method | Path | Behaviour |
+| :--- | :--- | :--- |
+| `GET` | `/github/status` | `{configured, repo, login, token_set, open_prs, last_poll, last_error, watching, watch_mode, poll_seconds, sessions_created}`; also starts the background poller (idempotent). |
+| `POST` | `/github/test` | `{repo?, token?}` — validate a token/repository pair without saving. Returns `{ok, login, full_name, default_branch, private, open_pr_count}`; `400` on a bad repo or rejected token. |
+| `POST` | `/github/connect` | `{repo, token?}` — validate with the supplied or saved token, save `github_repo` (and the token and resolved login), reset the baseline, start watching, return the status. `400` on a malformed repo or an auth failure. |
+| `POST` | `/github/disconnect` | Clear `github_repo` and `github_token` in `settings.json`, stop the poller. |
+| `POST` | `/github/poll` | One polling pass now: `{configured, polled, created, errors}`. |
+| `GET` | `/github/prs` | `{configured, prs}` — the cached open PR list. |
+| `POST` | `/github/prs/{number}/work` | `{request?}` — create a session for that PR and launch a worker (an explicit human action always launches). `400` when GitHub is not connected, `404` for an unknown PR. |
+
+**Settings precedence.** `DEFAULTS` (matching `plugin.yaml`) < `plugins.entries.superagent.settings` in `config.yaml` < `<HERMES_HOME>/plugin-data/superagent/settings.json` (what the connect form writes) < environment variables. A token that is empty or a `${...}` placeholder falls back to `SUPERAGENT_GITHUB_TOKEN`. `settings.json` is written atomically and chmod `600` where the platform supports it; the token is never returned by an endpoint (`token_set: true` says whether one exists).
+
+**Watch semantics.**
+
+- The **first successful poll is a baseline**: every existing comment and PR head is recorded as seen without creating a session, so connecting a busy repository does not replay its history.
+- Dedupe lives in the `gh_seen(key, seen_at)` table, so restarts do not duplicate work. Every unseen comment is marked seen before it is judged; a malformed comment cannot replay forever.
+- Bots (`*[bot]`, `github-actions`, `dependabot`) and the agent's own comments are ignored. `github_allowed_users` is an allow-list; empty means **nobody**.
+- `github_watch_mode: observe` records sessions as `observed` and launches nothing. A human promotes one later (the session is a normal chat session with its PR prompt and checkout path).
+- `github_watch_mode: auto` creates the session as `queued` and launches it. With `repo_path` configured, the PR is fetched into that clone (`+refs/pull/<n>/head:refs/superagent/pr-<n>`) and checked out as a detached worktree at `<data_dir>/workspaces/pr-<n>`, so the user's checkout and branch are untouched. If the checkout fails the session launches in `repo_path` with a `github` warning event; with no usable repository the session is marked `failed`.
+
 ---
 
 ## Testing
@@ -221,7 +258,7 @@ Run the test suite from the repository root:
 pytest -q
 ```
 
-The suite is hermetic: `tests/test_runner.py` and `tests/test_hardening.py` replace `Popen` with a fake, so no real `hermes` process is spawned. `tests/test_hardening.py` covers repo containment (missing/file/dot-dot/symlink escape), secret redaction, the 20k/2k caps, every `POST /ask` triage branch, and the runaway watchdog.
+The suite is hermetic: `tests/test_runner.py` and `tests/test_hardening.py` replace `Popen` with a fake, so no real `hermes` process is spawned. `tests/test_hardening.py` covers repo containment (missing/file/dot-dot/symlink escape), secret redaction, the 20k/2k caps, every `POST /ask` triage branch, and the runaway watchdog. The v0.3 GitHub tests are also offline: `tests/test_github.py` replaces the HTTP call at the `_urlopen` seam and git at the `git_runner` parameter, `tests/test_watcher.py` uses a canned client and a fake runner, and `tests/test_github_api.py` writes settings to a throwaway `HERMES_HOME` and patches the watcher/client singletons.
 
 Validate the plugin manifest and its registrations before shipping:
 

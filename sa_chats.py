@@ -68,18 +68,26 @@ CREATE TABLE IF NOT EXISTS state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS gh_seen (
+    key     TEXT PRIMARY KEY,
+    seen_at REAL NOT NULL
+);
 """
 
 # A chat is `queued` until a worker slot is free, `running` for the length of a
 # turn, then `idle` (waiting for the next user message) or `review` (work a
 # human should look at). `failed` and `cancelled` are terminal for that turn.
+# `observed` is a recorded request nobody launched yet: the GitHub watcher
+# creates these in observe mode and a human promotes them.
 QUEUED = "queued"
 RUNNING = "running"
 REVIEW = "review"
 IDLE = "idle"
 FAILED = "failed"
 CANCELLED = "cancelled"
-STATUSES = (QUEUED, RUNNING, REVIEW, IDLE, FAILED, CANCELLED)
+OBSERVED = "observed"
+STATUSES = (QUEUED, RUNNING, REVIEW, IDLE, FAILED, CANCELLED, OBSERVED)
 
 # Columns a caller may change through update_session(). Everything else
 # (id, created_at, ...) is owned by the store.
@@ -410,3 +418,59 @@ class ChatStore:
         with self._connect() as conn:
             row = conn.execute("SELECT 1 FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
         return row is not None
+
+    # -- state -----------------------------------------------------------
+    #
+    # Small key/value pairs the watcher keeps between polls (and restarts).
+    # The `state` table already exists for the ticket/chat sequences.
+
+    def get_state(self, key: str, default: str = "") -> str:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM state WHERE key = ?", (str(key),)).fetchone()
+        return str(row["value"]) if row is not None else default
+
+    def set_state(self, key: str, value: Any) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO state(key, value) VALUES(?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(key), str(value)),
+            )
+
+    # -- dedupe ----------------------------------------------------------
+    #
+    # The GitHub watcher has to remember which comments, PR heads and
+    # baselines it already handled. The rows live in SQLite, not in memory, so
+    # a restart does not replay every comment on a busy pull request.
+
+    def mark_seen(self, key: str) -> None:
+        """Record `key` as handled. Idempotent; empty keys are ignored."""
+        key = str(key or "").strip()
+        if not key:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO gh_seen(key, seen_at) VALUES(?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET seen_at = excluded.seen_at",
+                (key, time.time()),
+            )
+
+    def is_seen(self, key: str) -> bool:
+        key = str(key or "").strip()
+        if not key:
+            return False
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM gh_seen WHERE key = ?", (key,)).fetchone()
+        return row is not None
+
+    def clear_seen(self, prefix: str = "") -> int:
+        """Delete dedupe rows starting with `prefix` (all of them when empty)."""
+        with self._connect() as conn:
+            if prefix:
+                cursor = conn.execute(
+                    "DELETE FROM gh_seen WHERE substr(key, 1, ?) = ?",
+                    (len(prefix), prefix),
+                )
+            else:
+                cursor = conn.execute("DELETE FROM gh_seen")
+        return int(cursor.rowcount or 0)
