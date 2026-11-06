@@ -1,16 +1,20 @@
 """Superagent dashboard backend, mounted at /api/plugins/superagent/.
 
-Read-only views over the ticket SQLite database for the desktop panel.
-All state changes go through the agent-turn tools (superagent_ask / tick /
-run), never through this backend — it only shows what needs a human.
+Ticket views plus desktop-initiated actions for the desktop tab.
+GET routes stay read-only; POST /ask records a ticket, POST /run queues
+an approved ticket, POST /tick returns a routing-pass summary (workers
+only launch from an agent turn, so this never launches). GET /sessions
+returns per-ticket enriched session rows for the desktop sessions grid.
 
 Imported by the gateway on its own, outside the plugin package, so this
 module is self-contained: stdlib sqlite3 only, no relative imports.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +29,48 @@ _TICKET_COLUMNS = (
     "request", "status", "verdict", "reason", "mode", "result", "error",
     "created_at", "updated_at", "started_at",
 )
+
+# Minimal copy of the ticket-store DDL so POST /ask works even on a fresh
+# machine (idempotent; existing tables are left alone).
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tickets (
+    id            TEXT PRIMARY KEY,
+    source        TEXT NOT NULL,
+    source_ref    TEXT,
+    repo          TEXT,
+    issue_number  INTEGER,
+    requester     TEXT,
+    request       TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    verdict       TEXT,
+    reason        TEXT,
+    mode          TEXT,
+    handle        TEXT,
+    result        TEXT,
+    error         TEXT,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    started_at    REAL
+);
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id  TEXT,
+    kind       TEXT NOT NULL,
+    detail     TEXT,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS seen (
+    source_key TEXT PRIMARY KEY,
+    seen_at    REAL NOT NULL
+);
+"""
+
+_RUNNABLE = ("observed", "blocked", "failed", "queued")
+_TICK_LAUNCH_NOTE = "workers are launched only from a Hermes agent turn (chat or cron)"
 
 
 def _db_path() -> Path:
@@ -43,6 +89,15 @@ def _connect_ro(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _connect_rw(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(_SCHEMA)
+    return conn
+
+
 def _brief(row: sqlite3.Row) -> dict[str, Any]:
     request = (row["request"] or "").strip().replace("\n", " ")
     return {
@@ -54,6 +109,49 @@ def _brief(row: sqlite3.Row) -> dict[str, Any]:
         "reason": row["reason"],
         "error": row["error"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _check_ticket_id(ticket_id: str) -> str:
+    ticket_id = (ticket_id or "").strip()
+    if not ticket_id or "/" in ticket_id or "\\" in ticket_id or ticket_id in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid ticket id")
+    return ticket_id
+
+
+def _session_row(ticket: sqlite3.Row, last_event: dict[str, Any] | None) -> dict[str, Any]:
+    request = (ticket["request"] or "").strip().replace("\n", " ")
+    worker_id: str | None = None
+    has_handle = False
+    try:
+        raw_handle = ticket["handle"] if "handle" in ticket.keys() else None
+    except Exception:
+        raw_handle = None
+    if raw_handle:
+        has_handle = True
+        try:
+            parsed = json.loads(raw_handle) if isinstance(raw_handle, str) else raw_handle
+            if isinstance(parsed, dict):
+                worker_id = parsed.get("subagent_id") or parsed.get("session_id")
+        except Exception:
+            worker_id = None
+    keys = ticket.keys()
+    return {
+        "id": ticket["id"],
+        "status": ticket["status"],
+        "source": ticket["source"],
+        "requester": ticket["requester"],
+        "request": request[:160] + ("…" if len(request) > 160 else ""),
+        "reason": ticket["reason"],
+        "error": ticket["error"],
+        "updated_at": ticket["updated_at"],
+        "created_at": ticket["created_at"],
+        "mode": ticket["mode"] if "mode" in keys else None,
+        "verdict": ticket["verdict"] if "verdict" in keys else None,
+        "result": ticket["result"] if "result" in keys else None,
+        "worker_id": worker_id,
+        "has_handle": has_handle,
+        "last_event": last_event,
     }
 
 
@@ -86,9 +184,7 @@ def get_ticket(ticket_id: str) -> dict[str, Any]:
     path = _db_path()
     if not path.is_file():
         raise HTTPException(status_code=503, detail="superagent database not found (no tickets yet)")
-    ticket_id = (ticket_id or "").strip()
-    if not ticket_id or "/" in ticket_id or "\\" in ticket_id or ticket_id in (".", ".."):
-        raise HTTPException(status_code=400, detail="invalid ticket id")
+    ticket_id = _check_ticket_id(ticket_id)
     with _connect_ro(path) as conn:
         row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         if row is None:
@@ -98,3 +194,122 @@ def get_ticket(ticket_id: str) -> dict[str, Any]:
             "SELECT * FROM events WHERE ticket_id = ? ORDER BY id DESC LIMIT 20", (ticket_id,))]
     ticket["events"] = events
     return ticket
+
+
+@router.get("/sessions")
+def list_sessions(limit: int = 50) -> dict[str, Any]:
+    path = _db_path()
+    if not path.is_file():
+        return {"db_exists": False, "sessions": []}
+    limit = max(1, min(limit, 100))
+    with _connect_ro(path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM tickets ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        sessions = []
+        for ticket in rows:
+            ev = conn.execute(
+                "SELECT kind, detail, created_at FROM events WHERE ticket_id = ?"
+                " ORDER BY id DESC LIMIT 1", (ticket["id"],)).fetchone()
+            last = dict(ev) if ev is not None else None
+            sessions.append(_session_row(ticket, last))
+    return {"db_exists": True, "sessions": sessions}
+
+
+@router.post("/ask")
+def ask_ticket(body: dict) -> dict[str, Any]:
+    request = str((body or {}).get("request") or "").strip()
+    if not request:
+        raise HTTPException(status_code=400, detail="request is required")
+    requester = str((body or {}).get("requester") or "desktop").strip() or "desktop"
+    if len(request) > 2000:
+        raise HTTPException(status_code=400, detail="request is too long (max 2000 chars)")
+    path = _db_path()
+    now = time.time()
+    with _connect_rw(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM state WHERE key = 'ticket_seq'").fetchone()
+        seq = int(row["value"]) if row else 0
+        seq += 1
+        conn.execute(
+            "INSERT INTO state(key, value) VALUES('ticket_seq', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(seq),),
+        )
+        ticket_id = f"T-{seq:04d}"
+        conn.execute(
+            "INSERT INTO tickets (id, source, source_ref, repo, issue_number, requester,"
+            " request, status, verdict, reason, mode, handle, result, error,"
+            " created_at, updated_at, started_at)"
+            " VALUES (?, 'desktop', NULL, NULL, NULL, ?, ?, 'observed', 'accept',"
+            " 'desktop ask', 'observe', NULL, NULL, NULL, ?, ?, NULL)",
+            (ticket_id, requester, request, now, now),
+        )
+        conn.execute(
+            "INSERT INTO events(ticket_id, kind, detail, created_at) VALUES (?, ?, ?, ?)",
+            (ticket_id, "created", "desktop request -> observed", now),
+        )
+        conn.execute(
+            "INSERT INTO events(ticket_id, kind, detail, created_at) VALUES (?, ?, ?, ?)",
+            (ticket_id, "assessed", "accept: desktop ask", now),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    assert row is not None
+    return {"ok": True, "ticket": _brief(row)}
+
+
+@router.post("/run")
+def run_ticket(body: dict) -> dict[str, Any]:
+    raw = (body or {}).get("ticket_id") or (body or {}).get("id")
+    if not raw:
+        raise HTTPException(status_code=400, detail="ticket_id is required")
+    ticket_id = _check_ticket_id(str(raw))
+    path = _db_path()
+    if not path.is_file():
+        raise HTTPException(status_code=503, detail="superagent database not found (no tickets yet)")
+    now = time.time()
+    with _connect_rw(path) as conn:
+        ticket = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if ticket is None:
+            raise HTTPException(status_code=404, detail=f"unknown ticket {ticket_id}")
+        if ticket["status"] not in _RUNNABLE:
+            raise HTTPException(
+                status_code=409,
+                detail=f"ticket {ticket_id} is {ticket['status']};"
+                " only observed, blocked, failed or queued tickets can be run",
+            )
+        conn.execute(
+            "UPDATE tickets SET status = 'queued', mode = 'manual', error = NULL,"
+            " updated_at = ? WHERE id = ?",
+            (now, ticket_id),
+        )
+        conn.execute(
+            "INSERT INTO events(ticket_id, kind, detail, created_at) VALUES (?, ?, ?, ?)",
+            (ticket_id, "promoted", "a human approved the work (desktop)", now),
+        )
+        conn.commit()
+        updated = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    assert updated is not None
+    return {"ok": True, "launched": False, "ticket": _brief(updated),
+            "warning": _TICK_LAUNCH_NOTE}
+
+
+@router.post("/tick")
+def tick(body: dict | None = None) -> dict[str, Any]:
+    _ = body  # accepted for forward-compat ({wait, launch}); currently a no-op summary
+    path = _db_path()
+    if not path.is_file():
+        return {"db_exists": False, "mode": "observe", "polled": 0, "created": [],
+                "launched": [], "finished": [], "warnings": [_TICK_LAUNCH_NOTE],
+                "waiting": 0, "counts": {}}
+    with _connect_ro(path) as conn:
+        counts = {row["status"]: row["n"] for row in conn.execute(
+            "SELECT status, COUNT(*) AS n FROM tickets GROUP BY status")}
+        latest = conn.execute(
+            "SELECT mode FROM tickets ORDER BY updated_at DESC LIMIT 1").fetchone()
+    mode = (latest["mode"] if latest and latest["mode"] else "observe")
+    running = counts.get("running", 0)
+    return {"db_exists": True, "mode": mode, "polled": 0, "created": [],
+            "launched": [], "finished": [], "warnings": [_TICK_LAUNCH_NOTE],
+            "waiting": running, "counts": counts,
+            "running": running, "queued": counts.get("queued", 0)}
