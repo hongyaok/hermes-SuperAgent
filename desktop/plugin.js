@@ -17,6 +17,14 @@
  * transcript, above the composer), and GitHub/Settings are mutually exclusive
  * overlay drawers — neither can reflow or resize the conversation.
  *
+ * The composer is one rounded box, not a stack of rows: an auto-growing field
+ * (two rows, eight at most) over one meta row carrying preset/model, the repo
+ * for new chats and send/stop. Drafts persist per target (`draft:<id>` and
+ * `draft:new`, debounced), a send paints the user's text as an optimistic
+ * bubble until the server's own row arrives, and Enter / Cmd+Enter send while
+ * Shift+Enter breaks the line. The backend's 8 000-character cap is the
+ * contract; the counter only warns.
+ *
  * The ticket pane and the status-bar chip stay (they answer "does a human need
  * to look at anything?"); the route page is chat-only.
  *
@@ -978,7 +986,7 @@ function WaitingCard({ session }) {
   })
 }
 
-function Transcript({ session }) {
+function Transcript({ session, optimistic }) {
   const items = useMemo(() => buildTranscript(session), [session])
   const blocks = useMemo(() => groupTranscript(items), [items])
   const boxRef = useRef(null)
@@ -989,6 +997,15 @@ function Transcript({ session }) {
   const running = isBusy(session)
   const hasAnswer = items.some((item) => item.kind === 'message' && item.role !== 'user')
   const waiting = !!session && !hasAnswer && (session.status === 'queued' || session.status === 'running')
+  // An optimistic turn is a local bubble until the server's own user row
+  // lands. Counting matching rows means sending the same text twice still
+  // shows a bubble the second time, and never paints two for one send.
+  const pending = optimistic && optimistic.text ? optimistic : null
+  const pendingShown = pending
+    ? items.filter((item) => item.kind === 'message' && item.role === 'user' &&
+        String(item.content || '').trim() === pending.text).length
+    : 0
+  const showPending = !!pending && pendingShown <= (Number(pending.seen) || 0)
 
   // Switching chats starts at the newest line; polling never moves the box
   // unless the reader was already at the bottom.
@@ -996,7 +1013,7 @@ function Transcript({ session }) {
   useEffect(() => {
     const el = boxRef.current
     if (el && stickRef.current) el.scrollTop = el.scrollHeight
-  }, [sessionId, items.length, tail])
+  }, [sessionId, items.length, tail, showPending])
 
   const scrollToLatest = () => {
     stickRef.current = true
@@ -1017,6 +1034,24 @@ function Transcript({ session }) {
     : []
 
   if (waiting) body.push(jsx(WaitingCard, { key: 'waiting', session }))
+  if (showPending) {
+    body.push(jsxs('div', {
+      key: 'pending',
+      'data-pending': '1',
+      className: 'flex max-w-[85%] min-w-0 flex-col items-end gap-0.5 self-end',
+      children: [
+        jsx('div', {
+          key: 'b',
+          className: cn('min-w-0 rounded-lg bg-(--chrome-action-hover) px-3 py-1.5',
+            'whitespace-pre-wrap break-words text-sm leading-relaxed text-(--ui-text-secondary) opacity-70'),
+          children: pending.text,
+        }),
+        jsx('span', {
+          key: 't', className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: 'Sending…',
+        }),
+      ],
+    }))
+  }
   if (!body.length) {
     body.push(jsx('div', {
       key: 'empty', className: 'text-xs text-(--ui-text-tertiary)', children: 'No transcript yet.',
@@ -1451,36 +1486,65 @@ function SettingsPanel({ settings, models, loading, error, onRetry }) {
 
 // -- composer ---------------------------------------------------------------
 
-/** Named preset chips above the composer. Picking one fills the model and
- *  leaves the ModelPicker available for an ad-hoc choice. */
-function PresetChips({ presets, active, disabled, onPick }) {
-  const list = Array.isArray(presets) ? presets : []
-  if (!list.length) return null
-  return jsxs('div', {
-    role: 'group', 'aria-label': 'Model presets',
-    className: 'flex flex-wrap items-center gap-1',
-    children: [
-      jsx('span', { key: 'l', className: 'shrink-0 pr-0.5', children: 'Preset' }),
-      ...list.map((preset) => {
-        const name = String(preset.name || '')
-        const selected = name === active
-        return jsx('button', {
-          key: name,
-          type: 'button',
-          'aria-pressed': selected,
-          disabled,
-          title: presetLabelText(preset),
-          onClick: () => onPick(preset),
-          className: cn('rounded border px-1.5 py-0.5 text-[0.6875rem]',
-            selected
-              ? 'border-(--ui-stroke-secondary) bg-(--chrome-action-hover) text-(--ui-text-secondary)'
-              : 'border-transparent text-(--ui-text-quaternary) hover:border-(--ui-stroke-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary)',
-            disabled && 'opacity-50'),
-          children: name,
-        })
-      }),
-    ],
-  })
+// Drafts belong to a target, never to the page: one bucket per chat plus one
+// for the new-chat box, so switching chats cannot bleed text between them.
+const DRAFT_NEW_KEY = 'draft:new'
+const DRAFT_DEBOUNCE = 300
+// The box grows with its text up to eight rows, then scrolls. Fixed numbers
+// keep the height deterministic even when computed styles are unavailable.
+const COMPOSER_ROWS = 2
+const COMPOSER_MAX_ROWS = 8
+const COMPOSER_ROW_PX = 24
+const COMPOSER_PAD_PX = 16
+const COMPOSER_MIN_PX = COMPOSER_ROWS * COMPOSER_ROW_PX + COMPOSER_PAD_PX
+const COMPOSER_MAX_PX = COMPOSER_MAX_ROWS * COMPOSER_ROW_PX + COMPOSER_PAD_PX
+// The backend cap (8000) is the contract; the counter warns, it never clips.
+const COMPOSER_MAX_CHARS = 8000
+const COMPOSER_WARN_CHARS = 6400
+const COMPOSER_COUNTER_AT = 1000
+const RECENT_REPO_LIMIT = 5
+const RECENT_REPO_LIST_ID = 'superagent-recent-repos'
+
+function draftKeyFor(sessionId) {
+  return sessionId ? `draft:${sessionId}` : DRAFT_NEW_KEY
+}
+
+/** Last repos this person sent work into. A datalist, not a picker: the field
+ *  stays free text and the browser only offers what was used before. */
+function readRecentRepos() {
+  const raw = readStored('recentRepos', '')
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((entry) => typeof entry === 'string' && entry.trim())
+      .slice(0, RECENT_REPO_LIMIT)
+  } catch (error) {
+    // A corrupt list is not worth an error card; the field still works.
+    return []
+  }
+}
+
+function rememberRepo(repo) {
+  const value = String(repo || '').trim()
+  if (!value) return readRecentRepos()
+  const next = [value]
+    .concat(readRecentRepos().filter((entry) => entry !== value))
+    .slice(0, RECENT_REPO_LIMIT)
+  writeStored('recentRepos', JSON.stringify(next))
+  return next
+}
+
+/** Grows the textarea to its content, capped at eight rows; past the cap the
+ *  box scrolls instead of pushing the transcript off the page. */
+function fitTextarea(el) {
+  if (!el || !el.style) return
+  el.style.height = 'auto'
+  const full = Number(el.scrollHeight) || 0
+  const next = Math.min(Math.max(full, COMPOSER_MIN_PX), COMPOSER_MAX_PX)
+  el.style.height = `${next}px`
+  el.style.overflowY = full > COMPOSER_MAX_PX ? 'auto' : 'hidden'
 }
 
 /** `provider: model` for a preset (mirrors the backend's label). */
@@ -1491,72 +1555,214 @@ function presetLabelText(preset) {
   return name || provider
 }
 
+/** One chip means one preset: the name, plus a ✕ that hands the model back to
+ *  the picker. With no preset picked, a native select is the way in. */
+function PresetControl({ presets, active, disabled, onPick, onClear }) {
+  const list = Array.isArray(presets) ? presets : []
+  if (!list.length) return null
+  if (active) {
+    const preset = list.find((entry) => String((entry && entry.name) || '') === active)
+    return jsxs('span', {
+      'data-preset': active,
+      title: preset ? presetLabelText(preset) : active,
+      className: cn('inline-flex max-w-[12rem] min-w-0 shrink-0 items-center gap-0.5 rounded',
+        'border border-(--ui-stroke-secondary) bg-(--chrome-action-hover) px-1.5 py-0.5',
+        'text-[0.6875rem] text-(--ui-text-secondary)'),
+      children: [
+        jsx('span', { key: 'n', className: 'min-w-0 truncate', children: active }),
+        jsx('button', {
+          key: 'x', type: 'button', disabled,
+          'aria-label': `Clear preset ${active}`, title: 'Clear preset',
+          onClick: onClear,
+          className: cn('shrink-0 rounded px-0.5 leading-none text-(--ui-text-quaternary)',
+            'hover:text-(--ui-text-secondary) disabled:opacity-50'),
+          children: '×',
+        }),
+      ],
+    })
+  }
+  return jsxs('select', {
+    value: '', disabled, 'aria-label': 'Model preset',
+    onChange: (event) => {
+      const picked = list.find((entry) => String((entry && entry.name) || '') === event.target.value)
+      if (picked) onPick(picked)
+    },
+    className: cn('max-w-[9rem] shrink-0 rounded border border-(--ui-stroke-secondary) bg-transparent',
+      'px-1 py-0.5 text-[0.6875rem] text-(--ui-text-quaternary)'),
+    children: [
+      jsx('option', { key: 'none', value: '', children: 'Preset…' }),
+      ...list.map((preset) => jsx('option', {
+        key: String((preset && preset.name) || ''),
+        value: String((preset && preset.name) || ''),
+        children: String((preset && preset.name) || ''),
+      })),
+    ],
+  })
+}
+
+/** One calm box: the textarea, then a meta row that carries the model/preset,
+ *  the repo (new chats only) and the send/stop action. Nothing else is
+ *  bordered — an empty composer is one 64px field plus one 30px row. */
 function Composer(props) {
   const { mode, session, draft, onDraft, onSend, pending, error,
     model, onModelChange, repo, onRepoChange, models, inputRef,
-    onSessionModel, modelPending, presets, presetName, onPreset } = props
+    onSessionModel, modelPending, presets, presetName, onPreset, onPresetClear,
+    onStop, stopPending, recentRepos } = props
   const busy = isBusy(session)
-  const canSend = !!String(draft || '').trim() && !pending && !busy
+  const text = String(draft == null ? '' : draft)
+  const canSend = !!text.trim() && !pending && !busy
+  // The one sentence that explains a disabled Send, in priority order.
+  const reason = pending
+    ? 'Sending…'
+    : busy
+      ? 'Waiting for this turn to finish'
+      : !text.trim() ? 'Type a message' : ''
   const placeholder = mode === 'session'
     ? (busy ? 'Waiting for this turn to finish…' : 'Reply to this chat…')
     : 'Describe the work…'
-  const meta = mode === 'session'
+  const repos = Array.isArray(recentRepos) ? recentRepos : []
+  const sentRef = useRef(false)
+
+  // Auto-grow on every value change: the field is as tall as its text (up to
+  // eight rows), so the page never jumps when a draft starts.
+  useEffect(() => {
+    fitTextarea(inputRef && inputRef.current)
+  }, [draft, mode])
+
+  // After a send, focus stays in the box — once it is enabled again.
+  useEffect(() => {
+    if (!sentRef.current || pending || busy) return
+    sentRef.current = false
+    const el = inputRef && inputRef.current
+    if (el && typeof el.focus === 'function' && typeof document !== 'undefined' && document.activeElement !== el) {
+      el.focus()
+    }
+  }, [pending, busy, draft])
+
+  // Leaving the chat (or closing the new-chat box) drops a pending refocus:
+  // a long turn must never pull the keyboard back minutes later.
+  useEffect(() => { sentRef.current = false }, [mode, session && session.id])
+
+  const send = () => {
+    sentRef.current = true
+    onSend()
+  }
+
+  const left = mode === 'session'
     ? [
         jsx(SessionModelControl, {
           key: 'model', session, models, pending: modelPending, onChange: onSessionModel,
         }),
       ]
     : [
-        jsx(ModelPicker, { key: 'picker', value: model, models, disabled: pending, onChange: onModelChange }),
-        jsx('input', {
-          key: 'repo', type: 'text', value: repo, placeholder: 'repo path (optional)',
-          onChange: (event) => onRepoChange(event.target.value),
-          className: cn('min-w-0 flex-1 rounded border border-(--ui-stroke-secondary) bg-transparent',
-            'px-1.5 py-1 text-[0.6875rem] text-(--ui-text-secondary)',
-            'placeholder:text-(--ui-text-quaternary) focus:outline-none'),
+        jsx(PresetControl, {
+          key: 'preset', presets, active: presetName, disabled: pending,
+          onPick: onPreset, onClear: onPresetClear,
         }),
-        jsx('span', { key: 'hint', className: 'shrink-0', children: 'Enter sends · Shift+Enter newline' }),
+        jsx(ModelPicker, { key: 'picker', value: model, models, disabled: pending, onChange: onModelChange }),
+        jsxs('span', {
+          key: 'repo', className: 'flex min-w-0 flex-1 basis-[9rem] items-center',
+          children: [
+            jsx('input', {
+              key: 'i', type: 'text', value: repo, list: RECENT_REPO_LIST_ID,
+              placeholder: 'repo path (optional)', 'aria-label': 'Repository path',
+              onChange: (event) => onRepoChange(event.target.value),
+              className: cn('min-w-0 flex-1 bg-transparent px-1 py-0.5 text-[0.6875rem]',
+                'text-(--ui-text-secondary) placeholder:text-(--ui-text-quaternary)',
+                'focus:outline-none disabled:opacity-60'),
+            }),
+            jsx('datalist', {
+              key: 'd', id: RECENT_REPO_LIST_ID,
+              children: repos.map((entry, index) => jsx('option', { key: `${index}:${entry}`, value: entry })),
+            }),
+          ],
+        }),
       ]
 
-  return jsxs('div', {
-    className: 'flex flex-col gap-1.5',
+  const counter = text.length > COMPOSER_COUNTER_AT
+    ? jsx('span', {
+        key: 'count',
+        'data-over': text.length > COMPOSER_WARN_CHARS ? '1' : '0',
+        title: `${text.length} of ${COMPOSER_MAX_CHARS} characters`,
+        className: cn('shrink-0 tabular-nums',
+          text.length > COMPOSER_WARN_CHARS
+            ? 'text-(--ui-text-secondary)'
+            : 'text-(--ui-text-quaternary)'),
+        children: `${text.length} / ${COMPOSER_MAX_CHARS}`,
+      })
+    : null
+
+  const sendButton = jsxs('button', {
+    type: 'button', disabled: !canSend, onClick: send,
+    'aria-label': 'Send', title: reason || 'Send this message (Enter)',
+    className: cn('inline-flex h-6 shrink-0 items-center gap-1 rounded bg-(--chrome-action-hover)',
+      'px-2 text-[0.6875rem] font-medium text-(--ui-text-secondary) hover:opacity-90',
+      !canSend && 'opacity-40'),
     children: [
-      error ? jsx('div', { key: 'err', className: 'truncate text-[0.6875rem] text-(--ui-text-quaternary)', children: error }) : null,
-      mode === 'new'
-        ? jsx(PresetChips, {
-            key: 'presets', presets, active: presetName, disabled: pending, onPick: onPreset,
+      jsx('span', { key: 'g', 'aria-hidden': 'true', children: '↑' }),
+      jsx('span', { key: 'l', className: 'hidden sm:inline', children: pending ? 'Sending…' : 'Send' }),
+    ],
+  })
+
+  return jsxs('div', {
+    'data-composer': mode,
+    className: cn('flex shrink-0 flex-col overflow-hidden rounded-lg border',
+      'border-(--ui-stroke-secondary) bg-(--ui-bg-primary)'),
+    children: [
+      error
+        ? jsx('div', {
+            key: 'err', role: 'alert',
+            className: 'px-3 pt-2 text-[0.6875rem] text-(--ui-text-secondary)',
+            children: error,
           })
         : null,
-      jsxs('div', {
-        key: 'row', className: 'flex items-end gap-2',
-        children: [
-          jsx('textarea', {
-            key: 'input', ref: inputRef, rows: 2, value: draft,
-            disabled: pending || busy, placeholder,
-            'aria-label': mode === 'session' ? 'Reply to this chat' : 'Describe the work',
-            onChange: (event) => onDraft(event.target.value),
-            onKeyDown: (event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault()
-                onSend()
-              }
-            },
-            className: cn('min-h-16 min-w-0 flex-1 resize-none rounded-lg border border-(--ui-stroke-secondary)',
-              'bg-transparent px-3 py-2 text-sm leading-relaxed text-(--ui-text-secondary)',
-              'placeholder:text-(--ui-text-quaternary) focus:outline-none disabled:opacity-60'),
-          }),
-          jsx('button', {
-            key: 'send', type: 'button', disabled: !canSend, onClick: onSend,
-            title: 'Send (Enter)',
-            className: cn('shrink-0 self-end rounded bg-(--ui-bg-quaternary) px-3 py-1.5 text-xs',
-              'text-(--ui-text-primary) hover:bg-(--chrome-action-hover)', !canSend && 'opacity-50'),
-            children: pending ? (mode === 'session' ? 'Sending…' : 'Starting…') : 'Send',
-          }),
-        ],
+      jsx('textarea', {
+        key: 'input', ref: inputRef, rows: COMPOSER_ROWS, value: draft,
+        disabled: pending || busy, placeholder,
+        'aria-label': mode === 'session' ? 'Reply to this chat' : 'Describe the work',
+        onChange: (event) => onDraft(event.target.value),
+        onKeyDown: (event) => {
+          if (event.key === 'Escape') {
+            // Escape gives the keyboard back; it never clears the draft.
+            if (inputRef && inputRef.current) inputRef.current.blur()
+            return
+          }
+          if (event.key !== 'Enter') return
+          // An IME candidate window owns Enter; never send mid-composition.
+          if (event.nativeEvent && event.nativeEvent.isComposing) return
+          if (event.shiftKey) return
+          // Enter, Ctrl+Enter and Cmd+Enter send. Only this box listens, so no
+          // global shortcut is claimed anywhere else on the page.
+          event.preventDefault()
+          if (!canSend) return
+          send()
+        },
+        className: cn('min-h-16 w-full resize-none bg-transparent px-3 pt-2 pb-1',
+          'text-sm leading-relaxed text-(--ui-text-secondary)',
+          'placeholder:text-(--ui-text-quaternary) focus:outline-none disabled:opacity-60'),
       }),
       jsxs('div', {
-        key: 'meta', className: 'flex flex-wrap items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)',
-        children: meta,
+        key: 'meta',
+        className: cn('flex min-w-0 flex-wrap items-center gap-1.5 px-2 pt-0.5 pb-1.5',
+          'text-[0.6875rem] text-(--ui-text-quaternary)'),
+        children: [
+          ...left,
+          jsxs('div', {
+            key: 'act', className: 'ml-auto flex shrink-0 items-center gap-1',
+            children: [
+              counter,
+              busy && typeof onStop === 'function'
+                ? jsx(GhostButton, {
+                    key: 'stop', className: 'h-6 shrink-0 px-1.5 py-0',
+                    onClick: onStop, disabled: stopPending,
+                    title: 'Stop this turn', 'aria-label': 'Stop this turn',
+                    children: stopPending ? 'Stopping…' : 'Stop',
+                  })
+                : null,
+              jsx(Tip, { key: 'send', label: reason || 'Send this message (Enter)', children: sendButton }),
+            ],
+          }),
+        ],
       }),
     ],
   })
@@ -1844,11 +2050,10 @@ function OverflowMenu({ items, label }) {
 
 /** Two lines and three actions: title + status dot, then model · repo · PR.
  *  Comment-on-PR and the workspace tile live behind the ⋯ menu. */
-function ChatHeader({ session, onStop, stopPending, tile, diff, comment }) {
+function ChatHeader({ session, tile, diff, comment }) {
   const canOpen = !!session.hermes_session_id && !!(host && typeof host.openSession === 'function')
   const canTile = !tile && !!(host && typeof host.openWorkspace === 'function')
   const repo = String(session.repo || '').trim()
-  const busy = isBusy(session)
   const detail = String(session.error || '').trim()
 
   const overflow = []
@@ -1935,10 +2140,6 @@ function ChatHeader({ session, onStop, stopPending, tile, diff, comment }) {
             onClick: () => { host.openSession(session.hermes_session_id).catch(() => {}) },
             children: 'Open',
           }) : null,
-          busy && typeof onStop === 'function' ? jsx(GhostButton, {
-            key: 'stop', title: 'Stop this turn', onClick: onStop, disabled: stopPending,
-            children: stopPending ? 'Stopping…' : 'Stop',
-          }) : null,
           jsx(OverflowMenu, { key: 'more', items: overflow, label: 'More actions' }),
         ],
       }),
@@ -1947,7 +2148,7 @@ function ChatHeader({ session, onStop, stopPending, tile, diff, comment }) {
 }
 
 function ChatCenter(props) {
-  const { summary, detail, onStop, stopPending, canComment, sessions, onSelect, banner, ...composerProps } = props
+  const { summary, detail, canComment, sessions, onSelect, banner, optimistic, ...composerProps } = props
   const session = (detail && detail.data && detail.data.session) || summary
   const sessionId = session && session.id
   const busy = isBusy(session)
@@ -1996,7 +2197,7 @@ function ChatCenter(props) {
     className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-3',
     children: [
       jsx(ChatHeader, {
-        key: 'head', session, onStop, stopPending,
+        key: 'head', session,
         diff: diffAction, comment: commentAction,
       }),
       banner ? jsx('div', { key: 'banner', className: 'shrink-0', children: banner }) : null,
@@ -2005,7 +2206,7 @@ function ChatCenter(props) {
             key: 'err', title: `Could not load ${session.id}.`, error: detail.error,
             onRetry: () => detail.refetch(),
           })
-        : jsx(Transcript, { key: 'transcript', session }),
+        : jsx(Transcript, { key: 'transcript', session, optimistic }),
       diffOpen && hasRepo
         ? jsx(DiffPanel, {
             key: 'diff', session, query: diffQuery, onClose: () => setDiffOpen(false),
@@ -2607,7 +2808,16 @@ function SuperagentPage() {
   const chatsQuery = useChats()
   const modelsQuery = useModels()
   const [selectedId, setSelectedId] = useState(null)
-  const [draft, setDraft] = useState('')
+  // The draft is per target; `draft:new` starts the page, a chat restores its
+  // own bucket as soon as it is selected. Nothing here ever reads the server's
+  // `prompt` field — that would overwrite what the person is typing.
+  const [draft, setDraft] = useState(() => readStored(DRAFT_NEW_KEY, ''))
+  const draftKeyRef = useRef(DRAFT_NEW_KEY)
+  const draftRef = useRef(draft)
+  draftRef.current = draft
+  // The user's text, shown as a bubble until the server's own row lands.
+  const [optimistic, setOptimistic] = useState(null)
+  const [recentRepos, setRecentRepos] = useState(() => readRecentRepos())
   const [model, setModel] = useState(() => ({
     model: readStored('lastModel', ''), provider: readStored('lastProvider', ''),
   }))
@@ -2624,6 +2834,27 @@ function SuperagentPage() {
   // Focus returns here when a drawer closes (Escape, ✕, or a pick inside it).
   const githubRef = useRef(null)
   const settingsRef = useRef(null)
+
+  // One bucket per target. Switching flushes the outgoing text *before* the
+  // key moves, so a click 50ms after a keystroke cannot drop the draft.
+  useEffect(() => {
+    const key = draftKeyFor(selectedId)
+    if (key === draftKeyRef.current) return
+    writeStored(draftKeyRef.current, draftRef.current)
+    draftKeyRef.current = key
+    setDraft(readStored(key, ''))
+    setOptimistic(null)
+  }, [selectedId])
+
+  // Debounced, so typing never writes storage on every keystroke.
+  useEffect(() => {
+    const key = draftKeyRef.current
+    const timer = setTimeout(() => writeStored(key, draft), DRAFT_DEBOUNCE)
+    return () => clearTimeout(timer)
+  }, [draft])
+
+  // Leaving the page keeps the last keystroke, even inside the debounce window.
+  useEffect(() => () => { writeStored(draftKeyRef.current, draftRef.current) }, [])
 
   const data = chatsQuery.data
   const sessions = useMemo(() => {
@@ -2701,11 +2932,39 @@ function SuperagentPage() {
     setChatModel.mutate({ id: selectedSession.id, model: pickedModel, provider: pickedProvider })
   }
 
+  /** How many rows in the open transcript already carry this exact text, so an
+   *  optimistic bubble is replaced — never duplicated — when the server's own
+   *  user message lands. */
+  const userMessageCount = (text) => {
+    const session = selectedSession
+    if (!session) return 0
+    let count = String(session.prompt || '').trim() === text ? 1 : 0
+    for (const message of session.messages || []) {
+      if (message && message.role === 'user' && String(message.content || '').trim() === text) count += 1
+    }
+    return count
+  }
+
   const submit = () => {
     const text = String(draft || '').trim()
     if (!text || pending || busyTurn) return
+    const key = draftKeyRef.current
+    const sentRepo = String(repo || '').trim()
+    // The bubble goes up now; the draft stays in the (disabled) box so a
+    // failed send loses nothing.
+    setOptimistic({ text, seen: userMessageCount(text) })
+    const clear = (nextRepos) => {
+      setDraft('')
+      writeStored(key, '')
+      setOptimistic(null)
+      if (nextRepos) setRecentRepos(nextRepos)
+    }
+    const failed = () => setOptimistic(null)
     if (selectedId) {
-      sendChat.mutate({ id: selectedId, content: text }, { onSuccess: () => setDraft('') })
+      sendChat.mutate({ id: selectedId, content: text }, {
+        onSuccess: () => clear(null),
+        onError: failed,
+      })
       return
     }
     writeStored('lastModel', model.model)
@@ -2716,14 +2975,15 @@ function SuperagentPage() {
         prompt: text, model: model.model, provider: model.provider, repo,
         preset: presetName || undefined,
       },
-      { onSuccess: () => setDraft('') },
+      {
+        onSuccess: () => clear(sentRepo ? rememberRepo(sentRepo) : null),
+        onError: failed,
+      },
     )
   }
 
-  const select = (id) => {
-    setSelectedId(id)
-    setDraft('')
-  }
+  // Selection restores that chat's own bucket; the effect above does the work.
+  const select = (id) => setSelectedId(id)
 
   const pickPreset = (preset) => {
     if (!preset) return
@@ -2752,8 +3012,9 @@ function SuperagentPage() {
   }
 
   const newChat = () => {
+    // The draft is not cleared here: the new-chat bucket (or an in-progress
+    // empty box) is what the page should show.
     setSelectedId(null)
-    setDraft('')
     setPresetName('')
     setModel({ model: readStored('lastModel', ''), provider: readStored('lastProvider', '') })
     setRepo(readStored('lastRepo', ''))
@@ -2854,16 +3115,17 @@ function SuperagentPage() {
           jsx(SessionsRail, { key: 'rail', sessions, selectedId, onSelect: select }),
           jsx(ChatCenter, {
             key: 'center', summary: selectedSummary, detail,
-            sessions, onSelect: select, banner: onboarding,
+            sessions, onSelect: select, banner: onboarding, optimistic,
             draft, onDraft: setDraft, onSend: submit, onStop: stop,
             pending, stopPending, error: failure,
             // The PR comment needs a saved token; the status query already
             // polls while a PR badge is on the board, so this is free.
             canComment: !!(githubQuery.data && githubQuery.data.token_set),
             model, onModelChange: changeModel, repo, onRepoChange: setRepo,
-            models: modelsQuery.data, inputRef,
+            models: modelsQuery.data, inputRef, recentRepos,
             onSessionModel: changeSessionModel, modelPending: setChatModel.isPending,
             presets: presetList, presetName, onPreset: pickPreset,
+            onPresetClear: () => setPresetName(''),
           }),
         ],
       }),
