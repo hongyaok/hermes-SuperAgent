@@ -510,8 +510,27 @@ def test_reap_cancels_an_expired_turn_with_a_reason_event(chat):
     detail = chat.get_session(session["id"])
     assert detail["status"] == "cancelled"
     assert "timed out" in detail["error"]
+    assert "while running" in detail["error"]
     cancelled = next(event for event in detail["events"] if event["kind"] == "cancelled")
     assert "timed out" in cancelled["detail"]
+    assert "while running" in cancelled["detail"]
+
+
+def test_reap_says_when_a_queued_turn_timed_out(chat):
+    runner = make_runner(chat)
+    session = chat.create_session("waiting")
+    chat.update_session(session["id"], status="queued", started_at=time.time() - 1900)
+
+    expired = runner.reap(now=time.time(), timeout_seconds=1800)
+    assert [row["id"] for row in expired] == [session["id"]]
+    assert "while queued" in expired[0]["reason"]
+    assert "while running" not in expired[0]["reason"]
+
+    detail = chat.get_session(session["id"])
+    assert detail["status"] == "cancelled"
+    assert "while queued" in (detail["error"] or "")
+    cancelled = next(event for event in detail["events"] if event["kind"] == "cancelled")
+    assert "while queued" in cancelled["detail"]
 
 
 def test_reap_leaves_recent_turns_alone(chat):
@@ -543,6 +562,7 @@ def test_reap_kills_a_live_process_and_keeps_the_timeout_reason(chat, popen):
 
     detail = chat.get_session(session["id"])
     assert "timed out" in (detail["error"] or "")
+    assert "while running" in (detail["error"] or "")
     assert any("timed out" in event["detail"] for event in detail["events"])
 
 

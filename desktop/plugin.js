@@ -219,6 +219,41 @@ function sessionTitle(session) {
   return line ? clip(line, 72) : session.id
 }
 
+/**
+ * Toast once per finished turn.
+ *
+ * `previous` is the status map from the last poll, or null before the first
+ * one. The first pass only seeds it, so merely opening the page never replays
+ * completions that happened while it was closed. A chat that goes
+ * queued/running -> review/failed announces itself; `cancelled` is silent
+ * because the user (or the runaway guard) already stopped it deliberately.
+ * Returns the map the next poll should compare against.
+ */
+function announceCompletions(previous, sessions) {
+  const next = new Map()
+  const list = Array.isArray(sessions) ? sessions : []
+  for (const session of list) next.set(session.id, String(session.status || ''))
+  if (!previous) return next
+  const notify = host && typeof host.notify === 'function' ? host.notify : null
+  if (!notify) return next
+  for (const session of list) {
+    const before = previous.get(session.id)
+    const after = String(session.status || '')
+    if (before !== 'queued' && before !== 'running') continue
+    if (after !== 'review' && after !== 'failed') continue
+    const title = sessionTitle(session)
+    try {
+      notify({
+        kind: after === 'failed' ? 'error' : 'info',
+        message: after === 'failed' ? `${title} failed` : `${title} finished`,
+      })
+    } catch (error) {
+      // A host without working toasts must not break polling.
+    }
+  }
+  return next
+}
+
 function openUrl(url) {
   const target = String(url || '').trim()
   if (!target) return
@@ -1058,7 +1093,7 @@ function SettingsPanel({ settings, models, loading, error, onRetry, onClose }) {
                       })
                     : jsx('div', {
                         key: 'empty', className: 'px-1 py-2 text-xs text-(--ui-text-tertiary)',
-                        children: 'No presets yet — the built-in picker list is used.',
+                        children: 'No presets yet — use the model picker, or add one here.',
                       }),
                   jsx('div', {
                     key: 'add', className: 'flex items-center gap-2',
@@ -1441,10 +1476,16 @@ function ChatHeader({ session, onStop, stopPending, tile, diff, comment }) {
       children: 'Pull request',
     }))
   }
-  if (session.error) {
+  if (session.error || session.status === 'failed') {
+    // A failed session must say why in the header, not leave the status pill
+    // to imply it. Wider and slightly brighter than a passive meta item.
+    const detail = String(session.error || '').trim()
     meta.push(jsx('span', {
-      key: 'err', className: 'min-w-0 max-w-[22rem] truncate text-(--ui-text-quaternary)',
-      children: clip(session.error, 160),
+      key: 'err',
+      title: detail || 'No error text was recorded for this turn.',
+      className: cn('min-w-0 max-w-[26rem] truncate',
+        session.status === 'failed' ? 'text-(--ui-text-secondary)' : 'text-(--ui-text-quaternary)'),
+      children: detail ? `error: ${clip(detail, 200)}` : 'failed: no error recorded',
     }))
   }
 
@@ -1605,7 +1646,10 @@ function WorkerFeed({ session }) {
         return clip(detail ? `${kind}: ${detail}` : kind, 120)
       })
     : (() => {
-        const fallback = String(session.last_event || '').replace(/\s+/g, ' ').trim()
+        // A failed card's first question is "why" — show the stored error
+        // before the generic last event when no mini-feed arrived.
+        const failure = session.status === 'failed' ? firstLine(session.error) : ''
+        const fallback = failure || String(session.last_event || '').replace(/\s+/g, ' ').trim()
         return fallback ? [clip(fallback, 120)] : []
       })()
   if (!lines.length) return null
@@ -1981,7 +2025,7 @@ function GithubPanel({ status, prs, prsLoading, onSelectSession }) {
 const ONBOARDING_STEPS = [
   {
     title: 'Pick a model / preset',
-    hint: 'Set a default in Settings, or tap a preset chip before your first chat.',
+    hint: 'Set a default in Settings, or use the model picker in the composer.',
     action: 'Open settings',
     key: 'settings',
   },
@@ -2072,6 +2116,12 @@ function SuperagentPage() {
   const sessions = useMemo(() => {
     return ((data && data.sessions) || []).slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))
   }, [data])
+  // Completion toasts: diff statuses poll by poll. The ref is seeded by the
+  // first effect run, so mounting the page never replays old completions.
+  const previousStatus = useRef(null)
+  useEffect(() => {
+    previousStatus.current = announceCompletions(previousStatus.current, sessions)
+  }, [sessions])
   const counts = (data && data.counts) || {}
   const running = (data && data.running) || 0
   const queued = counts.queued || 0
@@ -2426,15 +2476,29 @@ function SuperagentPane() {
 function SuperagentChip() {
   const tickets = useTickets()
   const chats = useChats()
-  const attention = (tickets.data && tickets.data.attention && tickets.data.attention.length) || 0
-  const running = (chats.data && chats.data.running) || 0
-  const count = running || attention
-  const label = running ? `▶ ${running}` : attention > 0 ? `◆ ${attention}` : 'superagent'
-  const tip = running
-    ? `${running} Superagent chat${running === 1 ? '' : 's'} running`
-    : attention > 0
-      ? `${attention} ticket(s) need a human`
-      : 'Superagent: nothing needs you'
+  const chatData = chats.data
+  const counts = (chatData && chatData.counts) || {}
+  const running = (chatData && chatData.running) || 0
+  const waiting = (counts.review || 0) + (counts.failed || 0)
+  // Chats are the primary surface: the chip speaks for them as soon as the
+  // list returns. Ticket attention is only the fallback for a backend that has
+  // not answered at all (disabled plugin, first paint, older data source).
+  const ticketAttention = (tickets.data && tickets.data.attention && tickets.data.attention.length) || 0
+  const attention = chatData ? waiting : ticketAttention
+  const count = running + attention
+  const parts = []
+  if (running) parts.push(`▶ ${running}`)
+  if (attention) parts.push(`◆ ${attention}`)
+  const label = parts.length ? parts.join(' ') : 'superagent'
+  const unit = chatData ? 'chat' : 'ticket'
+  const plural = (n) => `${n} ${unit}${n === 1 ? '' : 's'}`
+  const tip = running && attention
+    ? `${plural(running)} running · ${plural(attention)} need you`
+    : running
+      ? `${plural(running)} running`
+      : attention > 0
+        ? (chatData ? `${plural(attention)} need review` : `${plural(attention)} need a human`)
+        : 'Superagent: nothing needs you'
   return jsx(Tip, {
     label: tip,
     children: jsx('span', {

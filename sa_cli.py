@@ -34,15 +34,10 @@ STATUS_ICONS = {
 }
 
 # Mirrors dashboard/plugin_api.py (the chat routes are the reference
-# implementation this CLI drives): same prompt cap, same preset defaults.
+# implementation this CLI drives): same prompt cap, same preset semantics.
 MAX_PROMPT_CHARS = 8000
 # Same comment cap the dashboard enforces; GitHub truncates silently past 65 536.
 MAX_COMMENT_CHARS = 20000
-DEFAULT_MODEL_PRESETS = [
-    "deepseek-v4.1-flash",
-    "qwen/qwen3.8-27b",
-    "z-ai/glm-5.3-flash",
-]
 
 # One Runner per database path, like the dashboard singleton: a CLI session
 # and an in-process dashboard share worker slots instead of racing.
@@ -171,10 +166,6 @@ def _config(ctx: Any, key: str, default: Any) -> Any:
         return default
 
 
-def _default_presets() -> list[dict[str, str]]:
-    return [{"name": name, "model": name, "provider": ""} for name in DEFAULT_MODEL_PRESETS]
-
-
 def models_payload(ctx: Any) -> dict:
     """Resolved default model/provider plus presets (same keys as GET /models)."""
     model = _env("SUPERAGENT_DEFAULT_MODEL") or str(_config(ctx, "default_model", "") or "").strip()
@@ -197,12 +188,15 @@ def models_payload(ctx: Any) -> dict:
             )
         except Exception:
             presets = []
-    if not presets:
-        presets = _default_presets()
+    # No presets configured is a valid answer: printing a hardcoded list would
+    # advertise models this machine may have no credentials for. The flat list
+    # still names the configured default so `models` is never empty for nothing.
     return {
         "default_model": model,
         "default_provider": provider,
-        "models": list(dict.fromkeys(preset["model"] for preset in presets)),
+        "models": list(dict.fromkeys(
+            [preset["model"] for preset in presets] + ([model] if model else [])
+        )),
         "presets": presets,
     }
 
@@ -228,16 +222,14 @@ def render_models(data: dict) -> str:
         "",
         "presets:",
     ]
-    presets = data.get("presets") or [
-        {"name": name, "model": name, "provider": ""} for name in data.get("models") or []
-    ]
+    presets = data.get("presets") or []
     if presets:
         for preset in presets:
             name = str(preset.get("name") or "")
             label = preset_label(preset)
             lines.append(f"  - {name} -> {label}")
     else:
-        lines.append("  (none)")
+        lines.append("  (none configured; use the model picker or set model_presets)")
     return "\n".join(lines)
 
 
@@ -277,7 +269,7 @@ def render_settings(data: dict) -> str:
             label = preset_label(preset)
             lines.append(f"    - {name} -> {label}")
     else:
-        lines.append("  model presets:      (none; built-in picker list is used)")
+        lines.append("  model presets:      (none configured)")
     return "\n".join(lines)
 
 
