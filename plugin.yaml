@@ -92,3 +92,10 @@ config_schema:
     default: 120
     label: Chat turn limit
     description: Maximum agent turns for one headless chat worker.
+  turn_timeout_seconds:
+    type: int
+    default: 1800
+    label: Chat turn time limit
+    description: >-
+      A queued or running chat turn older than this many seconds is cancelled by the
+      next reap or chat-list read (env SUPERAGENT_TURN_TIMEOUT_SECONDS). 0 disables the guard.
