@@ -1,0 +1,69 @@
+name: superagent
+version: 0.1.0
+description: >
+  Router/worker coding agent for one repository. Polls GitHub (or takes local
+  requests), turns accepted work into tickets, and runs each ticket in its own
+  Hermes subagent. Observe by default; a panel shows only what needs a human.
+author: Hermes
+provides_tools:
+  - superagent_ask
+  - superagent_tick
+  - superagent_status
+  - superagent_run
+config_schema:
+  mode:
+    type: str
+    choices: [off, observe, auto]
+    default: observe
+    label: Mode
+    description: "off = do nothing; observe = record requests only; auto = launch worker subagents."
+  repo_path:
+    type: str
+    default: ""
+    label: Repository path
+    description: Local clone the workers should work in.
+  github_repo:
+    type: str
+    default: ""
+    label: GitHub repository
+    description: "owner/name to poll for @mentions. Leave empty to use local requests only."
+  github_agent_login:
+    type: str
+    default: ""
+    label: Agent GitHub login
+    description: The account the agent acts as; mentions of it become requests.
+  github_allowed_users:
+    type: list
+    default: []
+    label: Allowed GitHub users
+    description: Only these logins may request work. Empty means nobody.
+  github_token:
+    type: secret
+    env: SUPERAGENT_GITHUB_TOKEN
+    label: GitHub token
+    description: Fine-grained token with issues read/write on the repository.
+  max_workers:
+    type: int
+    default: 2
+    label: Max parallel workers
+    description: How many worker subagents may run at once.
+  worker_toolsets:
+    type: list
+    default: [file, terminal]
+    label: Worker toolsets
+    description: Toolsets each worker subagent may use.
+  allow_proactive:
+    type: bool
+    default: false
+    label: Allow proactive work
+    description: Let the agent pick up unaddressed messages that match an action verb.
+  max_runtime_seconds:
+    type: int
+    default: 1800
+    label: Worker time limit
+    description: A worker still running after this many seconds is cancelled by the watchdog.
+  poll_limit:
+    type: int
+    default: 30
+    label: GitHub poll size
+    description: Maximum comments fetched per poll.
