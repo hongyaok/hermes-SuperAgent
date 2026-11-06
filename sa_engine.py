@@ -195,6 +195,38 @@ class Engine:
             "queued": counts.get(QUEUED, 0),
         }
 
+    def sessions(self, limit: int = 50, status: Optional[str] = None) -> dict:
+        """Sessions enrichment: list tickets as UI-ready session rows.
+
+        Read-only. Each row carries id, status, source, requester,
+        request (160-char preview), reason, error, handle,
+        result_preview (200-char preview), event_count, timestamps
+        (created_at / updated_at / started_at) and elapsed_secs
+        (now - started_at, falling back to created_at).
+        """
+        if hasattr(self.store, "list_tickets"):
+            tickets = self.store.list_tickets(status=status, limit=limit)
+        else:
+            tickets = self.store.list(status=status, limit=limit)
+        counts = self.store.count_by_status()
+        return {
+            "sessions": [self._session_row(t) for t in tickets],
+            "counts": counts,
+            "running": counts.get(RUNNING, 0),
+            "queued": counts.get(QUEUED, 0),
+        }
+
+    def get_ticket_detail(self, ticket_id: str) -> dict:
+        """Full ticket plus its audit event log. Raises KeyError when missing."""
+        ticket = self.store.get(ticket_id)
+        if not ticket:
+            raise KeyError(f"unknown ticket {ticket_id}")
+        if hasattr(self.store, "get_events"):
+            ticket["events"] = self.store.get_events(ticket_id)
+        else:
+            ticket["events"] = self.store.events(ticket_id)
+        return ticket
+
     def doctor(self) -> dict:
         repo = Path(self.settings.repo_path) if self.settings.repo_path else None
         checks = {
@@ -405,6 +437,35 @@ class Engine:
             "reason": ticket["reason"],
             "error": ticket.get("error"),
             "updated_at": ticket["updated_at"],
+        }
+
+    def _session_row(self, ticket: dict) -> dict:
+        request = (ticket.get("request") or "").strip().replace("\n", " ")
+        result = (ticket.get("result") or "").strip().replace("\n", " ")
+        if hasattr(self.store, "get_events"):
+            event_count = len(self.store.get_events(ticket["id"], limit=1000))
+        else:
+            event_count = len(self.store.events(ticket["id"], limit=1000))
+        base = ticket.get("started_at") or ticket.get("created_at") or time.time()
+        try:
+            elapsed_secs = time.time() - float(base)
+        except (TypeError, ValueError):
+            elapsed_secs = 0.0
+        return {
+            "id": ticket["id"],
+            "status": ticket["status"],
+            "source": ticket["source"],
+            "requester": ticket["requester"],
+            "request": request[:160] + ("…" if len(request) > 160 else ""),
+            "reason": ticket.get("reason"),
+            "error": ticket.get("error"),
+            "handle": ticket.get("handle"),
+            "result_preview": result[:200] + ("…" if len(result) > 200 else ""),
+            "event_count": event_count,
+            "created_at": ticket.get("created_at"),
+            "updated_at": ticket.get("updated_at"),
+            "started_at": ticket.get("started_at"),
+            "elapsed_secs": elapsed_secs,
         }
 
 

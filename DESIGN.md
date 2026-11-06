@@ -103,6 +103,40 @@ Starting in `observe` mode gives operators zero-risk visibility into the router:
 
 Every user-facing surface filters tickets through `NEEDS_ATTENTION = ("observed", "blocked", "review", "failed")`:
 
-- **CLI & Slash (`sa_cli.py`):** `render_status()` prints the `"Needs you:"` section first, or `"Nothing needs you."` when the attention queue is empty. `ignored` and routine `queued`/`running` noise never clutter the top section.
+- **CLI & Slash (`sa_cli.py`):** `render_status()` prints the `"Needs you:"` section first, or `"Nothing needs you."` when the attention queue is empty. `ignored` and routine `queued`/`running` noise never clutter the top section. `run <id>` promotes a ticket to `queued` (worker starts on the next agent turn); `show <id>` renders the full ticket plus its audit history.
 - **Automation Blueprint (`__init__.py`):** `Superagent watch` instructs the cron turn to call `superagent_tick(wait=true)` and report **only** tickets in `blocked`, `review`, `failed`, or `observed`—or reply with a single line: `'Superagent: nothing needs you.'`
-- **Desktop Panel & Status Chip (`desktop/plugin.js` + `dashboard/plugin_api.py`):** The backend opens SQLite in read-only URI mode (`file:...?mode=ro`) and separates `attention` tickets from `recent` tickets so the desktop chip and side panel highlight only items waiting on a human decision.
+- **Desktop Panel & Status Chip (`desktop/plugin.js` + `dashboard/plugin_api.py`):** The backend opens SQLite in read-only URI mode (`file:...?mode=ro`) and separates `attention` tickets from `recent` tickets so the desktop chip and side panel highlight only items waiting on a human decision. The panel shows two tabs: **Attention** (needs-you queue) and **Sessions** (full `Engine.sessions()` list with previews, event counts and elapsed time; row selection drills into `GET /tickets/{id}` / `Engine.get_ticket_detail()`).
+
+---
+
+## 6. Sessions Model (Read-Only Enrichment)
+
+`Engine.sessions(limit=50, status=None)` and `Engine.get_ticket_detail(ticket_id)` are a read-only view layer over the existing ticket schema — no table or migration change, no behavior change to `ask` / `tick` / `promote`.
+
+### Session row
+
+Each entry in `sessions()` returns:
+
+| Field | Source | Notes |
+| :--- | :--- | :--- |
+| `id`, `status`, `source`, `requester` | `tickets` columns | identity + routing state |
+| `request` | `tickets.request` | 160-char single-line preview (`…` suffix when truncated) |
+| `reason`, `error`, `handle` | `tickets` columns | router reason, last error, serialized worker handle (opaque string) |
+| `result_preview` | `tickets.result` | 200-char single-line preview (`…` suffix when truncated) |
+| `event_count` | `COUNT(events WHERE ticket_id=?)` via `Store.get_events()` | number of audit entries (created/assessed/launched/…); capped read (`LIMIT 1000`) |
+| `created_at`, `updated_at`, `started_at` | `tickets` timestamps | Unix epoch floats; `started_at` is `NULL` until first launch |
+| `elapsed_secs` | `now - (started_at or created_at)` | wall-clock age of the session; `0.0` when timestamps are missing |
+
+Plus top-level `counts` (`Store.count_by_status()`), `running` (`counts["running"]`) and `queued` (`counts["queued"]`) for header chips.
+
+### Detail view
+
+`get_ticket_detail(ticket_id)` returns the full `tickets` row plus `events` (newest-first, `LIMIT 20` via `Store.get_events()`). It raises `KeyError("unknown ticket …")` when the id does not exist, matching `status(ticket_id)` / `promote()` semantics.
+
+### Store helpers
+
+- `Store.list_tickets(status=None, limit=50)` — `SELECT * FROM tickets` with optional `status IN (…)` filter (comma-separated supported) ordered by `created_at DESC`. `Store.list()` is kept as a thin alias.
+- `Store.get_events(ticket_id, limit=20)` — `SELECT * FROM events WHERE ticket_id=? ORDER BY id DESC LIMIT ?`. `Store.events()` is kept as a thin alias.
+- `Store.count_by_status()` — existing `SELECT status, COUNT(*) GROUP BY status` aggregation (unchanged).
+
+All three are pure `SELECT`s: safe to call from agent turns, CLI processes, and the read-only dashboard backend without locking writers.
