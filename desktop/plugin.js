@@ -2396,7 +2396,7 @@ function OverflowMenu({ items, label }) {
 
 /** Two lines and three actions: title + status dot, then model · repo · PR.
  *  Comment-on-PR and the workspace tile live behind the ⋯ menu. */
-function ChatHeader({ session, tile, diff, comment }) {
+function ChatHeader({ session, tile, diff, comment, retry }) {
   const canOpen = !!session.hermes_session_id && !!(host && typeof host.openSession === 'function')
   const canTile = !tile && !!(host && typeof host.openWorkspace === 'function')
   const repo = String(session.repo || '').trim()
@@ -2484,6 +2484,15 @@ function ChatHeader({ session, tile, diff, comment }) {
       jsxs('div', {
         key: 'actions', className: 'flex shrink-0 flex-wrap items-center justify-end gap-1',
         children: [
+          // Only a stopped turn offers this: the prompt is already stored, so
+          // the click relaunches it instead of asking the user to retype it.
+          retry ? jsx(GhostButton, {
+            key: 'retry',
+            title: 'Run the last prompt again in this chat',
+            disabled: retry.pending,
+            onClick: () => retry.onRetry(),
+            children: retry.pending ? 'Retrying…' : 'Retry',
+          }) : null,
           diff ? jsx(GhostButton, {
             key: 'diff',
             title: 'Show what this session changed in its repository',
@@ -2505,7 +2514,7 @@ function ChatHeader({ session, tile, diff, comment }) {
 }
 
 function ChatCenter(props) {
-  const { summary, detail, canComment, sessions, onSelect, banner, optimistic, ...composerProps } = props
+  const { summary, detail, canComment, sessions, onSelect, banner, optimistic, retry, ...composerProps } = props
   const session = (detail && detail.data && detail.data.session) || summary
   const sessionId = session && session.id
   const busy = isBusy(session)
@@ -2555,7 +2564,7 @@ function ChatCenter(props) {
     children: [
       jsx(ChatHeader, {
         key: 'head', session,
-        diff: diffAction, comment: commentAction,
+        diff: diffAction, comment: commentAction, retry,
       }),
       banner ? jsx('div', { key: 'banner', className: 'shrink-0', children: banner }) : null,
       detail && detail.isError
@@ -3270,6 +3279,13 @@ function SuperagentPage() {
     onSuccess: () => invalidateChats(queryClient, selectedId),
   })
 
+  // Retry reuses the prompt already in the transcript — no new message is
+  // appended, so the button is only offered for a stopped turn.
+  const retryChat = useMutation({
+    mutationFn: (id) => rest(`/chats/${encodeURIComponent(id)}/retry`, { method: 'POST' }),
+    onSuccess: () => invalidateChats(queryClient, selectedId),
+  })
+
   // A chat's model is fixed at creation; this swaps it for future turns.
   const setChatModel = useMutation({
     mutationFn: (vars) => rest(`/chats/${encodeURIComponent(vars.id)}/model`, {
@@ -3367,7 +3383,8 @@ function SuperagentPage() {
   const notice = (createChat.data && createChat.data.ok === false && createChat.data.error) ||
     (sendChat.data && sendChat.data.ok === false && sendChat.data.error) || ''
   const failure = errorText(createChat.error) || errorText(sendChat.error) ||
-    errorText(stopChat.error) || errorText(setChatModel.error) ||
+    errorText(stopChat.error) || errorText(retryChat.error) ||
+    errorText(setChatModel.error) ||
     errorText(renameChat.error) || errorText(archiveChat.error) ||
     errorText(deleteChat.error) || notice
 
@@ -3581,6 +3598,10 @@ function SuperagentPage() {
             onSessionModel: changeSessionModel, modelPending: setChatModel.isPending,
             presets: presetList, presetName, onPreset: pickPreset,
             onPresetClear: () => setPresetName(''),
+            retry: selectedSession
+              && (selectedSession.status === 'failed' || selectedSession.status === 'cancelled')
+              ? { pending: retryChat.isPending, onRetry: () => retryChat.mutate(selectedSession.id) }
+              : null,
             onUnarchive: selectedSession
               ? () => archiveSession(selectedSession.id, false)
               : null,

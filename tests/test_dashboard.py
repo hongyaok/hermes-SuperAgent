@@ -973,3 +973,90 @@ def test_list_chats_rejects_an_overlong_query(chat_api):
     with pytest.raises(api.HTTPException) as excinfo:
         api.list_chats(q="x" * (api.sa_chats.SEARCH_QUERY_CHARS + 1))
     assert excinfo.value.status_code == 400
+
+
+# -- retry -----------------------------------------------------------------
+
+
+def _failed_chat(api, prompt="fix the parser", *, hermes_session_id=None):
+    store = api.sa_chats.ChatStore(api._db_path())
+    session = store.create_session(prompt, model="m", provider="p")
+    store.add_message(session["id"], "user", prompt)
+    store.update_session(
+        session["id"], status=api.sa_chats.FAILED, error="boom", tokens=99,
+        duration_ms=5, hermes_session_id=hermes_session_id,
+    )
+    return store, session["id"]
+
+
+def test_retry_relaunches_the_same_session_with_the_last_prompt(chat_api):
+    api, runner = chat_api
+    store, session_id = _failed_chat(api, hermes_session_id="h-1")
+    store.add_message(session_id, "user", "and run the tests")
+    store.update_session(session_id, status=api.sa_chats.FAILED)
+
+    body = api.retry_chat(session_id)
+    assert body["ok"] is True and body["launched"] is True and body["resumed"] is True
+    assert runner.launches == [{
+        "session_id": session_id,
+        "prompt": "and run the tests",
+        "resume_session_id": "h-1",
+        "model": "m",
+        "provider": "p",
+        "repo": "",
+    }]
+    refreshed = store.get_session(session_id, message_limit=0)
+    assert refreshed["error"] is None and refreshed["tokens"] is None
+    assert [e["kind"] for e in store.get_events(session_id)].count("retry") == 1
+    # The prompt is reused, not duplicated.
+    assert [m["content"] for m in store.get_messages(session_id)] == [
+        "fix the parser", "and run the tests"
+    ]
+
+
+def test_retry_without_a_hermes_session_starts_fresh(chat_api):
+    api, runner = chat_api
+    _, session_id = _failed_chat(api)
+
+    body = api.retry_chat(session_id)
+    assert body["resumed"] is False
+    assert runner.launches[0]["resume_session_id"] is None
+
+
+def test_retry_refuses_a_running_chat(chat_api):
+    api, _ = chat_api
+    store, session_id = _failed_chat(api)
+    store.update_session(session_id, status=api.sa_chats.RUNNING)
+
+    with pytest.raises(api.HTTPException) as excinfo:
+        api.retry_chat(session_id)
+    assert excinfo.value.status_code == 409
+
+
+def test_retry_refuses_a_reviewed_chat(chat_api):
+    api, _ = chat_api
+    store, session_id = _failed_chat(api)
+    store.update_session(session_id, status=api.sa_chats.REVIEW)
+
+    with pytest.raises(api.HTTPException) as excinfo:
+        api.retry_chat(session_id)
+    assert excinfo.value.status_code == 409
+    assert "review" in str(excinfo.value.detail)
+
+
+def test_retry_needs_a_user_message(chat_api):
+    api, _ = chat_api
+    store = api.sa_chats.ChatStore(api._db_path())
+    session = store.create_session("ghost")
+    store.update_session(session["id"], status=api.sa_chats.FAILED)
+
+    with pytest.raises(api.HTTPException) as excinfo:
+        api.retry_chat(session["id"])
+    assert excinfo.value.status_code == 400
+
+
+def test_retry_unknown_session_is_404(chat_api):
+    api, _ = chat_api
+    with pytest.raises(api.HTTPException) as excinfo:
+        api.retry_chat("S-9999")
+    assert excinfo.value.status_code == 404

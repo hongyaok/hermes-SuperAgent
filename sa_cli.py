@@ -814,6 +814,122 @@ def _launch_chat(args: argparse.Namespace, ctx: Any, engine: Any, want_json: boo
     return 0
 
 
+def _retry_chat(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
+    """`retry SESSION`: relaunch the last prompt of a failed/cancelled chat.
+
+    The prompt is not appended again — it is already in the transcript — so a
+    retry cannot turn one question into two. A live turn or a reviewable result
+    is refused instead of being silently repeated.
+    """
+    session_id = _session_id_arg(getattr(args, "session_id", ""))
+    if not session_id:
+        print(USAGE)
+        return 2
+    try:
+        store = _chat_store(engine)
+        session = store.get_session(session_id, message_limit=0)
+    except Exception as exc:
+        print(f"error: retry failed: {exc}")
+        return 1
+    if session is None:
+        print(f"error: unknown chat session {session_id}")
+        return 1
+    status = session.get("status")
+    if status in (sa_chats.QUEUED, sa_chats.RUNNING):
+        print(f"error: session {session_id} is {status}; nothing to retry")
+        return 1
+    if status not in (sa_chats.FAILED, sa_chats.CANCELLED):
+        print(
+            f"error: session {session_id} is {status};"
+            " retry only a failed or cancelled chat"
+        )
+        return 1
+    message = store.last_user_message(session_id)
+    prompt = str((message or {}).get("content") or "").strip()
+    if not prompt:
+        print("error: no user message to retry")
+        return 1
+
+    model = str(session.get("model") or "")
+    provider = str(session.get("provider") or "")
+    repo = str(session.get("repo") or "")
+    resume_id = str(session.get("hermes_session_id") or "").strip()
+    detach = bool(getattr(args, "detach", False))
+    db_path = str(getattr(store, "path", ""))
+    try:
+        store.update_session(
+            session_id, error=None, tokens=None, duration_ms=None,
+            last_event=None, finished_at=None,
+        )
+    except Exception as exc:
+        print(f"error: retry failed: {exc}")
+        return 1
+
+    try:
+        _get_runner(store).launch_turn(
+            session_id,
+            prompt,
+            resume_session_id=resume_id or None,
+            model=model,
+            provider=provider,
+            repo=repo,
+            block=not detach,
+        )
+    except KeyboardInterrupt:
+        try:
+            _get_runner(store).stop(session_id)
+        except Exception:
+            pass
+        print(f"\n{session_id} cancelled (interrupted)")
+        return 1
+    except Exception as exc:
+        detail = str(exc) or exc.__class__.__name__
+        try:
+            store.update_session(
+                session_id, status=sa_chats.FAILED, error=detail,
+                finished_at=time.time(), pid=None,
+            )
+            store.add_event(session_id, "failed", detail)
+            failed = store.get_session(session_id, message_limit=0)
+        except Exception:
+            failed = {"id": session_id, "status": sa_chats.FAILED, "error": detail}
+        if want_json:
+            print(json.dumps({
+                "ok": False,
+                "launched": False,
+                "error": detail,
+                "db_path": db_path,
+                "session": failed,
+            }, indent=2, default=str))
+        else:
+            print(f"error: cannot retry {session_id}: {detail}")
+        return 1
+
+    store.add_event(
+        session_id,
+        "retry",
+        f"retry after {status} (resumed {resume_id})" if resume_id
+        else f"retry after {status} (fresh session)",
+    )
+    fresh = store.get_session(session_id, message_limit=(0 if detach else 50)) or session
+    if want_json:
+        print(json.dumps({
+            "ok": True,
+            "launched": True,
+            "detached": detach,
+            "resumed": bool(resume_id),
+            "session": fresh,
+            "db_path": db_path,
+            "transcript": f"hermes superagent show {session_id}",
+        }, indent=2, default=str))
+    else:
+        print(render_chat(fresh, db_path))
+        if not detach:
+            print()
+            print(render_session(fresh))
+    return 0
+
+
 def _list_sessions(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
     try:
         limit = int(getattr(args, "limit", 20) or 20)
@@ -1485,6 +1601,15 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
     stop_p = subs.add_parser("stop", help="Cancel a queued or running chat turn")
     stop_p.add_argument("session_id", help="Chat session id (e.g. S-0001)")
     _add_json_flag(stop_p)
+    retry_p = subs.add_parser(
+        "retry", help="Re-run the last prompt of a failed or cancelled chat"
+    )
+    retry_p.add_argument("session_id", help="Chat session id (e.g. S-0001)")
+    retry_p.add_argument(
+        "--detach", action="store_true",
+        help="Launch the turn and return instead of waiting for it",
+    )
+    _add_json_flag(retry_p)
     diff_p = subs.add_parser(
         "diff", help="Show git status, stat and patch for a chat session's repository"
     )
@@ -1616,6 +1741,9 @@ def run(args: argparse.Namespace, ctx: Any) -> int:
             print(USAGE)
             return 2
         return _stop_session(session_id, engine, want_json)
+
+    if command == "retry":
+        return _retry_chat(args, engine, want_json)
 
     if command == "ask":
         parts = getattr(args, "request", None)

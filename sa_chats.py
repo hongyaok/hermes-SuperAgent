@@ -665,6 +665,21 @@ class ChatStore:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def last_user_message(self, session_id: str) -> Optional[dict]:
+        """The newest user message, or None — exactly what a retry would resend.
+
+        A retry deliberately reuses the stored text instead of appending a
+        duplicate message, so this is a plain lookup rather than a scan of the
+        capped transcript (a 200-message window could miss the prompt).
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chat_messages WHERE session_id = ? AND role = 'user'"
+                " ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     # -- events ----------------------------------------------------------
 
     def add_event(self, session_id: str, kind: str, detail: str = "") -> dict:

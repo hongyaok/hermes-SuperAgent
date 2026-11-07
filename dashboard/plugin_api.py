@@ -1134,6 +1134,75 @@ def post_chat_message(session_id: str, body: dict) -> dict[str, Any]:
     }
 
 
+@router.post("/chats/{session_id}/retry")
+def retry_chat(session_id: str) -> dict[str, Any]:
+    """Re-run the last prompt of a failed or cancelled chat.
+
+    A retry is not a new message: the transcript already holds the user's text,
+    so the same row is relaunched with that prompt, resuming its Hermes session
+    when one was created. A live turn is already working and a ``review`` chat
+    is a result to read, so both are 409 rather than a silent duplicate.
+    """
+    session_id = _check_session_id(session_id)
+    store = _chat_store()
+    session = store.get_session(session_id, message_limit=0)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    status = session["status"]
+    if status in (sa_chats.QUEUED, sa_chats.RUNNING):
+        raise HTTPException(
+            status_code=409, detail=f"session {session_id} is {status}; nothing to retry"
+        )
+    if status not in (sa_chats.FAILED, sa_chats.CANCELLED):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"session {session_id} is {status}; retry only a failed or cancelled chat"
+            ),
+        )
+    message = store.last_user_message(session_id)
+    prompt = str((message or {}).get("content") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="no user message to retry")
+
+    model = _scrub(session.get("model") or "")
+    provider = _scrub(session.get("provider") or "")
+    # The stored repo was validated when the chat was created; validate again
+    # so a deleted or replaced directory fails as a 400, never as argv.
+    repo = _validated_repo(session.get("repo") or "")
+    resume_id = (session.get("hermes_session_id") or "").strip()
+
+    # Forget the failed attempt's numbers: a retried turn starts clean, and a
+    # stale token count next to a live turn reads as if it were already done.
+    store.update_session(
+        session_id,
+        error=None,
+        tokens=None,
+        duration_ms=None,
+        last_event=None,
+        finished_at=None,
+    )
+    try:
+        _get_runner().launch_turn(
+            session_id,
+            prompt,
+            resume_session_id=resume_id or None,
+            model=model,
+            provider=provider,
+            repo=repo,
+        )
+    except Exception as exc:
+        return _fail_session(store, session_id, str(exc) or exc.__class__.__name__)
+    resumed = f"resumed {resume_id}" if resume_id else "fresh session"
+    store.add_event(session_id, "retry", f"retry after {status} ({resumed})")
+    return {
+        "ok": True,
+        "launched": True,
+        "resumed": bool(resume_id),
+        "session": store.get_session(session_id),
+    }
+
+
 @router.post("/chats/{session_id}/model")
 def set_chat_model(session_id: str, body: dict) -> dict[str, Any]:
     """Change the model/provider a session will use for its *next* turn.
