@@ -510,3 +510,26 @@ def test_blank_search_is_the_plain_list(chat):
     ]
     assert all("match_field" not in row for row in searched["sessions"])
     assert searched["counts"] == listed["counts"]
+
+
+# -- markdown export -------------------------------------------------------
+
+
+def test_session_markdown_marks_an_empty_transcript(chat):
+    session = chat.create_session("empty one")
+    markdown = sa_chats.session_markdown(chat.get_session(session["id"]))
+
+    assert markdown.startswith("# empty one")
+    assert "_(no messages yet)_" in markdown
+    assert "## Activity" in markdown  # create_session records one event
+
+
+def test_session_markdown_caps_a_runaway_export(chat):
+    session = chat.create_session("long one")
+    chat.add_message(session["id"], "assistant", "x" * 5000)
+
+    markdown = sa_chats.session_markdown(
+        chat.get_session(session["id"]), max_chars=600
+    )
+    assert len(markdown) <= 700
+    assert "export truncated at 600 characters" in markdown

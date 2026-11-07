@@ -15,6 +15,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
@@ -137,6 +138,9 @@ RECENT_EVENT_CHARS = 160
 # one-line excerpt a rail row can show under its title.
 SEARCH_QUERY_CHARS = 200
 SEARCH_SNIPPET_CHARS = 160
+# A transcript export is for humans and diff review, not an archive: cap it so
+# one runaway chat cannot produce a multi-megabyte download.
+MAX_EXPORT_CHARS = 400_000
 
 
 def derive_title(prompt: str, limit: int = MAX_TITLE_CHARS) -> str:
@@ -240,6 +244,91 @@ def _board_counts(conn: sqlite3.Connection, mode: str) -> tuple[dict[str, int], 
         ).fetchone()["n"]
     )
     return counts, archived_count
+
+
+def _iso_time(value: Any) -> str:
+    """Local ISO-8601 for an epoch stamp; an empty string when unusable."""
+    try:
+        return datetime.fromtimestamp(float(value)).astimezone().isoformat(
+            timespec="seconds"
+        )
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def session_markdown(session: dict, max_chars: int = MAX_EXPORT_CHARS) -> str:
+    """One chat as a self-contained Markdown document.
+
+    Reads only the stored row — no git, no network, no token — so an export is
+    a faithful copy of what the rail shows, not a second opinion about the
+    repository. The header places the conversation, the transcript keeps
+    message order, and the activity tail says how the turn ended (launch,
+    retry, failure, comment), which is often the part a reader needs.
+    """
+    prompt = str(session.get("prompt") or "").strip()
+    session_id = str(session.get("id") or "")
+    title = str(session.get("title") or "").strip() or derive_title(prompt) or session_id
+    facts: list[tuple[str, str]] = [
+        ("Session", f"`{session_id}`"),
+        ("Status", f"`{session.get('status') or ''}`"),
+    ]
+    model = str(session.get("model") or "").strip()
+    provider = str(session.get("provider") or "").strip()
+    if model or provider:
+        label = f"`{model}`" if model else ""
+        facts.append(("Model", (label + (f" ({provider})" if provider else "")).strip()))
+    repo = str(session.get("repo") or "").strip()
+    if repo:
+        facts.append(("Repo", f"`{repo}`"))
+    for key, label in (("created_at", "Created"), ("updated_at", "Updated")):
+        stamp = _iso_time(session.get(key))
+        if stamp:
+            facts.append((label, stamp))
+    tokens = session.get("tokens")
+    if tokens:
+        facts.append(("Tokens", f"{int(tokens):,}"))
+    duration = session.get("duration_ms")
+    if duration:
+        facts.append(("Duration", f"{int(duration) / 1000:.1f}s"))
+    if session.get("pr_number"):
+        url = str(session.get("pr_url") or "").strip()
+        facts.append(("Pull request", f"#{session['pr_number']}" + (f" {url}" if url else "")))
+    if session.get("hermes_session_id"):
+        facts.append(("Hermes session", f"`{session['hermes_session_id']}`"))
+
+    lines = [f"# {title}", ""]
+    lines.extend(f"- **{label}**: {value}" for label, value in facts)
+    lines.extend(["", "## Prompt", ""])
+    prompt_lines = prompt.splitlines() or [""]
+    lines.extend(f"> {line}" if line.strip() else ">" for line in prompt_lines)
+    lines.extend(["", "## Transcript", ""])
+    messages = session.get("messages") or []
+    for message in messages:
+        role = str(message.get("role") or "message")
+        heading = {"user": "You", "assistant": "Assistant", "system": "System"}.get(
+            role, role.title()
+        )
+        body = str(message.get("content") or "").strip() or "_(empty)_"
+        lines.extend([f"### {heading}", "", body, ""])
+    if not messages:
+        lines.extend(["_(no messages yet)_", ""])
+    events = session.get("events") or []
+    if events:
+        lines.extend(["## Activity", ""])
+        for event in events:
+            stamp = _iso_time(event.get("created_at"))
+            detail = " ".join(str(event.get("detail") or "").split())
+            entry = f"- `{stamp}` **{event.get('kind') or 'event'}**"
+            lines.append(entry + (f" — {detail}" if detail else ""))
+        lines.append("")
+
+    text = "\n".join(lines).rstrip() + "\n"
+    if len(text) > max_chars:
+        # A pathological transcript must not turn one export into a 20 MB file;
+        # the note keeps the cut visible instead of silently dropping the tail.
+        kept = text[:max_chars].rsplit("\n", 1)[0]
+        text = kept + f"\n\n_… export truncated at {max_chars:,} characters._\n"
+    return text
 
 
 class ChatStore:

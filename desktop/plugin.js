@@ -314,6 +314,25 @@ function openUrl(url) {
   }
 }
 
+/** Save a generated document the shell already returned: the response *is*
+ *  the file, so no round-trip or filesystem permission is needed. A shell
+ *  without Blob just does nothing — the transcript stays on screen. */
+function downloadMarkdown(filename, text) {
+  try {
+    const blob = new Blob([String(text || '')], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = String(filename || 'superagent-chat.md')
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch (error) {
+    // Nothing to clean up: the export simply was not saved.
+  }
+}
+
 function errorText(error) {
   if (!error) return ''
   return String((error && error.message) || error)
@@ -344,6 +363,11 @@ function fetchChatDiff(id) {
 /** The comment body POST /comment would send (no network, no write). */
 function fetchCommentPreview(id) {
   return rest ? rest(`/chats/${encodeURIComponent(id)}/comment-preview`) : Promise.reject(new Error('backend not ready'))
+}
+
+/** The transcript as Markdown; the caller turns it into a download. */
+function fetchChatExport(id) {
+  return rest ? rest(`/chats/${encodeURIComponent(id)}/export`) : Promise.reject(new Error('backend not ready'))
 }
 
 function fetchModels() {
@@ -2396,7 +2420,7 @@ function OverflowMenu({ items, label }) {
 
 /** Two lines and three actions: title + status dot, then model · repo · PR.
  *  Comment-on-PR and the workspace tile live behind the ⋯ menu. */
-function ChatHeader({ session, tile, diff, comment, retry }) {
+function ChatHeader({ session, tile, diff, comment, retry, exportMd }) {
   const canOpen = !!session.hermes_session_id && !!(host && typeof host.openSession === 'function')
   const canTile = !tile && !!(host && typeof host.openWorkspace === 'function')
   const repo = String(session.repo || '').trim()
@@ -2409,6 +2433,14 @@ function ChatHeader({ session, tile, diff, comment, retry }) {
       label: comment.open ? 'Close the comment box' : `Comment on PR #${session.pr_number}`,
       disabled: comment.disabled,
       onSelect: comment.onToggle,
+    })
+  }
+  if (exportMd) {
+    overflow.push({
+      id: 'export',
+      label: exportMd.pending ? 'Preparing export…' : 'Export as Markdown',
+      disabled: exportMd.pending,
+      onSelect: exportMd.onExport,
     })
   }
   if (canTile) {
@@ -2514,7 +2546,7 @@ function ChatHeader({ session, tile, diff, comment, retry }) {
 }
 
 function ChatCenter(props) {
-  const { summary, detail, canComment, sessions, onSelect, banner, optimistic, retry, ...composerProps } = props
+  const { summary, detail, canComment, sessions, onSelect, banner, optimistic, retry, exportMd, ...composerProps } = props
   const session = (detail && detail.data && detail.data.session) || summary
   const sessionId = session && session.id
   const busy = isBusy(session)
@@ -2564,7 +2596,7 @@ function ChatCenter(props) {
     children: [
       jsx(ChatHeader, {
         key: 'head', session,
-        diff: diffAction, comment: commentAction, retry,
+        diff: diffAction, comment: commentAction, retry, exportMd,
       }),
       banner ? jsx('div', { key: 'banner', className: 'shrink-0', children: banner }) : null,
       detail && detail.isError
@@ -3286,6 +3318,17 @@ function SuperagentPage() {
     onSuccess: () => invalidateChats(queryClient, selectedId),
   })
 
+  // The export is a plain read: save the generated Markdown locally, no write
+  // to the chat and no change to its state.
+  const exportChat = useMutation({
+    mutationFn: (id) => fetchChatExport(id),
+    onSuccess: (data) => {
+      if (data && data.markdown) {
+        downloadMarkdown(data.filename || 'superagent-chat.md', data.markdown)
+      }
+    },
+  })
+
   // A chat's model is fixed at creation; this swaps it for future turns.
   const setChatModel = useMutation({
     mutationFn: (vars) => rest(`/chats/${encodeURIComponent(vars.id)}/model`, {
@@ -3384,7 +3427,7 @@ function SuperagentPage() {
     (sendChat.data && sendChat.data.ok === false && sendChat.data.error) || ''
   const failure = errorText(createChat.error) || errorText(sendChat.error) ||
     errorText(stopChat.error) || errorText(retryChat.error) ||
-    errorText(setChatModel.error) ||
+    errorText(exportChat.error) || errorText(setChatModel.error) ||
     errorText(renameChat.error) || errorText(archiveChat.error) ||
     errorText(deleteChat.error) || notice
 
@@ -3601,6 +3644,9 @@ function SuperagentPage() {
             retry: selectedSession
               && (selectedSession.status === 'failed' || selectedSession.status === 'cancelled')
               ? { pending: retryChat.isPending, onRetry: () => retryChat.mutate(selectedSession.id) }
+              : null,
+            exportMd: selectedSession
+              ? { pending: exportChat.isPending, onExport: () => exportChat.mutate(selectedSession.id) }
               : null,
             onUnarchive: selectedSession
               ? () => archiveSession(selectedSession.id, false)
