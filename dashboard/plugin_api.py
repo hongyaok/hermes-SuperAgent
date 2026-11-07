@@ -979,6 +979,23 @@ def rename_chat(session_id: str, body: dict | None = None) -> dict[str, Any]:
     return {"ok": True, "session": updated}
 
 
+@router.post("/chats/{session_id}/pin")
+def pin_chat(session_id: str, body: dict | None = None) -> dict[str, Any]:
+    """Pin a chat to the top of the rail (default), or release it.
+
+    Pinning is display-only, so a live turn is allowed: the row keeps its
+    status, transcript and worktree, and unpinning returns it to its real place.
+    """
+    session_id = _check_session_id(session_id)
+    data = body if isinstance(body, dict) else {}
+    raw = data.get("pinned", True)
+    pinned = True if raw is None else _settings_bool(raw, "pinned")
+    updated = _chat_store().set_pinned(session_id, pinned=pinned)
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    return {"ok": True, "session": updated}
+
+
 @router.post("/chats/{session_id}/archive")
 def archive_chat(session_id: str, body: dict | None = None) -> dict[str, Any]:
     """Archive (default) or restore one chat. 409 while its turn is live.

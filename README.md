@@ -27,7 +27,7 @@ It separates **routing** from **execution**, and keeps every result behind one r
 - **GitHub connect & PR watch** — one repository, an allow-list, `observe` or `auto` mode, open-PR list with **Work on this PR**, and one isolated `git worktree` per pull request.
 - **Review handoff** — a lazy diff panel and a human-confirmed PR comment, plus `hermes superagent diff|comment`.
 - **Tickets for everything else** — deterministic zero-token triage, `superagent_ask/tick/status/run` tools, `/superagent`, and the **Superagent watch** cron blueprint.
-- **A CLI for the same state** — `hermes superagent status|chat|sessions|search|retry|export|usage|show|stop|models|settings|github|diff|comment|doctor`, all with `--json` and stable exit codes.
+- **A CLI for the same state** — `hermes superagent status|chat|sessions|search|retry|export|usage|pin|unpin|show|stop|models|settings|github|diff|comment|doctor`, all with `--json` and stable exit codes.
 
 ## How it works
 
@@ -204,6 +204,10 @@ hermes superagent export S-0001 --out ./exports
 hermes superagent usage
 hermes superagent usage --days 30 --json
 
+# Keep a chat at the top of the rail, or release it
+hermes superagent pin S-0001
+hermes superagent unpin S-0001
+
 # Review what a finished session changed, then comment on its PR
 hermes superagent diff S-0001
 hermes superagent comment S-0001
@@ -302,7 +306,7 @@ Each session row contains `id`, `status`, `source`, `requester`, `request` (160-
 The Superagent page (`/superagent`) is chat-first. Everything in the tab is backed by `/chats` and `/models`; ticket state is shown alongside but a chat turn never creates a ticket.
 
 - **Chat rail (left)** — the newest chats, each with status, model, age (or elapsed time while a turn runs). Selecting a row opens its transcript; **New chat** clears the composer. The search box asks the server, matching titles, opening prompts and every stored message (250 ms debounce, stale responses discarded) and shows the matching line under the title; clearing it restores the normal board immediately.
-- **Chat housekeeping** — each row grows a `⋯` on hover/focus: **Rename** edits the title inline (Enter saves, Esc cancels, blur saves a change), **Archive** / **Unarchive** files a chat away, and **Delete** asks once (the app's confirm dialog) before removing the row and its transcript. Archived rows are dimmed and tagged, a compact **Show archived** toggle in the rail footer switches to `?archived=all` and is remembered, and an archived chat's header carries an **Archived** pill while its composer is read-only until it is unarchived. Nothing here touches files, worktrees or pull requests.
+- **Chat housekeeping** — each row grows a `⋯` on hover/focus: **Pin to top** / **Unpin** keeps a chat above the timeline (display-only, the row keeps its real timestamps), **Rename** edits the title inline (Enter saves, Esc cancels, blur saves a change), **Archive** / **Unarchive** files a chat away, and **Delete** asks once (the app's confirm dialog) before removing the row and its transcript. Archived rows are dimmed and tagged, a compact **Show archived** toggle in the rail footer switches to `?archived=all` and is remembered, and an archived chat's header carries an **Archived** pill while its composer is read-only until it is unarchived. Nothing here touches files, worktrees or pull requests.
 - **Transcript (centre)** — the session prompt followed by `chat_messages` and `chat_events` merged in order, so assistant text interleaves with tool calls, errors and result lines. A failed turn shows the stored error.
 - **Composer** — a model picker fed by `/models` (presets plus **Default model**), an optional repo path (defaults to the configured repo) and Enter-to-send / Shift+Enter newline. While a turn is queued or running the composer is disabled and **Stop** cancels the turn; an archived chat is read-only (`Archived — unarchive to continue`).
 - **Chat header** — status, model/provider, tokens, duration, and **Open in Hermes** when `hermes_session_id` is known. A `failed` session puts its stored `error` in the header (prefixed `error:`) instead of leaving the status pill to imply it. A `failed` or `cancelled` chat also shows **Retry**, which re-runs its last prompt in place (`POST /chats/{id}/retry`) rather than making you retype it. The `⋯` menu offers **Export as Markdown**, which saves the transcript (`GET /chats/{id}/export`) as `superagent-<id>.md`.
@@ -328,6 +332,7 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 | `GET` | `/chats?limit=50&q=` | `{db_exists, sessions, counts, running, archived_count}`; also runs the runaway watchdog before answering. An optional `archived` query takes `hide` (default: no archived rows), `only` or `all`; an unknown value is `400`. An optional `q` searches titles, prompts and every stored message instead of listing, adding `match_field` (`title`/`prompt`/`message`) and `match_snippet` (≤160 chars) per row; a term over 200 chars is `400`. `counts` describe the visible board, not the hit list. |
 | `POST` | `/chats` | Validate, create and launch a chat. Optional `preset` selects a named model (explicit `model`/`provider` still win; unknown preset is `400` listing the available names) and records a `preset` event. `400` on an empty/oversized prompt or an invalid repo; `200 {ok:false}` when the worker cannot start (the session is stored as `failed`). |
 | `PATCH` | `/chats/{id}` | Rename: `{title}` is trimmed, whitespace-collapsed and capped at 200 chars. `400` empty/oversized/non-string, `404` unknown id. Returns `{ok, session}`; allowed while a turn runs. |
+| `POST` | `/chats/{id}/pin` | `{pinned?: true}` pins a chat above the timeline; `{pinned: false}` releases it. Display-only: allowed while a turn runs, never touches `updated_at`, so unpinning returns the row to its real place. `404` unknown. Returns `{ok, session}`. |
 | `POST` | `/chats/{id}/archive` | `{archived?: true}` archives (stamps `archived_at` once, leaves `updated_at` alone) and `{archived: false}` restores. `409` while queued/running, `404` unknown. Returns `{ok, session}`. |
 | `DELETE` | `/chats/{id}` | Delete the row, its `chat_messages` and its `chat_events` in one transaction (`gh_seen` is kept so a GitHub comment is not replayed). `409` while queued/running, `404` unknown. Never deletes files. Returns `{ok, id}`. |
 | `GET` | `/chats/{id}` | Session with `messages` and `events`; `404` for an unknown id. |

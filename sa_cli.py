@@ -1056,6 +1056,27 @@ def _usage(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
     return 0
 
 
+def _pin_chat(args: argparse.Namespace, engine: Any, want_json: bool, pinned: bool) -> int:
+    """`pin` / `unpin SESSION`: move a chat to the top of the rail, or release it."""
+    session_id = _session_id_arg(getattr(args, "session_id", ""))
+    if not session_id:
+        print(USAGE)
+        return 2
+    try:
+        session = _chat_store(engine).set_pinned(session_id, pinned=pinned)
+    except Exception as exc:
+        print(f"error: {'pin' if pinned else 'unpin'} failed: {exc}")
+        return 1
+    if session is None:
+        print(f"error: unknown chat session {session_id}")
+        return 1
+    if want_json:
+        print(json.dumps({"ok": True, "pinned": pinned, "session": session}, indent=2, default=str))
+    else:
+        print(f"{session_id} {'pinned' if pinned else 'unpinned'}")
+    return 0
+
+
 def _list_sessions(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
     try:
         limit = int(getattr(args, "limit", 20) or 20)
@@ -1748,6 +1769,13 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         "--days", type=int, default=14, help="How many days to cover (1-90)"
     )
     _add_json_flag(usage_p)
+    for name, help_text in (
+        ("pin", "Pin a chat to the top of the rail"),
+        ("unpin", "Release a pinned chat"),
+    ):
+        pin_p = subs.add_parser(name, help=help_text)
+        pin_p.add_argument("session_id", help="Chat session id (e.g. S-0001)")
+        _add_json_flag(pin_p)
     diff_p = subs.add_parser(
         "diff", help="Show git status, stat and patch for a chat session's repository"
     )
@@ -1888,6 +1916,12 @@ def run(args: argparse.Namespace, ctx: Any) -> int:
 
     if command == "usage":
         return _usage(args, engine, want_json)
+
+    if command == "pin":
+        return _pin_chat(args, engine, want_json, True)
+
+    if command == "unpin":
+        return _pin_chat(args, engine, want_json, False)
 
     if command == "ask":
         parts = getattr(args, "request", None)

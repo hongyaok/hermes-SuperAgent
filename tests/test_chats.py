@@ -573,3 +573,67 @@ def test_usage_buckets_totals_and_models(chat):
     }
     assert data["series"][-1]["date"] == data["series"][-1]["date"]
     assert sum(day["sessions"] for day in data["series"]) == 3
+
+
+# -- pinning ---------------------------------------------------------------
+
+
+def test_pinned_sessions_sort_first_and_release_cleanly(chat):
+    first = chat.create_session("first")
+    second = chat.create_session("second")
+    assert [row["id"] for row in chat.list_sessions()["sessions"]] == [
+        second["id"], first["id"]
+    ]
+
+    assert chat.set_pinned(first["id"])["pinned_at"]
+    assert [row["id"] for row in chat.list_sessions()["sessions"]] == [
+        first["id"], second["id"]
+    ]
+    before = chat.get_session(first["id"])["updated_at"]
+
+    # Unpinning must not promote the row to "just now".
+    chat.set_pinned(first["id"], False)
+    assert [row["id"] for row in chat.list_sessions()["sessions"]] == [
+        second["id"], first["id"]
+    ]
+    after = chat.get_session(first["id"])
+    assert after["pinned_at"] is None
+    assert after["updated_at"] == before
+
+
+def test_pin_is_idempotent_and_search_respects_it(chat):
+    first = chat.create_session("alpha one")
+    second = chat.create_session("alpha two")
+    chat.set_pinned(first["id"])
+    stamp = chat.get_session(first["id"])["pinned_at"]
+    chat.set_pinned(first["id"])
+    assert chat.get_session(first["id"])["pinned_at"] == stamp
+    assert [row["id"] for row in chat.search_sessions("alpha")["sessions"]] == [
+        first["id"], second["id"]
+    ]
+
+
+def test_pin_unknown_session_returns_none(chat):
+    assert chat.set_pinned("S-9999") is None
+
+
+def test_migrate_adds_pinned_at_to_an_old_database(tmp_path, sa):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE chat_sessions (id TEXT PRIMARY KEY, title TEXT,"
+        " prompt TEXT NOT NULL, status TEXT NOT NULL, model TEXT, provider TEXT,"
+        " repo TEXT, hermes_session_id TEXT, source TEXT, github_repo TEXT,"
+        " pr_number INTEGER, pr_url TEXT, pid INTEGER, tokens INTEGER,"
+        " duration_ms INTEGER, error TEXT, last_event TEXT, created_at REAL NOT NULL,"
+        " updated_at REAL NOT NULL, started_at REAL, finished_at REAL)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = sa.sa_chats.ChatStore(path)
+    with store._connect() as handle:
+        columns = {row["name"] for row in handle.execute("PRAGMA table_info(chat_sessions)")}
+    assert {"archived_at", "pinned_at"} <= columns

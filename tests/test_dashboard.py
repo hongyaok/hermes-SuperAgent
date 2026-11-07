@@ -1117,3 +1117,27 @@ def test_usage_clamps_an_absurd_window(chat_api):
     api, _ = chat_api
     assert api.usage(days=500)["days"] == 90
     assert api.usage(days=0)["days"] == 1
+
+
+# -- pinning ---------------------------------------------------------------
+
+
+def test_pin_moves_a_chat_to_the_top(chat_api):
+    api, _ = chat_api
+    store = api.sa_chats.ChatStore(api._db_path())
+    first = store.create_session("first")
+    second = store.create_session("second")
+
+    body = api.pin_chat(first["id"])
+    assert body["ok"] is True and body["session"]["pinned_at"]
+    assert [row["id"] for row in api.list_chats()["sessions"]] == [first["id"], second["id"]]
+
+    api.pin_chat(first["id"], {"pinned": False})
+    assert [row["id"] for row in api.list_chats()["sessions"]] == [second["id"], first["id"]]
+
+
+def test_pin_unknown_session_is_404(chat_api):
+    api, _ = chat_api
+    with pytest.raises(api.HTTPException) as excinfo:
+        api.pin_chat("S-9999")
+    assert excinfo.value.status_code == 404

@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     updated_at        REAL NOT NULL,
     started_at        REAL,
     finished_at       REAL,
-    archived_at       REAL
+    archived_at       REAL,
+    pinned_at         REAL
 );
 CREATE INDEX IF NOT EXISTS chat_sessions_updated ON chat_sessions(updated_at);
 CREATE INDEX IF NOT EXISTS chat_sessions_status ON chat_sessions(status, updated_at);
@@ -356,6 +357,8 @@ class ChatStore:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(chat_sessions)")}
         if "archived_at" not in columns:
             conn.execute("ALTER TABLE chat_sessions ADD COLUMN archived_at REAL")
+        if "pinned_at" not in columns:
+            conn.execute("ALTER TABLE chat_sessions ADD COLUMN pinned_at REAL")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS chat_sessions_archived"
             " ON chat_sessions(archived_at)"
@@ -490,6 +493,29 @@ class ChatStore:
                 )
         return self.get_session(session_id, message_limit=0)
 
+    def set_pinned(self, session_id: str, pinned: bool = True) -> Optional[dict]:
+        """Pin a session to the top of the rail, or release it.
+
+        Like archiving, pinning is a display decision: it stamps ``pinned_at``
+        once and never touches ``updated_at``, so unpinning returns the row to
+        its real place in the timeline instead of promoting it to "just now".
+        """
+        if not self.exists(session_id):
+            return None
+        if pinned:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE chat_sessions SET pinned_at = COALESCE(pinned_at, ?)"
+                    " WHERE id = ?",
+                    (time.time(), session_id),
+                )
+        else:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE chat_sessions SET pinned_at = NULL WHERE id = ?", (session_id,)
+                )
+        return self.get_session(session_id, message_limit=0)
+
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and its transcript in one transaction.
 
@@ -566,7 +592,7 @@ class ChatStore:
             rows = conn.execute(
                 "SELECT s.*, (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id)"
                 " AS message_count FROM chat_sessions s" + clause +
-                " ORDER BY s.updated_at DESC LIMIT ?",
+                " ORDER BY (s.pinned_at IS NOT NULL) DESC, s.updated_at DESC LIMIT ?",
                 params,
             ).fetchall()
             counts, archived_count = _board_counts(conn, mode)
@@ -637,7 +663,7 @@ class ChatStore:
             rows = conn.execute(
                 "SELECT s.*, (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id)"
                 " AS message_count FROM chat_sessions s" + clause +
-                " ORDER BY s.updated_at DESC LIMIT ?",
+                " ORDER BY (s.pinned_at IS NOT NULL) DESC, s.updated_at DESC LIMIT ?",
                 params,
             ).fetchall()
             sessions = [dict(row) for row in rows]

@@ -671,6 +671,7 @@ function RailMenuItem({ label, onSelect }) {
  */
 function SessionRow({
   session, selected, onSelect, onRename, onArchive, onDelete, onDeleteAsk, opensUp, match,
+  onPin,
 }) {
   const archived = !!session.archived_at
   const [menuOpen, setMenuOpen] = useState(false)
@@ -730,6 +731,10 @@ function SessionRow({
   }
 
   const items = [
+    jsx(RailMenuItem, {
+      key: 'pin', label: session.pinned_at ? 'Unpin' : 'Pin to top',
+      onSelect: () => { setMenuOpen(false); onPin(session.id, !session.pinned_at) },
+    }),
     jsx(RailMenuItem, {
       key: 'rename', label: 'Rename',
       onSelect: () => { setMenuOpen(false); startRename() },
@@ -847,7 +852,7 @@ function SessionRow({
                 children: [
                   jsx('span', {
                     key: 'title', className: 'truncate text-xs text-(--ui-text-secondary)',
-                    children: sessionTitle(session),
+                    children: session.pinned_at ? `▴ ${sessionTitle(session)}` : sessionTitle(session),
                   }),
                   // Why the chat matched: only while a search is active, so a
                   // normal rail row stays one line.
@@ -957,7 +962,7 @@ function RailFilter({ value, onChange }) {
 
 function SessionsRail({
   sessions, selectedId, onSelect, onRename, onArchive, onDelete,
-  showArchived, onToggleArchived, archivedCount, searchRef,
+  showArchived, onToggleArchived, archivedCount, searchRef, onPin,
 }) {
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
@@ -1080,7 +1085,7 @@ function SessionsRail({
             children: shown.length
               ? shown.map((session, index) => jsx(SessionRow, {
                   key: session.id, session, selected: session.id === selectedId,
-                  onSelect: choose, onRename, onArchive, onDelete,
+                  onSelect: choose, onRename, onArchive, onDelete, onPin,
                   onDeleteAsk: setPendingDelete,
                   match: searching ? session.match_snippet : '',
                   // The last two rows open their menu upwards so the list's
@@ -3772,6 +3777,16 @@ function SuperagentPage() {
     onError: () => invalidateChats(queryClient, selectedId),
   })
 
+  // Display-only: the server refuses nothing here, and the rail re-sorts from
+  // the refetched board (pinned rows first) rather than guessing locally.
+  const pinChat = useMutation({
+    mutationFn: (vars) => rest(`/chats/${encodeURIComponent(vars.id)}/pin`, {
+      method: 'POST', body: { pinned: vars.pinned },
+    }),
+    onSuccess: () => invalidateChats(queryClient, selectedId),
+    onError: () => invalidateChats(queryClient, selectedId),
+  })
+
   const deleteChat = useMutation({
     mutationFn: (id) => rest(`/chats/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     onSuccess: () => invalidateChats(queryClient, selectedId),
@@ -3820,6 +3835,7 @@ function SuperagentPage() {
     errorText(stopChat.error) || errorText(retryChat.error) ||
     errorText(exportChat.error) || errorText(setChatModel.error) ||
     errorText(renameChat.error) || errorText(archiveChat.error) ||
+    errorText(pinChat.error) ||
     errorText(deleteChat.error) || notice
 
   const changeSessionModel = (next) => {
@@ -4065,6 +4081,7 @@ function SuperagentPage() {
             onRename: renameSession, onArchive: archiveSession, onDelete: deleteSession,
             showArchived, onToggleArchived: toggleArchived,
             archivedCount: archivedTotal, searchRef: railSearchRef,
+            onPin: (id, pinned) => pinChat.mutate({ id, pinned }),
           }),
           jsx(ChatCenter, {
             key: 'center', summary: selectedSummary, detail,

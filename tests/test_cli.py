@@ -1116,3 +1116,32 @@ def test_usage_rejects_an_out_of_range_window(
     rc = sa.sa_cli.run(_args(superagent_command="usage", days=0), object())
     assert rc == 2
     assert "--days" in capsys.readouterr().out
+
+
+# -- pinning ---------------------------------------------------------------
+
+
+def test_pin_and_unpin_report_and_persist(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    chat = sa.sa_chats.ChatStore(store.path)
+    session = chat.create_session("pin me")
+
+    rc = sa.sa_cli.run(_args(superagent_command="pin", session_id=session["id"]), object())
+    assert rc == 0
+    assert "pinned" in capsys.readouterr().out
+    assert chat.get_session(session["id"])["pinned_at"]
+
+    rc = sa.sa_cli.run(_args(superagent_command="unpin", session_id=session["id"]), object())
+    assert rc == 0
+    assert "unpinned" in capsys.readouterr().out
+    assert chat.get_session(session["id"])["pinned_at"] is None
+
+
+def test_pin_unknown_session_is_an_error(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+
+    rc = sa.sa_cli.run(_args(superagent_command="pin", session_id="S-9999"), object())
+    assert rc == 1
+    assert "unknown chat session" in capsys.readouterr().out
