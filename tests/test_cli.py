@@ -805,3 +805,92 @@ def test_parser_registers_preset_and_settings(sa):
     assert ns.preset == "fast"
     ns = parser.parse_args(["settings", "--json"])
     assert ns.superagent_command == "settings" and ns.json is True
+
+
+# -- search ----------------------------------------------------------------
+
+
+def test_search_prints_each_hit_and_its_snippet(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    chat = sa.sa_chats.ChatStore(store.path)
+    hit = chat.create_session("Fix the postgres migration")
+    chat.add_message(hit["id"], "assistant", "the rollback never ran")
+    chat.create_session("Add a regression test")
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="search", query=["rollback"], limit=20, archived="hide"),
+        object(),
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Search 'rollback'" in out
+    assert hit["id"] in out
+    assert "the rollback never ran" in out
+    assert "regression" not in out
+
+
+def test_search_json_carries_the_term_and_match_field(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    chat = sa.sa_chats.ChatStore(store.path)
+    hit = chat.create_session("Fix the postgres migration")
+    chat.add_message(hit["id"], "assistant", "the rollback never ran")
+
+    rc = sa.sa_cli.run(
+        _args(
+            superagent_command="search", query=["rollback"], limit=20,
+            archived="hide", json=True,
+        ),
+        object(),
+    )
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert data["query"] == "rollback"
+    assert data["sessions"][0]["id"] == hit["id"]
+    assert data["sessions"][0]["match_field"] == "message"
+
+
+def test_search_without_hits_prints_one_line(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    sa.sa_chats.ChatStore(store.path).create_session("something unrelated")
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="search", query=["zzz"], limit=20, archived="hide"),
+        object(),
+    )
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "No chats match 'zzz'."
+
+
+def test_search_needs_a_query(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="search", query=[], limit=20, archived="hide"),
+        object(),
+    )
+    assert rc == 2
+    assert "query" in capsys.readouterr().out
+
+
+def test_search_rejects_a_bad_archived_mode(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="search", query=["x"], limit=20, archived="nope"),
+        object(),
+    )
+    assert rc == 2
+    assert "--archived" in capsys.readouterr().out

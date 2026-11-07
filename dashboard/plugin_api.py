@@ -861,7 +861,9 @@ def list_models() -> dict[str, Any]:
 
 
 @router.get("/chats")
-def list_chats(limit: int = 50, status: str = "", archived: str = "hide") -> dict[str, Any]:
+def list_chats(
+    limit: int = 50, status: str = "", archived: str = "hide", q: str = ""
+) -> dict[str, Any]:
     """Sessions newest-first; live rows carry ``recent_events``/``elapsed_seconds``.
 
     ``?status=running,queued`` narrows the rows (comma separated); omitting it
@@ -869,6 +871,12 @@ def list_chats(limit: int = 50, status: str = "", archived: str = "hide") -> dic
     archived sessions are visible (default ``hide``); an unknown value is a 400
     rather than a silently different board. Status counts describe the visible
     set, and ``archived_count`` always says how many are filed away.
+
+    ``?q=`` searches instead of listing: titles, opening prompts and every
+    stored message are matched case-insensitively, and each returned row adds
+    ``match_field`` / ``match_snippet`` so the rail can show why it matched.
+    The term is capped at ``SEARCH_QUERY_CHARS``; longer input is a 400 rather
+    than a silently truncated search.
     """
     path = _db_path()
     if not path.is_file():
@@ -883,11 +891,23 @@ def list_chats(limit: int = 50, status: str = "", archived: str = "hide") -> dic
             status_code=400,
             detail=f"archived must be one of {', '.join(sa_chats.ARCHIVED_MODES)}",
         )
+    term = str(q or "").strip()
+    if len(term) > sa_chats.SEARCH_QUERY_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"q must be at most {sa_chats.SEARCH_QUERY_CHARS} characters",
+        )
     # A list read is also the supervisor: turns past the timeout are cancelled
     # here, so a forgotten chat cannot hold a worker slot forever.
     _reap_turns()
     statuses = [part.strip() for part in str(status or "").split(",") if part.strip()]
-    data = _chat_store().list_sessions(limit=limit, statuses=statuses, archived=mode)
+    store = _chat_store()
+    if term:
+        data = store.search_sessions(
+            term, limit=limit, statuses=statuses, archived=mode
+        )
+    else:
+        data = store.list_sessions(limit=limit, statuses=statuses, archived=mode)
     return {"db_exists": True, **data}
 
 
