@@ -841,6 +841,21 @@ def update_settings(body: dict | None = None) -> dict[str, Any]:
     return {"ok": True, "settings": _settings_payload()}
 
 
+@router.get("/usage")
+def usage(days: int = 14) -> dict[str, Any]:
+    """Chat activity for the last ``days``: totals, a daily series, per-model rows.
+
+    Read-only and aggregated from the chat tables only — nothing here depends
+    on the worker runner, so it answers while every slot is busy.
+    """
+    days = max(1, min(int(days if days is not None else 14), 90))
+    return {
+        "ok": True,
+        "db_exists": _db_path().is_file(),
+        **_chat_store().usage(days),
+    }
+
+
 @router.get("/models")
 def list_models() -> dict[str, Any]:
     settings = sa_settings.load_settings()

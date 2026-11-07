@@ -806,6 +806,75 @@ class ChatStore:
             ).fetchall()
         return {row["status"]: row["n"] for row in rows}
 
+    def usage(self, days: int = 14, now: float | None = None) -> dict:
+        """Totals, a local-day series and a per-model split for the last ``days``.
+
+        Aggregated in Python on purpose: SQLite's ``date()`` is UTC, which would
+        move a 01:00 +08 session into the previous day and make the chart lie.
+        The series is filled to exactly ``days`` buckets so a bar chart keeps a
+        stable width even on quiet weeks.
+        """
+        days = max(1, int(days))
+        now = time.time() if now is None else now
+        since = now - days * 86400
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT created_at, tokens, duration_ms, status, model, provider"
+                " FROM chat_sessions WHERE created_at >= ?",
+                (since,),
+            ).fetchall()
+            turns = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM chat_events"
+                    " WHERE created_at >= ? AND kind IN ('launched', 'retry')",
+                    (since,),
+                ).fetchone()["n"]
+            )
+
+        series: dict[str, dict] = {}
+        models: dict[tuple[str, str], dict] = {}
+        counts: dict[str, int] = {}
+        totals = {"sessions": len(rows), "turns": turns, "tokens": 0, "duration_ms": 0}
+        for row in rows:
+            day = (
+                datetime.fromtimestamp(float(row["created_at"]))
+                .astimezone()
+                .strftime("%Y-%m-%d")
+            )
+            bucket = series.setdefault(day, {"date": day, "sessions": 0, "tokens": 0})
+            tokens = int(row["tokens"] or 0)
+            bucket["sessions"] += 1
+            bucket["tokens"] += tokens
+            totals["tokens"] += tokens
+            totals["duration_ms"] += int(row["duration_ms"] or 0)
+            status = str(row["status"] or "")
+            counts[status] = counts.get(status, 0) + 1
+            key = (str(row["model"] or ""), str(row["provider"] or ""))
+            model = models.setdefault(
+                key,
+                {"model": key[0], "provider": key[1], "sessions": 0, "tokens": 0},
+            )
+            model["sessions"] += 1
+            model["tokens"] += tokens
+
+        filled = []
+        for offset in range(days - 1, -1, -1):
+            day = (
+                datetime.fromtimestamp(now - offset * 86400)
+                .astimezone()
+                .strftime("%Y-%m-%d")
+            )
+            filled.append(series.get(day, {"date": day, "sessions": 0, "tokens": 0}))
+        return {
+            "days": days,
+            "since": since,
+            "totals": {**totals, "counts": counts},
+            "series": filled,
+            "models": sorted(
+                models.values(), key=lambda m: (-m["sessions"], m["model"])
+            ),
+        }
+
     def exists(self, session_id: str) -> bool:
         with self._connect() as conn:
             row = conn.execute("SELECT 1 FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
