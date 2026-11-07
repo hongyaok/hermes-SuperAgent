@@ -2284,9 +2284,53 @@ const DIFF_LETTERS = {
 // A 5 000-file status is not a review: show the head and say how much is left.
 const DIFF_FILE_ROWS = 200
 
+/** Split a unified patch into one block per file, keeping each `diff --git`
+ *  header so the raw text stays readable. Adds/deletes are counted per block
+ *  for the header badges; a preamble before the first file (truncation notice,
+ *  binary marker) becomes a pathless block instead of being dropped. */
+function splitPatch(patch) {
+  const text = String(patch || '')
+  if (!text.trim()) return []
+  const blocks = []
+  let current = null
+  for (const line of text.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      const match = line.match(/^diff --git a\/(.+?) b\/(.+)$/)
+      current = { path: match ? match[2] : '', lines: [line] }
+      blocks.push(current)
+    } else if (current) {
+      current.lines.push(line)
+    } else {
+      current = { path: '', lines: [line] }
+      blocks.push(current)
+    }
+  }
+  return blocks.map((block, index) => ({
+    key: `b${index}`,
+    path: block.path,
+    body: block.lines.join('\n'),
+    adds: block.lines.filter((l) => l.startsWith('+') && !l.startsWith('+++')).length,
+    dels: block.lines.filter((l) => l.startsWith('-') && !l.startsWith('---')).length,
+  }))
+}
+
+/** Clipboard write that never rejects at the caller: a shell without the API
+ *  resolves false, so the button just does not announce "Copied". */
+function copyToClipboard(value) {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard
+      && typeof navigator.clipboard.writeText === 'function') {
+      return navigator.clipboard.writeText(String(value || '')).then(() => true, () => false)
+    }
+  } catch (error) {
+    // Fall through to the no-op.
+  }
+  return Promise.resolve(false)
+}
+
 /** Collapsible "what did this session change" panel, between transcript and
  *  composer. The query is owned by ChatCenter (the header needs its count);
- *  this component only renders it. */
+ *  this component only renders it, one collapsible section per file. */
 function DiffPanel({ session, query, onClose }) {
   const data = (query && query.data) || {}
   const files = Array.isArray(data.files) ? data.files : []
@@ -2295,6 +2339,43 @@ function DiffPanel({ session, query, onClose }) {
   const failed = (data && data.ok === false && data.error) || ''
   const error = failed || errorText(query && query.error)
   const fetching = !!(query && query.isFetching)
+  const blocks = useMemo(() => splitPatch(data.patch), [data.patch])
+  const [collapsed, setCollapsed] = useState({})
+  const [copied, setCopied] = useState('')
+  const blockRefs = useRef([])
+  const copyTimer = useRef(null)
+
+  // A new chat means new files: stale collapse/copy state would point at the
+  // previous diff's indexes.
+  useEffect(() => {
+    setCollapsed({})
+    setCopied('')
+  }, [session && session.id])
+  useEffect(() => () => {
+    if (copyTimer.current) clearTimeout(copyTimer.current)
+  }, [])
+
+  const copy = (value, tag) => {
+    copyToClipboard(value).then((ok) => {
+      if (!ok) return
+      setCopied(tag)
+      if (copyTimer.current) clearTimeout(copyTimer.current)
+      copyTimer.current = setTimeout(() => setCopied(''), 1200)
+    })
+  }
+
+  // `git status` paths and patch paths normally agree; a rename can disagree,
+  // so fall back to a suffix match and otherwise leave the row inert.
+  const blockIndex = (path) => blocks.findIndex((block) => block.path && (
+    block.path === path || block.path.endsWith(`/${path}`) || path.endsWith(`/${block.path}`)
+  ))
+
+  const jump = (index) => {
+    const element = blockRefs.current[index]
+    if (element && typeof element.scrollIntoView === 'function') {
+      element.scrollIntoView({ block: 'nearest' })
+    }
+  }
 
   return jsxs('div', {
     className: cn('flex max-h-[22rem] min-h-0 flex-col gap-1.5 overflow-y-auto rounded border',
@@ -2325,6 +2406,11 @@ function DiffPanel({ session, query, onClose }) {
           jsxs('div', {
             key: 'a', className: 'flex shrink-0 items-center gap-1',
             children: [
+              data.patch ? jsx(GhostButton, {
+                key: 'copy', title: 'Copy the whole patch',
+                onClick: () => copy(String(data.patch), 'patch'),
+                children: copied === 'patch' ? 'Copied' : 'Copy patch',
+              }) : null,
               jsx(GhostButton, {
                 key: 'refresh', onClick: () => query && query.refetch(), disabled: fetching,
                 children: fetching ? 'Refreshing…' : 'Refresh',
@@ -2353,10 +2439,9 @@ function DiffPanel({ session, query, onClose }) {
         ? jsxs('div', {
             key: 'files', className: 'flex shrink-0 flex-col gap-0.5',
             children: [
-              ...shown.map((file, index) => jsxs('div', {
-                key: `f${index}`,
-                className: 'flex min-w-0 items-baseline gap-1.5 font-mono text-[0.6875rem]',
-                children: [
+              ...shown.map((file, index) => {
+                const target = blockIndex(file.path)
+                const cells = [
                   jsx('span', {
                     key: 's', className: 'w-5 shrink-0 text-(--ui-text-quaternary)',
                     children: DIFF_LETTERS[file.status] || '?',
@@ -2365,8 +2450,23 @@ function DiffPanel({ session, query, onClose }) {
                     key: 'p', className: 'min-w-0 truncate text-(--ui-text-tertiary)',
                     children: file.path,
                   }),
-                ],
-              })),
+                ]
+                // Only a file that has a patch section is a jump target;
+                // an untracked or binary row stays a plain line.
+                return target >= 0
+                  ? jsx('button', {
+                      key: `f${index}`, type: 'button', onClick: () => jump(target),
+                      title: 'Jump to this file in the patch',
+                      className: cn('flex min-w-0 items-baseline gap-1.5 rounded px-0.5 text-left',
+                        'font-mono text-[0.6875rem] hover:bg-(--chrome-action-hover)'),
+                      children: cells,
+                    })
+                  : jsx('div', {
+                      key: `f${index}`,
+                      className: 'flex min-w-0 items-baseline gap-1.5 px-0.5 font-mono text-[0.6875rem]',
+                      children: cells,
+                    })
+              }),
               hidden > 0
                 ? jsx('div', {
                     key: 'more', className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
@@ -2384,12 +2484,64 @@ function DiffPanel({ session, query, onClose }) {
             children: String(data.stat),
           })
         : null,
-      data.patch
-        ? jsx('pre', {
-            key: 'patch',
-            className: cn('min-h-0 shrink-0 overflow-x-auto whitespace-pre font-mono text-[0.6875rem]',
-              'leading-[1.35] text-(--ui-text-quaternary)'),
-            children: String(data.patch),
+      blocks.length
+        ? jsxs('div', {
+            key: 'blocks', className: 'flex min-h-0 shrink-0 flex-col gap-1',
+            children: blocks.map((block, index) => {
+              const isCollapsed = !!collapsed[index]
+              return jsxs('div', {
+                key: block.key,
+                ref: (element) => { blockRefs.current[index] = element },
+                className: 'rounded border border-(--ui-stroke-secondary)',
+                children: [
+                  jsxs('div', {
+                    key: 'h',
+                    className: 'flex min-w-0 items-center gap-1.5 px-1.5 py-0.5 font-mono text-[0.6875rem]',
+                    children: [
+                      jsx('button', {
+                        key: 't', type: 'button',
+                        'aria-expanded': !isCollapsed,
+                        title: block.path || 'patch',
+                        onClick: () => setCollapsed((previous) => ({
+                          ...previous, [index]: !previous[index],
+                        })),
+                        className: cn('min-w-0 flex-1 truncate text-left',
+                          'text-(--ui-text-secondary) hover:text-(--ui-text-primary)'),
+                        children: `${isCollapsed ? '▸' : '▾'} ${block.path || '(patch)'}`,
+                      }),
+                      block.adds
+                        ? jsx('span', {
+                            key: 'a', className: 'shrink-0 text-(--ui-text-quaternary)',
+                            children: `+${block.adds}`,
+                          })
+                        : null,
+                      block.dels
+                        ? jsx('span', {
+                            key: 'd', className: 'shrink-0 text-(--ui-text-quaternary)',
+                            children: `-${block.dels}`,
+                          })
+                        : null,
+                      block.path
+                        ? jsx(GhostButton, {
+                            key: 'c', title: 'Copy this path',
+                            onClick: () => copy(block.path, block.key),
+                            children: copied === block.key ? 'Copied' : 'Copy',
+                          })
+                        : null,
+                    ],
+                  }),
+                  isCollapsed
+                    ? null
+                    : jsx('pre', {
+                        key: 'b',
+                        className: cn('overflow-x-auto whitespace-pre border-t',
+                          'border-(--ui-stroke-secondary) px-1.5 py-1 font-mono',
+                          'text-[0.6875rem] leading-[1.35] text-(--ui-text-quaternary)'),
+                        children: block.body,
+                      }),
+                ],
+              })
+            }),
           })
         : null,
     ],

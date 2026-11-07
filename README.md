@@ -431,7 +431,7 @@ Closing the loop does not need a push. A finished session leaves its changes in 
 - the file count, the repository and a *patch truncated* note when the cap hit;
 - the `git diff --stat` block (plus a `staged:` block when the index has changes);
 - one row per file with its porcelain letter (`M`, `A`, `D`, `R`, `??`, `!`); past 200 files it says how many were not listed;
-- the patch itself in a monospace `<pre>`.
+- **one collapsible section per file**: the path, its `+n/-n` counts, and the file's own patch. Clicking a file row jumps to its section; **Copy** copies that path. **Copy patch** copies the whole patch, and a pathless preamble (truncation note, binary marker) still renders rather than disappearing.
 
 **Comment on PR button.** Visible when the session carries a PR number *and* a GitHub token is saved. It opens an inline confirm — never `window.confirm` — with a textarea prefilled from the preview endpoint, **Post** and **Cancel**. The button is disabled while a turn is running and nothing is posted until **Post** is pressed; the success notice links to the new comment. A user edit is never overwritten by a preview refetch.
 
