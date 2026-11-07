@@ -133,6 +133,11 @@ LIVE_STATUSES = (QUEUED, RUNNING)
 RECENT_EVENT_LIMIT = 3
 RECENT_EVENT_CHARS = 160
 
+# Search: the longest term the HTTP layer accepts, and the width of the
+# one-line excerpt a rail row can show under its title.
+SEARCH_QUERY_CHARS = 200
+SEARCH_SNIPPET_CHARS = 160
+
 
 def derive_title(prompt: str, limit: int = MAX_TITLE_CHARS) -> str:
     """First non-empty line of the prompt, clipped to ``limit`` characters."""
@@ -164,6 +169,77 @@ def _elapsed_seconds(row: dict, now: float) -> Optional[int]:
     if not started or row.get("status") == QUEUED:
         return 0
     return max(0, int(now - started))
+
+
+def _escape_like(term: str) -> str:
+    """Escape LIKE wildcards so a literal ``%`` cannot match every row.
+
+    SQLite treats ``%`` and ``_`` as wildcards and has no default escape
+    character; every query that uses this must add ``ESCAPE '\\'``.
+    """
+    return (
+        str(term)
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
+def _snippet(text: Any, needle: str, limit: int = SEARCH_SNIPPET_CHARS) -> str:
+    """One readable line around the first hit, ``…`` on a clipped edge."""
+    body = " ".join(str(text or "").split())
+    if not body:
+        return ""
+    low = body.lower()
+    index = low.find(str(needle or "").lower())
+    if index < 0 or len(body) <= limit:
+        return body[:limit]
+    room = max(0, limit - len(needle))
+    start = max(0, index - room // 2)
+    end = min(len(body), start + limit)
+    start = max(0, end - limit)
+    lead = start > 0
+    tail = end < len(body)
+    # Each marker costs a character, so shrink the window by that much: the
+    # excerpt (markers included) is what has to fit the rail's one line.
+    excess = int(lead) + int(tail)
+    if excess:
+        end = max(start + 1, end - excess)
+        tail = end < len(body)
+    piece = body[start:end]
+    if lead:
+        piece = "…" + piece.lstrip()
+    if tail:
+        piece = piece.rstrip() + "…"
+    return piece
+
+
+def _board_counts(conn: sqlite3.Connection, mode: str) -> tuple[dict[str, int], int]:
+    """Status counts and the archived total for one visibility mode.
+
+    Counts describe the board, not the current row filter: a search or a
+    status tab must not restate "3 review" as "1 review". They do obey
+    ``archived`` visibility, so a hidden chat never inflates a number the
+    rail cannot show, and ``archived_count`` always reports the real total.
+    """
+    count_clause = ""
+    if mode == "hide":
+        count_clause = " WHERE archived_at IS NULL"
+    elif mode == "only":
+        count_clause = " WHERE archived_at IS NOT NULL"
+    counts = {
+        row["status"]: row["n"]
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS n FROM chat_sessions" + count_clause
+            + " GROUP BY status"
+        )
+    }
+    archived_count = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM chat_sessions WHERE archived_at IS NOT NULL"
+        ).fetchone()["n"]
+    )
+    return counts, archived_count
 
 
 class ChatStore:
@@ -396,13 +472,6 @@ class ChatStore:
         elif mode == "only":
             clauses.append("s.archived_at IS NOT NULL")
         clause = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        # Counts ignore the status filter (existing behaviour) but obey the
-        # archived one, so "running" can never count a hidden card.
-        count_clause = ""
-        if mode == "hide":
-            count_clause = " WHERE archived_at IS NULL"
-        elif mode == "only":
-            count_clause = " WHERE archived_at IS NOT NULL"
         params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
@@ -411,18 +480,7 @@ class ChatStore:
                 " ORDER BY s.updated_at DESC LIMIT ?",
                 params,
             ).fetchall()
-            counts = {
-                row["status"]: row["n"]
-                for row in conn.execute(
-                    "SELECT status, COUNT(*) AS n FROM chat_sessions" + count_clause
-                    + " GROUP BY status"
-                )
-            }
-            archived_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS n FROM chat_sessions WHERE archived_at IS NOT NULL"
-                ).fetchone()["n"]
-            )
+            counts, archived_count = _board_counts(conn, mode)
             sessions = [dict(row) for row in rows]
             live_ids = [row["id"] for row in sessions if row["status"] in LIVE_STATUSES]
             feeds = self._recent_events(conn, live_ids)
@@ -437,6 +495,109 @@ class ChatStore:
             "running": counts.get(RUNNING, 0),
             "archived_count": archived_count,
         }
+
+    def search_sessions(
+        self,
+        query: str,
+        limit: int = 50,
+        statuses: Optional[Sequence[str]] = None,
+        archived: str = "hide",
+    ) -> dict:
+        """Sessions whose title, prompt or any message contains ``query``.
+
+        Same board semantics as :meth:`list_sessions` — archived visibility,
+        the optional status filter, newest-first order, and counts that
+        describe the board rather than the hit list — so the rail can swap one
+        call for the other without its header numbers changing meaning.
+
+        Each row also carries ``match_field`` (``title`` / ``prompt`` /
+        ``message``) and ``match_snippet``: why the chat matched, in one line.
+        A blank query is exactly :meth:`list_sessions`, with no ``match_*``
+        keys at all.
+
+        Matching is SQLite ``LIKE``, which folds case for ASCII only, and the
+        term is escaped, so searching ``100%`` looks for that literal.
+        """
+        term = str(query or "").strip()
+        if not term:
+            return self.list_sessions(limit=limit, statuses=statuses, archived=archived)
+        limit = max(1, int(limit))
+        mode = str(archived or "hide").strip().lower()
+        if mode not in ARCHIVED_MODES:
+            raise ValueError(
+                f"archived must be one of {', '.join(ARCHIVED_MODES)} (got {archived!r})"
+            )
+        wanted = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+        pattern = "%" + _escape_like(term) + "%"
+        clauses: list[str] = [
+            "(s.title LIKE ? ESCAPE '\\' OR s.prompt LIKE ? ESCAPE '\\'"
+            " OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.session_id = s.id"
+            " AND m.content LIKE ? ESCAPE '\\'))"
+        ]
+        params: list[Any] = [pattern, pattern, pattern]
+        if wanted:
+            clauses.append("s.status IN (%s)" % ", ".join("?" for _ in wanted))
+            params.extend(wanted)
+        if mode == "hide":
+            clauses.append("s.archived_at IS NULL")
+        elif mode == "only":
+            clauses.append("s.archived_at IS NOT NULL")
+        clause = " WHERE " + " AND ".join(clauses)
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT s.*, (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id)"
+                " AS message_count FROM chat_sessions s" + clause +
+                " ORDER BY s.updated_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+            sessions = [dict(row) for row in rows]
+            hits = self._matching_messages(conn, [row["id"] for row in sessions], pattern)
+            counts, archived_count = _board_counts(conn, mode)
+            live_ids = [row["id"] for row in sessions if row["status"] in LIVE_STATUSES]
+            feeds = self._recent_events(conn, live_ids)
+        needle = term.lower()
+        now = time.time()
+        for session in sessions:
+            title = str(session.get("title") or "")
+            prompt = str(session.get("prompt") or "")
+            if needle in title.lower():
+                field, text = "title", title
+            elif needle in prompt.lower():
+                field, text = "prompt", prompt
+            else:
+                field, text = "message", hits.get(session["id"], "")
+            session["match_field"] = field
+            session["match_snippet"] = _snippet(text, needle)
+            session["elapsed_seconds"] = _elapsed_seconds(session, now)
+            if session["id"] in feeds:
+                session["recent_events"] = feeds[session["id"]]
+        return {
+            "sessions": sessions,
+            "counts": counts,
+            "running": counts.get(RUNNING, 0),
+            "archived_count": archived_count,
+        }
+
+    def _matching_messages(
+        self,
+        conn: sqlite3.Connection,
+        session_ids: Sequence[str],
+        pattern: str,
+    ) -> dict[str, str]:
+        """Newest message that matches ``pattern`` for each session, one query."""
+        ids = [str(session_id) for session_id in session_ids if session_id]
+        if not ids:
+            return {}
+        rows = conn.execute(
+            "SELECT session_id, content FROM chat_messages WHERE session_id IN (%s)"
+            " AND content LIKE ? ESCAPE '\\' ORDER BY id DESC" % ", ".join("?" for _ in ids),
+            [*ids, pattern],
+        ).fetchall()
+        hits: dict[str, str] = {}
+        for row in rows:
+            hits.setdefault(row["session_id"], row["content"] or "")
+        return hits
 
     def _recent_events(
         self,

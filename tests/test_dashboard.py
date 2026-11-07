@@ -936,3 +936,40 @@ def test_health_on_a_database_without_chat_tables(tmp_path, monkeypatch):
     assert body["db_exists"] is True
     assert body["archived_count"] == 0
 
+
+
+# -- chat search -----------------------------------------------------------
+
+
+def test_list_chats_search_filters_and_explains_the_hit(chat_api):
+    api, _ = chat_api
+    store = api.sa_chats.ChatStore(api._db_path())
+    hit = store.create_session("Fix the parser crash")
+    store.add_message(
+        hit["id"], "assistant", "the stack overflow came from recursive descent"
+    )
+    store.create_session("Add a regression test")
+
+    body = api.list_chats(q="  stack overflow  ")
+    assert [row["id"] for row in body["sessions"]] == [hit["id"]]
+    row = body["sessions"][0]
+    assert row["match_field"] == "message"
+    assert "stack overflow" in row["match_snippet"]
+    # Counts still describe the board, not the hit list.
+    assert sum(body["counts"].values()) == 2
+
+
+def test_list_chats_empty_query_keeps_the_plain_list(chat_api):
+    api, _ = chat_api
+    store = api.sa_chats.ChatStore(api._db_path())
+    store.create_session("Fix the parser crash")
+
+    row = api.list_chats(q="")["sessions"][0]
+    assert "match_field" not in row
+
+
+def test_list_chats_rejects_an_overlong_query(chat_api):
+    api, _ = chat_api
+    with pytest.raises(api.HTTPException) as excinfo:
+        api.list_chats(q="x" * (api.sa_chats.SEARCH_QUERY_CHARS + 1))
+    assert excinfo.value.status_code == 400

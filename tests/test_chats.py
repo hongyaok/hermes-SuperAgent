@@ -413,3 +413,100 @@ def test_delete_keeps_the_github_dedupe_rows_and_files_on_disk(tmp_path, chat):
     assert chat.is_seen("gh_comment:owner/repo:7") is True
     # ...and a delete is never a file operation.
     assert marker.read_text(encoding="utf-8") == "still here"
+
+
+# -- search ---------------------------------------------------------------
+
+
+def test_search_reports_where_it_matched(chat):
+    title_hit = chat.create_session("Fix the postgres migration")
+    prompt_hit = chat.create_session(
+        "Investigate the flaky test\n\nit mentions websocket frames"
+    )
+    message_hit = chat.create_session("Unrelated opening line")
+    chat.add_message(message_hit["id"], "assistant", "the backoff jitter was missing")
+
+    rows = chat.search_sessions("jitter")["sessions"]
+    assert [row["id"] for row in rows] == [message_hit["id"]]
+    assert rows[0]["match_field"] == "message"
+    assert "backoff jitter" in rows[0]["match_snippet"]
+
+    rows = chat.search_sessions("postgres")["sessions"]
+    assert [(row["id"], row["match_field"]) for row in rows] == [
+        (title_hit["id"], "title")
+    ]
+
+    rows = chat.search_sessions("websocket")["sessions"]
+    assert [(row["id"], row["match_field"]) for row in rows] == [
+        (prompt_hit["id"], "prompt")
+    ]
+
+
+def test_search_folds_case(chat):
+    session = chat.create_session("Fix the Postgres migration")
+    assert [row["id"] for row in chat.search_sessions("POSTGRES")["sessions"]] == [
+        session["id"]
+    ]
+
+
+def test_search_escapes_like_wildcards(chat):
+    percent = chat.create_session("100% coverage")
+    chat.create_session("plain task")
+
+    # A literal % must not behave as "match everything"...
+    assert [row["id"] for row in chat.search_sessions("%")["sessions"]] == [percent["id"]]
+    # ...and a literal _ must not match any single character.
+    assert chat.search_sessions("_")["sessions"] == []
+
+
+def test_search_obeys_archived_visibility(chat):
+    visible = chat.create_session("keep me visible")
+    filed = chat.create_session("file me away")
+    chat.set_archived(filed["id"])
+
+    assert chat.search_sessions("file")["sessions"] == []
+    assert [row["id"] for row in chat.search_sessions("file", archived="only")["sessions"]] == [
+        filed["id"]
+    ]
+    assert {row["id"] for row in chat.search_sessions("e", archived="all")["sessions"]} == {
+        visible["id"], filed["id"]
+    }
+
+
+def test_search_limit_is_newest_first(chat):
+    chat.create_session("alpha one")
+    second = chat.create_session("alpha two")
+    third = chat.create_session("alpha three")
+
+    rows = chat.search_sessions("alpha", limit=2)["sessions"]
+    assert [row["id"] for row in rows] == [third["id"], second["id"]]
+
+
+def test_search_snippet_is_capped_and_marked(chat):
+    session = chat.create_session("long one")
+    chat.add_message(
+        session["id"], "assistant", ("lorem " * 60) + "NEEDLE" + (" ipsum" * 60)
+    )
+
+    snippet = chat.search_sessions("needle")["sessions"][0]["match_snippet"]
+    assert len(snippet) <= sa_chats.SEARCH_SNIPPET_CHARS
+    assert snippet.startswith("…") and snippet.endswith("…")
+    assert "NEEDLE" in snippet
+
+
+def test_search_without_hits_is_empty(chat):
+    chat.create_session("something")
+    assert chat.search_sessions("nothing-like-this")["sessions"] == []
+
+
+def test_blank_search_is_the_plain_list(chat):
+    chat.create_session("one")
+    chat.create_session("two")
+
+    listed = chat.list_sessions()
+    searched = chat.search_sessions("   ")
+    assert [row["id"] for row in searched["sessions"]] == [
+        row["id"] for row in listed["sessions"]
+    ]
+    assert all("match_field" not in row for row in searched["sessions"])
+    assert searched["counts"] == listed["counts"]

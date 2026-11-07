@@ -595,6 +595,30 @@ def render_sessions(data: dict) -> str:
     return "\n".join(lines)
 
 
+def render_search(data: dict) -> str:
+    """One block per hit: where it was, what it says, and why it matched."""
+    rows = data.get("sessions") or []
+    term = str(data.get("query") or "")
+    if not rows:
+        return f"No chats match '{term}'."
+    lines = [
+        f"Search '{term}'   {len(rows)} match{'es' if len(rows) != 1 else ''}",
+        "",
+    ]
+    for row in rows:
+        session_id = str(row.get("id") or "?")
+        status = str(row.get("status") or "?")
+        age = _format_age(
+            time.time() - float(row.get("updated_at") or row.get("created_at") or 0)
+        )
+        title = " ".join(str(row.get("title") or row.get("prompt") or "").split())
+        snippet = " ".join(str(row.get("match_snippet") or "").split())
+        lines.append(f"  {session_id}  {status:<9} {age:>4}  {title}")
+        if snippet:
+            lines.append(f"      {snippet}")
+    return "\n".join(lines)
+
+
 def render_chat(session: dict, db_path: str = "") -> str:
     if not isinstance(session, dict):
         return str(session)
@@ -814,6 +838,48 @@ def _list_sessions(args: argparse.Namespace, engine: Any, want_json: bool) -> in
         json.dumps(payload, indent=2, default=str)
         if want_json
         else render_sessions(payload)
+    )
+    return 0
+
+
+def _search_chats(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
+    """Search the chat store; a blank term or bad mode is a usage error."""
+    term = " ".join(getattr(args, "query", []) or []).strip()
+    if not term:
+        print("error: search needs a query")
+        return 2
+    if len(term) > sa_chats.SEARCH_QUERY_CHARS:
+        print(
+            f"error: query too long (max {sa_chats.SEARCH_QUERY_CHARS} characters)"
+        )
+        return 2
+    archived = str(getattr(args, "archived", "hide") or "hide").strip().lower()
+    if archived not in sa_chats.ARCHIVED_MODES:
+        print(f"error: --archived must be one of {', '.join(sa_chats.ARCHIVED_MODES)}")
+        return 2
+    try:
+        limit = int(getattr(args, "limit", 20) or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 200))
+    try:
+        store = _chat_store(engine)
+        data = store.search_sessions(term, limit=limit, archived=archived)
+        payload = {
+            "query": term,
+            "db_exists": Path(str(store.path)).is_file(),
+            "sessions": _enrich_sessions(data),
+            "counts": data.get("counts") or {},
+            "running": data.get("running", 0),
+            "archived_count": data.get("archived_count", 0),
+        }
+    except Exception as exc:
+        print(f"error: search failed: {exc}")
+        return 1
+    print(
+        json.dumps(payload, indent=2, default=str)
+        if want_json
+        else render_search(payload)
     )
     return 0
 
@@ -1406,6 +1472,16 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         help="Include archived sessions (hidden by default)",
     )
     _add_json_flag(sessions_p)
+    search_p = subs.add_parser(
+        "search", help="Search chat titles, prompts and transcripts"
+    )
+    search_p.add_argument("query", nargs="+", help="Text to look for")
+    search_p.add_argument("--limit", type=int, default=20, help="How many matches to show")
+    search_p.add_argument(
+        "--archived", default="hide", choices=("hide", "only", "all"),
+        help="Archived visibility: hide (default), only or all",
+    )
+    _add_json_flag(search_p)
     stop_p = subs.add_parser("stop", help="Cancel a queued or running chat turn")
     stop_p.add_argument("session_id", help="Chat session id (e.g. S-0001)")
     _add_json_flag(stop_p)
@@ -1530,6 +1606,9 @@ def run(args: argparse.Namespace, ctx: Any) -> int:
 
     if command == "sessions":
         return _list_sessions(args, engine, want_json)
+
+    if command == "search":
+        return _search_chats(args, engine, want_json)
 
     if command == "stop":
         session_id = _session_id_arg(getattr(args, "session_id", ""))

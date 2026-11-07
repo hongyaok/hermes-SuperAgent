@@ -70,6 +70,8 @@ const ID = 'superagent'
 // Polling budgets. A live worker is worth 2s; a quiet board is not.
 const LIST_POLL_RUNNING = 2000
 const LIST_POLL_QUIET = 8000
+// Typing in the rail is cheap; a search round-trip per keystroke is not.
+const SEARCH_DEBOUNCE_MS = 250
 const DETAIL_POLL_RUNNING = 1500
 const DETAIL_POLL_QUIET = 6000
 const TICKET_POLL = 15000
@@ -323,9 +325,11 @@ function fetchTickets() {
   return rest ? rest('/tickets') : Promise.reject(new Error('backend not ready'))
 }
 
-function fetchChats(archived) {
+function fetchChats(archived, query) {
   const suffix = archived === 'all' ? '&archived=all' : ''
-  return rest ? rest(`/chats?limit=50${suffix}`) : Promise.reject(new Error('backend not ready'))
+  const needle = String(query || '').trim()
+  const term = needle ? `&q=${encodeURIComponent(needle)}` : ''
+  return rest ? rest(`/chats?limit=50${suffix}${term}`) : Promise.reject(new Error('backend not ready'))
 }
 
 function fetchChat(id) {
@@ -375,6 +379,19 @@ function useChats(archived = 'hide') {
       const data = query.state.data
       return data && (data.running || 0) > 0 ? LIST_POLL_RUNNING : LIST_POLL_QUIET
     },
+  })
+}
+
+/** Server-side search. The query key carries the term, so a late response for
+ *  an older term can never overwrite the newest one; a blank term disables the
+ *  query and the rail falls back to the plain list. Results are not polled —
+ *  a finished chat does not change what it said. */
+function useChatSearch(term, archived = 'hide') {
+  return useQuery({
+    queryKey: [ID, 'chats', 'search', archived, term],
+    queryFn: () => fetchChats(archived, term),
+    enabled: !!term,
+    retry: false,
   })
 }
 
@@ -615,7 +632,7 @@ function RailMenuItem({ label, onSelect }) {
  *  becomes "Confirm delete" for three seconds.
  */
 function SessionRow({
-  session, selected, onSelect, onRename, onArchive, onDelete, onDeleteAsk, opensUp,
+  session, selected, onSelect, onRename, onArchive, onDelete, onDeleteAsk, opensUp, match,
 }) {
   const archived = !!session.archived_at
   const [menuOpen, setMenuOpen] = useState(false)
@@ -788,8 +805,23 @@ function SessionRow({
             children: [
               jsx(StatusGlyph, { key: 'g', status: session.status, pulse: true }),
               jsx('span', {
-                key: 't', className: 'min-w-0 flex-1 truncate text-xs text-(--ui-text-secondary)',
-                children: sessionTitle(session),
+                key: 't', className: 'flex min-w-0 flex-1 flex-col',
+                children: [
+                  jsx('span', {
+                    key: 'title', className: 'truncate text-xs text-(--ui-text-secondary)',
+                    children: sessionTitle(session),
+                  }),
+                  // Why the chat matched: only while a search is active, so a
+                  // normal rail row stays one line.
+                  match
+                    ? jsx('span', {
+                        key: 'match',
+                        title: match,
+                        className: 'truncate text-[0.6875rem] leading-4 text-(--ui-text-quaternary)',
+                        children: match,
+                      })
+                    : null,
+                ],
               }),
               archived
                 ? jsx('span', {
@@ -847,15 +879,6 @@ function railFilterMatch(session, filter) {
   return true
 }
 
-/** Client-side search over the two things a chat is remembered by: its title
- *  and the request that opened it. */
-function railQueryMatch(session, query) {
-  const needle = String(query || '').trim().toLowerCase()
-  if (!needle) return true
-  const haystack = `${sessionTitle(session)}\n${String((session && session.prompt) || '')}`.toLowerCase()
-  return haystack.indexOf(needle) !== -1
-}
-
 const RAIL_EMPTY = {
   all: 'No chats yet.',
   live: 'Nothing running.',
@@ -900,6 +923,16 @@ function SessionsRail({
 }) {
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
+  // The debounced term is what the server sees; `query` stays instant so the
+  // input never feels laggy.
+  const [term, setTerm] = useState('')
+  useEffect(() => {
+    const handle = setTimeout(() => setTerm(String(query || '').trim()), SEARCH_DEBOUNCE_MS)
+    return () => clearTimeout(handle)
+  }, [query])
+  const search = useChatSearch(term, showArchived ? 'all' : 'hide')
+  const searching = !!term
+  const source = searching ? ((search.data && search.data.sessions) || []) : sessions
   // The delete confirm step: the SDK dialog needs to live above the row that
   // opened it (a row can unmount as soon as the list refreshes).
   const [pendingDelete, setPendingDelete] = useState(null)
@@ -907,9 +940,8 @@ function SessionsRail({
   // chat closes it so the transcript gets the screen. md+ ignores this state.
   const [open, setOpen] = useState(() => !selectedId)
   const shown = useMemo(
-    () => sessions.filter((session) =>
-      railFilterMatch(session, filter) && railQueryMatch(session, query)),
-    [sessions, filter, query],
+    () => source.filter((session) => railFilterMatch(session, filter)),
+    [source, filter],
   )
 
   const choose = (id) => {
@@ -922,18 +954,19 @@ function SessionsRail({
     onDelete(id)
   }
 
-  const searching = !!String(query || '').trim()
-  const noChats = sessions.length === 0
-  const emptyText = showArchived
-    ? (noChats ? 'No archived chats.' : 'No matching archived chats.')
-    : noChats
-      ? 'No chats yet.'
-      : searching
-        ? 'No matching chats.'
+  const noChats = source.length === 0
+  const emptyText = searching
+    ? (search.isFetching && !search.data ? 'Searching…' : 'No matching chats.')
+    : showArchived
+      ? (noChats ? 'No archived chats.' : 'No matching archived chats.')
+      : noChats
+        ? 'No chats yet.'
         : RAIL_EMPTY[filter]
-  const countLabel = shown.length === sessions.length
-    ? `${sessions.length} chat${sessions.length === 1 ? '' : 's'}`
-    : `${shown.length} of ${sessions.length}`
+  const countLabel = searching
+    ? `${shown.length} match${shown.length === 1 ? '' : 'es'}`
+    : shown.length === sessions.length
+      ? `${sessions.length} chat${sessions.length === 1 ? '' : 's'}`
+      : `${shown.length} of ${sessions.length}`
   const showToggle = !!showArchived || (Number(archivedCount) || 0) > 0
 
   return jsxs('div', {
@@ -981,6 +1014,7 @@ function SessionsRail({
                   key: session.id, session, selected: session.id === selectedId,
                   onSelect: choose, onRename, onArchive, onDelete,
                   onDeleteAsk: setPendingDelete,
+                  match: searching ? session.match_snippet : '',
                   // The last two rows open their menu upwards so the list's
                   // overflow cannot clip it in a shell without a portal.
                   opensUp: index >= shown.length - 2,
