@@ -957,7 +957,7 @@ function RailFilter({ value, onChange }) {
 
 function SessionsRail({
   sessions, selectedId, onSelect, onRename, onArchive, onDelete,
-  showArchived, onToggleArchived, archivedCount,
+  showArchived, onToggleArchived, archivedCount, searchRef,
 }) {
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
@@ -986,6 +986,34 @@ function SessionsRail({
     onSelect(id)
     if (isNarrowViewport()) setOpen(false)
   }
+
+  // j/k move through what is actually on screen, so a search or a chip filter
+  // decides the order too. Typing keeps the keys, and an open drawer owns them.
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (!event || event.defaultPrevented) return
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      if (event.key !== 'j' && event.key !== 'k') return
+      const target = event.target
+      const tag = target && target.tagName ? String(target.tagName).toLowerCase() : ''
+      if (tag === 'input' || tag === 'textarea' || tag === 'select'
+        || (target && target.isContentEditable)) return
+      if (typeof document !== 'undefined'
+        && document.querySelector('[data-drawer], [data-shortcuts]')) return
+      if (!shown.length) return
+      if (typeof event.preventDefault === 'function') event.preventDefault()
+      const index = shown.findIndex((row) => row.id === selectedId)
+      const next = event.key === 'j'
+        ? Math.min(shown.length - 1, index < 0 ? 0 : index + 1)
+        : Math.max(0, index < 0 ? 0 : index - 1)
+      choose(shown[next].id)
+    }
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return undefined
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [shown, selectedId, onSelect])
 
   const removeNow = (id) => {
     setPendingDelete(null)
@@ -1034,8 +1062,10 @@ function SessionsRail({
           jsx('input', {
             key: 'search',
             type: 'search',
+            ref: searchRef,
             value: query,
             placeholder: 'Search chats',
+            title: 'Search chats (/)',
             'aria-label': 'Search chats',
             autoComplete: 'off',
             onChange: (event) => setQuery(event.target.value),
@@ -3420,6 +3450,75 @@ function OnboardingBanner({ onSettings, onGithub, onStart, onDismiss }) {
   })
 }
 
+/** The keyboard map, as a sheet rather than a tooltip nobody finds. `?` opens
+ *  it, Escape or a click on the backdrop closes it. */
+const SHORTCUTS = [
+  ['/', 'Focus chat search'],
+  ['j / k', 'Next / previous chat'],
+  ['n', 'New chat'],
+  ['?', 'This list'],
+  ['Esc', 'Close a panel'],
+]
+
+function ShortcutSheet({ open, onClose }) {
+  const cardRef = useRef(null)
+  useEffect(() => {
+    if (!open) return undefined
+    const el = cardRef.current
+    if (el && typeof el.focus === 'function') el.focus()
+    const onKeyDown = (event) => {
+      if (event && event.key === 'Escape') {
+        if (typeof event.preventDefault === 'function') event.preventDefault()
+        onClose()
+      }
+    }
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return undefined
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [open, onClose])
+  if (!open) return null
+  return jsx('div', {
+    'data-shortcuts': 'open',
+    className: 'absolute inset-0 z-30 flex items-start justify-center bg-black/30 p-6',
+    onClick: onClose,
+    children: jsxs('div', {
+      ref: cardRef,
+      role: 'dialog',
+      'aria-modal': 'true',
+      'aria-label': 'Keyboard shortcuts',
+      tabIndex: -1,
+      onClick: (event) => event.stopPropagation(),
+      className: cn('flex w-full max-w-xs flex-col gap-1.5 rounded border',
+        'border-(--ui-stroke-secondary) bg-(--ui-bg-primary) p-3 text-xs shadow-lg',
+        'focus:outline-none'),
+      children: [
+        jsx('div', {
+          key: 't',
+          className: 'text-[0.625rem] uppercase tracking-wide text-(--ui-text-quaternary)',
+          children: 'Keyboard',
+        }),
+        ...SHORTCUTS.map(([keys, label]) => jsxs('div', {
+          key: keys,
+          className: 'flex items-baseline justify-between gap-3',
+          children: [
+            jsx('kbd', {
+              key: 'k',
+              className: cn('rounded border border-(--ui-stroke-secondary) px-1',
+                'font-mono text-[0.6875rem] text-(--ui-text-secondary)'),
+              children: keys,
+            }),
+            jsx('span', {
+              key: 'l', className: 'text-(--ui-text-tertiary)', children: label,
+            }),
+          ],
+        })),
+      ],
+    }),
+  })
+}
+
 // -- overlay drawers --------------------------------------------------------
 
 /** A right-side panel over the chat. It is absolutely positioned, so opening
@@ -3527,6 +3626,8 @@ function SuperagentPage() {
   // Focus returns here when a drawer closes (Escape, ✕, or a pick inside it).
   const githubRef = useRef(null)
   const settingsRef = useRef(null)
+  const railSearchRef = useRef(null)
+  const [shortcuts, setShortcuts] = useState(false)
 
   // One bucket per target. Switching flushes the outgoing text *before* the
   // key moves, so a click 50ms after a keystroke cannot drop the draft.
@@ -3820,6 +3921,44 @@ function SuperagentPage() {
 
   const presetList = (modelsQuery.data && modelsQuery.data.presets) || []
 
+  // Page-level keys. A field keeps its own keys; the rail owns j/k and the
+  // drawer owns Escape, so this only handles the three global commands.
+  const newChatRef = useRef(newChat)
+  newChatRef.current = newChat
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (!event || event.defaultPrevented) return
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      const target = event.target
+      const tag = target && target.tagName ? String(target.tagName).toLowerCase() : ''
+      if (tag === 'input' || tag === 'textarea' || tag === 'select'
+        || (target && target.isContentEditable)) return
+      // A drawer or the sheet owns the keyboard while it is open.
+      if (typeof document !== 'undefined'
+        && document.querySelector('[data-drawer], [data-shortcuts]')) return
+      if (event.key === '?') {
+        if (typeof event.preventDefault === 'function') event.preventDefault()
+        setShortcuts(true)
+        return
+      }
+      if (event.key === '/') {
+        if (typeof event.preventDefault === 'function') event.preventDefault()
+        const element = railSearchRef.current
+        if (element && typeof element.focus === 'function') element.focus()
+        return
+      }
+      if (event.key === 'n' || event.key === 'N') {
+        if (typeof event.preventDefault === 'function') event.preventDefault()
+        newChatRef.current()
+      }
+    }
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return undefined
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
+
   /** Toggle one drawer; the other closes because there is a single slot. */
   const toggleDrawer = (name) => setDrawer((current) => (current === name ? null : name))
 
@@ -3925,7 +4064,7 @@ function SuperagentPage() {
             key: 'rail', sessions, selectedId, onSelect: select,
             onRename: renameSession, onArchive: archiveSession, onDelete: deleteSession,
             showArchived, onToggleArchived: toggleArchived,
-            archivedCount: archivedTotal,
+            archivedCount: archivedTotal, searchRef: railSearchRef,
           }),
           jsx(ChatCenter, {
             key: 'center', summary: selectedSummary, detail,
@@ -3952,6 +4091,9 @@ function SuperagentPage() {
               : null,
           }),
         ],
+      }),
+      jsx(ShortcutSheet, {
+        key: 'shortcuts', open: shortcuts, onClose: () => setShortcuts(false),
       }),
       githubOpen
         ? jsx(OverlayDrawer, {
