@@ -42,7 +42,7 @@ Router-side triage (the assessor) runs no LLM, and polling is plain REST plus SQ
 
 ### Architecture
 
-The principles and the two worker mechanisms are explained in [DESIGN.md](DESIGN.md). The file map, SQLite tables, every HTTP endpoint, the desktop structure, CLI surface and release operations are in [HANDOVER.md](HANDOVER.md).
+The principles, the two worker mechanisms and the safety model are explained in [DESIGN.md](DESIGN.md). This README is the reference for every endpoint, CLI command, setting and review flow.
 
 ---
 
@@ -434,6 +434,21 @@ hermes superagent comment S-0001 --body-file review.md
 `comment` exits `2` for usage (both body sources, unreadable/empty file, over 20 000 chars), `1` for an unknown session, a session without a PR, no repo/token or a GitHub failure, and `0` with the comment URL on success.
 
 **Guardrails.** `collect_diff` runs git as an argv list with no shell and never raises: a missing directory, a plain directory, a missing `git` binary and a timeout are all `{ok: false, error}` with stderr redacted. The repository path is resolved through the same containment check as a worker turn, so a session cannot point the diff at an arbitrary directory. Commenting calls exactly one REST endpoint (`POST /repos/{repo}/issues/{n}/comments`) — no commit, push, merge or PR edit happens anywhere in this flow.
+
+---
+
+## Known limitations
+
+- **Workers never commit, push, merge or open a PR.** They edit the working tree and the session ends in `review`; publishing is a human decision, not a missing feature.
+- **The GitHub allow-list is the security boundary.** Empty `github_allowed_users` means **nobody** can trigger work, and the agent ignores comments from its own login — testing with the account that owns the token produces no sessions.
+- **One watched repository and one token per install.** Polling covers open PRs only, capped by `github_pr_limit`.
+- **PR comments land in the PR conversation** through the issue-comments endpoint; the plugin does not reply inside review threads or edit existing comments.
+- **Backend edits need `hermes gateway restart`.** The desktop **Reload desktop plugins** action only reloads `desktop/plugin.js`.
+- **`max_workers` is an in-process semaphore.** One gateway process is assumed; two gateways against the same database would each allow their own workers.
+- **Ticket workers still need an agent turn.** CLI, REST and slash commands only queue; `superagent_tick` / `superagent_run` in a chat or the **Superagent watch** cron launch them.
+- **The chat UI is poll-based**, not token-streaming, and a transcript is read back capped at 200 messages and 50 events per request.
+- **PR worktrees accumulate** under `<data_dir>/workspaces/pr-<n>`; nothing prunes them automatically.
+- **Windows UTF-8.** Persisted text is UTF-8 and subprocess/git output is decoded with replacement, so a tool emitting a legacy OEM code page can leave `�` in captured output.
 
 ---
 
