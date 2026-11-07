@@ -378,6 +378,12 @@ function fetchSettings() {
   return rest ? rest('/settings') : Promise.reject(new Error('backend not ready'))
 }
 
+/** Aggregated chat activity: totals, a daily series, per-model rows. */
+function fetchUsage(days) {
+  const span = Math.max(1, Math.min(Number(days) || 14, 90))
+  return rest ? rest(`/usage?days=${span}`) : Promise.reject(new Error('backend not ready'))
+}
+
 function fetchGithubStatus() {
   return rest ? rest('/github/status') : Promise.reject(new Error('backend not ready'))
 }
@@ -441,6 +447,14 @@ function useChatDiff(id, enabled, running) {
 function useModels() {
   return useQuery({
     queryKey: [ID, 'models'], queryFn: fetchModels, staleTime: 60000, retry: false,
+  })
+}
+
+/** Only fetched while the Usage drawer is open: it is a report, not a poll. */
+function useUsage(enabled, days = 14) {
+  return useQuery({
+    queryKey: [ID, 'usage', days], queryFn: () => fetchUsage(days),
+    enabled: !!enabled, staleTime: 30000, retry: false,
   })
 }
 
@@ -1564,6 +1578,128 @@ function presetRowsFrom(settings) {
     model: String((preset && preset.model) || ''),
     provider: String((preset && preset.provider) || ''),
   }))
+}
+
+/** Compact token label for a report: 1234567 -> "1.2M". */
+function shortTokens(value) {
+  const number = Number(value) || 0
+  if (number >= 1e6) return `${(number / 1e6).toFixed(1)}M`
+  if (number >= 1e3) return `${(number / 1e3).toFixed(1)}k`
+  return String(Math.round(number))
+}
+
+/** Read-only activity report: five figures, 14 daily bars, and the models
+ *  that did the work. Nothing here polls — a report that refetches while you
+ *  read it is noise, so it loads once when the drawer opens. */
+function UsagePanel({ usage, loading, error, onRetry }) {
+  if (error) {
+    return jsx(ErrorCard, { title: 'Could not load usage.', error, onRetry })
+  }
+  if (loading || !usage) {
+    return jsx('div', {
+      className: 'p-3 text-xs text-(--ui-text-tertiary)', children: 'Loading usage…',
+    })
+  }
+  const totals = usage.totals || {}
+  const counts = totals.counts || {}
+  const series = usage.series || []
+  const models = usage.models || []
+  const peak = Math.max(1, ...series.map((day) => Number(day.tokens) || 0))
+  const stats = [
+    ['Chats', String(totals.sessions || 0)],
+    ['Turns', String(totals.turns || 0)],
+    ['Tokens', shortTokens(totals.tokens)],
+    ['Review', String(counts.review || 0)],
+    ['Failed', String(counts.failed || 0)],
+  ]
+  return jsxs('div', {
+    className: 'flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3 text-xs',
+    children: [
+      jsx('div', {
+        key: 'stats', className: 'flex flex-wrap gap-2',
+        children: stats.map(([label, value]) => jsxs('div', {
+          key: label,
+          className: cn('flex min-w-[5rem] flex-col gap-0.5 rounded border',
+            'border-(--ui-stroke-secondary) px-2 py-1.5'),
+          children: [
+            jsx('span', {
+              key: 'l',
+              className: 'text-[0.625rem] uppercase tracking-wide text-(--ui-text-quaternary)',
+              children: label,
+            }),
+            jsx('span', {
+              key: 'v', className: 'text-sm tabular-nums text-(--ui-text-secondary)',
+              children: value,
+            }),
+          ],
+        })),
+      }),
+      jsxs('div', {
+        key: 'chart', className: 'flex flex-col gap-1',
+        children: [
+          jsx('span', {
+            key: 'h',
+            className: 'text-[0.625rem] uppercase tracking-wide text-(--ui-text-quaternary)',
+            children: `Tokens · last ${usage.days || series.length} days`,
+          }),
+          jsx('div', {
+            key: 'bars', className: 'flex h-16 items-end gap-0.5',
+            children: series.map((day) => {
+              const tokens = Number(day.tokens) || 0
+              return jsx('div', {
+                key: day.date,
+                title: `${day.date}: ${day.sessions || 0} chat(s) · ${tokens.toLocaleString()} tokens`,
+                className: cn('flex-1 rounded-t',
+                  tokens ? 'bg-(--accent) opacity-60' : 'bg-(--ui-stroke-secondary)'),
+                style: {
+                  height: `${Math.max(tokens ? 4 : 1, Math.round((tokens / peak) * 100))}%`,
+                },
+              })
+            }),
+          }),
+          jsxs('div', {
+            key: 'axis',
+            className: 'flex justify-between text-[0.625rem] text-(--ui-text-quaternary)',
+            children: [
+              jsx('span', { key: 'a', children: series.length ? series[0].date : '' }),
+              jsx('span', {
+                key: 'b', children: series.length ? series[series.length - 1].date : '',
+              }),
+            ],
+          }),
+        ],
+      }),
+      models.length
+        ? jsxs('div', {
+            key: 'models', className: 'flex flex-col gap-1',
+            children: [
+              jsx('span', {
+                key: 'h',
+                className: 'text-[0.625rem] uppercase tracking-wide text-(--ui-text-quaternary)',
+                children: 'By model',
+              }),
+              ...models.slice(0, 8).map((row) => jsxs('div', {
+                key: `${row.model}|${row.provider}`,
+                className: cn('flex items-baseline justify-between gap-2 rounded px-1 py-0.5',
+                  'hover:bg-(--chrome-action-hover)'),
+                children: [
+                  jsx('span', {
+                    key: 'm',
+                    className: 'min-w-0 truncate font-mono text-[0.6875rem] text-(--ui-text-secondary)',
+                    children: row.model || 'unknown',
+                  }),
+                  jsx('span', {
+                    key: 'n',
+                    className: 'shrink-0 tabular-nums text-[0.6875rem] text-(--ui-text-quaternary)',
+                    children: `${row.sessions || 0} · ${shortTokens(row.tokens)}`,
+                  }),
+                ],
+              })),
+            ],
+          })
+        : null,
+    ],
+  })
 }
 
 /** Full-width settings surface: defaults, named presets and worker limits.
@@ -3229,10 +3365,12 @@ function SuperagentPage() {
   const [drawer, setDrawer] = useState(null)
   const githubOpen = drawer === 'github'
   const settingsOpen = drawer === 'settings'
+  const usageOpen = drawer === 'usage'
   const [presetName, setPresetName] = useState('')
   const [onboarded, setOnboarded] = useState(() => readStored('onboarded', '') === '1')
   const detail = useChat(selectedId)
   const settingsQuery = useSettings(settingsOpen)
+  const usageQuery = useUsage(usageOpen)
   const inputRef = useRef(null)
   // Focus returns here when a drawer closes (Escape, ✕, or a pick inside it).
   const githubRef = useRef(null)
@@ -3537,7 +3675,9 @@ function SuperagentPage() {
   const closeDrawer = () => {
     const which = drawer
     setDrawer(null)
-    const target = which === 'settings' ? settingsRef.current : githubRef.current
+    const target = which === 'settings'
+      ? settingsRef.current
+      : (which === 'github' ? githubRef.current : null)
     if (target && typeof target.focus === 'function') target.focus()
   }
 
@@ -3597,6 +3737,13 @@ function SuperagentPage() {
               jsx(GithubHeaderButton, {
                 key: 'github', open: githubOpen, status: githubQuery.data,
                 onClick: () => toggleDrawer('github'), buttonRef: githubRef,
+              }),
+              jsx(HeaderIconButton, {
+                key: 'usage', label: 'Usage',
+                tip: 'Usage: chats, tokens and models for the last 14 days',
+                active: usageOpen,
+                onClick: () => toggleDrawer('usage'),
+                children: '▤',
               }),
               jsx(HeaderIconButton, {
                 key: 'settings', label: 'Settings',
@@ -3679,6 +3826,19 @@ function SuperagentPage() {
               settings: settingsQuery.data, models: modelsQuery.data,
               loading: settingsQuery.isLoading, error: settingsQuery.error,
               onRetry: () => settingsQuery.refetch(),
+            }),
+          })
+        : null,
+      usageOpen
+        ? jsx(OverlayDrawer, {
+            key: 'usage-drawer',
+            panel: 'usage',
+            title: 'Usage',
+            subtitle: 'last 14 days',
+            onClose: closeDrawer,
+            children: jsx(UsagePanel, {
+              usage: usageQuery.data, loading: usageQuery.isLoading,
+              error: usageQuery.error, onRetry: () => usageQuery.refetch(),
             }),
           })
         : null,

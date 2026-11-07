@@ -23,10 +23,11 @@ It separates **routing** from **execution**, and keeps every result behind one r
 - **Live workers** — every queued, running, review or failed chat as a card with status, model, elapsed timer, tokens and a three-event mini-feed, so parallel work fits on one screen.
 - **Model presets and defaults** — named `(model, provider)` pairs saved from the ⚙ Settings panel, CLI or `config.yaml`, offered as composer chips; `GET /models` reports only what you configured plus your default model.
 - **Completion toasts** — one desktop notification per turn that ends in `review` or `failed` (no replay on page load, silent for cancelled turns).
+- **A usage report** — the header's **Usage** drawer shows chats, turns, tokens, review/failed counts, a 14-day token bar chart and the per-model split, all from one read-only `GET /usage` (`hermes superagent usage`).
 - **GitHub connect & PR watch** — one repository, an allow-list, `observe` or `auto` mode, open-PR list with **Work on this PR**, and one isolated `git worktree` per pull request.
 - **Review handoff** — a lazy diff panel and a human-confirmed PR comment, plus `hermes superagent diff|comment`.
 - **Tickets for everything else** — deterministic zero-token triage, `superagent_ask/tick/status/run` tools, `/superagent`, and the **Superagent watch** cron blueprint.
-- **A CLI for the same state** — `hermes superagent status|chat|sessions|search|retry|export|show|stop|models|settings|github|diff|comment|doctor`, all with `--json` and stable exit codes.
+- **A CLI for the same state** — `hermes superagent status|chat|sessions|search|retry|export|usage|show|stop|models|settings|github|diff|comment|doctor`, all with `--json` and stable exit codes.
 
 ## How it works
 
@@ -199,6 +200,10 @@ hermes superagent export S-0001
 hermes superagent export S-0001 --out review.md
 hermes superagent export S-0001 --out ./exports
 
+# Activity report: chats, turns, tokens, per-day bars and the model split
+hermes superagent usage
+hermes superagent usage --days 30 --json
+
 # Review what a finished session changed, then comment on its PR
 hermes superagent diff S-0001
 hermes superagent comment S-0001
@@ -268,6 +273,7 @@ The plugin ships a unified desktop extension (`desktop/plugin.js`) and a FastAPI
 - `POST /api/plugins/superagent/chats/{session_id}/comment` — post one human-confirmed comment to the session's pull request.
 - `GET|POST /api/plugins/superagent/settings` — merged public settings / save the panel-editable keys (the token is never returned).
 - `GET /api/plugins/superagent/models` — default model/provider and the configured presets (`[]` when none are configured).
+- `GET /api/plugins/superagent/usage?days=14` — read-only activity report: totals (`sessions`, `turns`, `tokens`, `duration_ms`, status `counts`), one bucket per local day, and the per-model split. `days` is clamped to `1–90`.
 - `GET /api/plugins/superagent/github/status` · `POST /github/{test,connect,settings,disconnect,poll}` · `GET /github/prs` · `POST /github/prs/{n}/work` — connect one repository, watch PRs and start a session on one (see [GitHub connect & PR watch](#9-github-connect--pr-watch)).
 
 The desktop page at `/superagent` leads with the chat workspace (see [Desktop chat workspace](#7-desktop-chat-workspace)); the ticket surface lives beside it:
@@ -302,6 +308,7 @@ The Superagent page (`/superagent`) is chat-first. Everything in the tab is back
 - **Chat header** — status, model/provider, tokens, duration, and **Open in Hermes** when `hermes_session_id` is known. A `failed` session puts its stored `error` in the header (prefixed `error:`) instead of leaving the status pill to imply it. A `failed` or `cancelled` chat also shows **Retry**, which re-runs its last prompt in place (`POST /chats/{id}/retry`) rather than making you retype it. The `⋯` menu offers **Export as Markdown**, which saves the transcript (`GET /chats/{id}/export`) as `superagent-<id>.md`.
 - **Live workers (right)** — every queued or running chat as a card, so parallel workers stay visible without opening each chat. A failed card with no recent event feed shows the first line of the stored error.
 - **Completion toasts** — when a chat moves from `queued`/`running` to `review` or `failed` while the page is mounted, one `host.notify` toast says `<title> finished` (`info`) or `<title> failed` (`error`). The first poll only seeds the status map, so opening the page never replays old completions; `cancelled` is silent.
+- **Usage drawer** — the ▤ header button opens a read-only report: five figures (chats, turns, tokens, review, failed), a 14-day token bar chart with per-day tooltips, and the per-model split. It loads once per open (`staleTime` 30 s) and never polls.
 - **Status-bar chip** — speaks for chats: `▶ N` while N run and `◆ M` when M sessions sit in `review`/`failed`. Ticket attention is used only while the chats query has no data at all (backend disabled or first paint).
 - **Polling** — the rail refreshes from `/chats` on a timer (faster while anything is running); the open chat refreshes from `/chats/{id}` at the same time. No WebSocket is required.
 
@@ -314,6 +321,7 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 | Method | Path | Behaviour |
 | :--- | :--- | :--- |
 | `GET` | `/models` | `{default_model, default_provider, models, presets}` from settings/env. `presets` is `[{name, model, provider}]` and is `[]` when none are configured; `models` is the flat list of preset models in order plus the configured `default_model`, never a hardcoded catalogue. |
+| `GET` | `/usage?days=14` | `{ok, db_exists, days, since, totals, series, models}` — chats and turns created in the window, summed `tokens`/`duration_ms`, status `counts`, one `{date, sessions, tokens}` bucket per **local** day (filled to `days`), and `{model, provider, sessions, tokens}` rows busiest first. `days` is clamped to `1–90`. |
 | `GET` | `/settings` | Merged, public settings (`mode`, `repo_path`, defaults, normalised `model_presets`, worker limits, GitHub watch fields) plus `github_token_set`; never the token. |
 | `POST` | `/settings` | Validate and save `mode`, `repo_path`, `default_model`, `default_provider`, `model_presets`, `max_workers` (1–8), `worker_yolo`, `chat_max_turns` (1–500); unknown keys and out-of-range values are `400`. Drops the Runner singleton so the next turn uses the new values. Returns `{ok, settings}`. |
 | `GET` | `/chats?limit=50&q=` | `{db_exists, sessions, counts, running, archived_count}`; also runs the runaway watchdog before answering. An optional `archived` query takes `hide` (default: no archived rows), `only` or `all`; an unknown value is `400`. An optional `q` searches titles, prompts and every stored message instead of listing, adding `match_field` (`title`/`prompt`/`message`) and `match_snippet` (≤160 chars) per row; a term over 200 chars is `400`. `counts` describe the visible board, not the hit list. |

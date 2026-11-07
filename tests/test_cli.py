@@ -1074,3 +1074,45 @@ def test_export_unknown_session_is_an_error(
     rc = sa.sa_cli.run(_export_args(session_id="S-9999"), object())
     assert rc == 1
     assert "unknown chat session" in capsys.readouterr().out
+
+
+# -- usage -----------------------------------------------------------------
+
+
+def test_usage_prints_totals_and_bars(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    chat = sa.sa_chats.ChatStore(store.path)
+    session = chat.create_session("measure me", model="m")
+    chat.update_session(session["id"], tokens=1200)
+
+    rc = sa.sa_cli.run(_args(superagent_command="usage", days=7), object())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Usage — last 7 days" in out
+    assert "chats 1" in out and "tokens 1.2k" in out
+    assert "█" in out
+    assert "m" in out
+
+
+def test_usage_json_shape(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    sa.sa_chats.ChatStore(store.path).create_session("measure me", model="m")
+
+    rc = sa.sa_cli.run(_args(superagent_command="usage", days=7, json=True), object())
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert data["days"] == 7 and len(data["series"]) == 7
+    assert data["totals"]["sessions"] == 1
+
+
+def test_usage_rejects_an_out_of_range_window(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+
+    rc = sa.sa_cli.run(_args(superagent_command="usage", days=0), object())
+    assert rc == 2
+    assert "--days" in capsys.readouterr().out

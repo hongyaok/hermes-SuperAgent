@@ -1093,3 +1093,27 @@ def test_export_unknown_session_is_404(chat_api):
     with pytest.raises(api.HTTPException) as excinfo:
         api.export_chat("S-9999")
     assert excinfo.value.status_code == 404
+
+
+# -- usage -----------------------------------------------------------------
+
+
+def test_usage_reports_totals_series_and_models(chat_api):
+    api, _ = chat_api
+    store = api.sa_chats.ChatStore(api._db_path())
+    session = store.create_session("measure me", model="m", provider="p")
+    store.update_session(session["id"], tokens=42)
+
+    body = api.usage(days=7)
+    assert body["ok"] is True and body["db_exists"] is True
+    assert body["days"] == 7
+    assert len(body["series"]) == 7
+    assert body["totals"]["sessions"] == 1
+    assert body["totals"]["tokens"] == 42
+    assert body["models"][0]["model"] == "m"
+
+
+def test_usage_clamps_an_absurd_window(chat_api):
+    api, _ = chat_api
+    assert api.usage(days=500)["days"] == 90
+    assert api.usage(days=0)["days"] == 1

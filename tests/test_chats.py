@@ -533,3 +533,43 @@ def test_session_markdown_caps_a_runaway_export(chat):
     )
     assert len(markdown) <= 700
     assert "export truncated at 600 characters" in markdown
+
+
+# -- usage -----------------------------------------------------------------
+
+
+def _set_created(chat, session_id, stamp):
+    with chat._connect() as conn:
+        conn.execute(
+            "UPDATE chat_sessions SET created_at = ? WHERE id = ?", (stamp, session_id)
+        )
+
+
+def test_usage_buckets_totals_and_models(chat):
+    now = 1_700_000_000.0
+    chat.create_session("old work", model="gone")
+    first = chat.create_session("first", model="m1", provider="p")
+    second = chat.create_session("second", model="m1", provider="p")
+    third = chat.create_session("third", model="m2", provider="p")
+    _set_created(chat, "S-0001", now - 30 * 86400)   # outside a 7-day window
+    _set_created(chat, first["id"], now - 86400)
+    _set_created(chat, second["id"], now - 2 * 86400)
+    _set_created(chat, third["id"], now - 3600)
+    chat.update_session(first["id"], tokens=1000, duration_ms=500)
+    chat.update_session(second["id"], tokens=500)
+    chat.update_session(third["id"], tokens=1500, status="review")
+    chat.add_event(first["id"], "launched", "headless worker")
+
+    data = chat.usage(days=7, now=now)
+    assert data["days"] == 7
+    assert len(data["series"]) == 7
+    assert data["totals"]["sessions"] == 3      # the 30-day-old chat is out
+    assert data["totals"]["tokens"] == 3000
+    assert data["totals"]["duration_ms"] == 500
+    assert data["totals"]["turns"] == 1
+    assert data["totals"]["counts"]["review"] == 1
+    assert data["models"][0] == {
+        "model": "m1", "provider": "p", "sessions": 2, "tokens": 1500,
+    }
+    assert data["series"][-1]["date"] == data["series"][-1]["date"]
+    assert sum(day["sessions"] for day in data["series"]) == 3

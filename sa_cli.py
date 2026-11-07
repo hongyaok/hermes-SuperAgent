@@ -979,6 +979,83 @@ def _export_chat(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
     return 0
 
 
+def _tokens_label(value: Any) -> str:
+    """1234567 -> '1.2M' — a chart label, not an exact count."""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        return "0"
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M"
+    if number >= 1_000:
+        return f"{number / 1_000:.1f}k"
+    return str(number)
+
+
+def render_usage(data: dict) -> str:
+    """Totals, one bar per day and the busiest models — the CLI view of /usage."""
+    totals = data.get("totals") or {}
+    counts = totals.get("counts") or {}
+    lines = [
+        f"Usage — last {data.get('days', 14)} days",
+        "  chats {chats}   turns {turns}   tokens {tokens}".format(
+            chats=totals.get("sessions", 0),
+            turns=totals.get("turns", 0),
+            tokens=_tokens_label(totals.get("tokens", 0)),
+        ),
+    ]
+    if counts:
+        lines.append("  " + "  ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+    series = data.get("series") or []
+    peak = max([int(day.get("tokens") or 0) for day in series] + [0]) or 1
+    lines.append("")
+    for day in series:
+        tokens = int(day.get("tokens") or 0)
+        width = round(tokens / peak * 24) if tokens else 0
+        lines.append(
+            f"  {day.get('date')}  {'█' * width:<24}  {_tokens_label(tokens):>7}"
+            f"  {int(day.get('sessions') or 0):>3} chat(s)"
+        )
+    models = data.get("models") or []
+    if models:
+        lines.extend(["", f"  {'model':<28} {'chats':>6} {'tokens':>9}"])
+        for row in models[:8]:
+            name = str(row.get("model") or "unknown")[:28]
+            lines.append(
+                f"  {name:<28} {int(row.get('sessions') or 0):>6}"
+                f" {_tokens_label(row.get('tokens')):>9}"
+            )
+    return "\n".join(lines)
+
+
+def _usage(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
+    """`usage [--days N]`: aggregate chat activity, no worker involvement."""
+    try:
+        raw_days = getattr(args, "days", 14)
+        days = 14 if raw_days is None else int(raw_days)
+    except (TypeError, ValueError):
+        days = 14
+    if days < 1 or days > 90:
+        print("error: --days must be between 1 and 90")
+        return 2
+    try:
+        store = _chat_store(engine)
+        payload = {
+            "ok": True,
+            "db_exists": Path(str(store.path)).is_file(),
+            **store.usage(days),
+        }
+    except Exception as exc:
+        print(f"error: usage failed: {exc}")
+        return 1
+    print(
+        json.dumps(payload, indent=2, default=str)
+        if want_json
+        else render_usage(payload)
+    )
+    return 0
+
+
 def _list_sessions(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
     try:
         limit = int(getattr(args, "limit", 20) or 20)
@@ -1666,6 +1743,11 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         help="Write to this file (or directory) instead of stdout",
     )
     _add_json_flag(export_p)
+    usage_p = subs.add_parser("usage", help="Show chat activity for the last N days")
+    usage_p.add_argument(
+        "--days", type=int, default=14, help="How many days to cover (1-90)"
+    )
+    _add_json_flag(usage_p)
     diff_p = subs.add_parser(
         "diff", help="Show git status, stat and patch for a chat session's repository"
     )
@@ -1803,6 +1885,9 @@ def run(args: argparse.Namespace, ctx: Any) -> int:
 
     if command == "export":
         return _export_chat(args, engine, want_json)
+
+    if command == "usage":
+        return _usage(args, engine, want_json)
 
     if command == "ask":
         parts = getattr(args, "request", None)
