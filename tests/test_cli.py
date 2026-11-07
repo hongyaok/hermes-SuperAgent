@@ -894,3 +894,105 @@ def test_search_rejects_a_bad_archived_mode(
     )
     assert rc == 2
     assert "--archived" in capsys.readouterr().out
+
+
+# -- retry -----------------------------------------------------------------
+
+
+def _failed_chat(sa, store, prompt="fix the parser", *, hermes_session_id="h-1"):
+    chat = sa.sa_chats.ChatStore(store.path)
+    session = chat.create_session(prompt, model="m")
+    chat.add_message(session["id"], "user", prompt)
+    chat.update_session(
+        session["id"], status=sa.sa_chats.FAILED, error="boom", tokens=99,
+        duration_ms=5, hermes_session_id=hermes_session_id,
+    )
+    return chat, session["id"]
+
+
+def test_retry_relaunches_and_prints_the_session(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    _clear_chat_env(monkeypatch)
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    runner = _patch_runner(sa, monkeypatch, FakeRunner())
+    chat, session_id = _failed_chat(sa, store)
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="retry", session_id=session_id, detach=True), object()
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert session_id in out
+    assert runner.launched == [{
+        "session_id": session_id,
+        "prompt": "fix the parser",
+        "resume_session_id": "h-1",
+        "model": "m",
+        "provider": "",
+        "repo": "",
+        "block": False,
+    }]
+    assert chat.last_user_message(session_id)["content"] == "fix the parser"
+    assert chat.get_session(session_id, message_limit=0)["tokens"] is None
+
+
+def test_retry_json_shape(sa, store, fake_executor, monkeypatch, capsys):
+    _clear_chat_env(monkeypatch)
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    _patch_runner(sa, monkeypatch, FakeRunner())
+    _, session_id = _failed_chat(sa, store)
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="retry", session_id=session_id, detach=True, json=True),
+        object(),
+    )
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert data["ok"] is True and data["launched"] is True and data["resumed"] is True
+    assert data["session"]["id"] == session_id
+    assert data["transcript"].endswith("show " + session_id)
+
+
+def test_retry_refuses_a_reviewed_chat(sa, store, fake_executor, monkeypatch, capsys):
+    _clear_chat_env(monkeypatch)
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    _patch_runner(sa, monkeypatch, FakeRunner())
+    chat, session_id = _failed_chat(sa, store)
+    chat.update_session(session_id, status=sa.sa_chats.REVIEW)
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="retry", session_id=session_id, detach=True), object()
+    )
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "review" in out
+
+
+def test_retry_unknown_session_is_an_error(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    _clear_chat_env(monkeypatch)
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    _patch_runner(sa, monkeypatch, FakeRunner())
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="retry", session_id="S-9999", detach=True), object()
+    )
+    assert rc == 1
+    assert "unknown chat session" in capsys.readouterr().out
+
+
+def test_retry_without_an_id_is_usage(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+
+    rc = sa.sa_cli.run(
+        _args(superagent_command="retry", session_id="", detach=True), object()
+    )
+    assert rc == 2
+    assert "usage" in capsys.readouterr().out.lower()

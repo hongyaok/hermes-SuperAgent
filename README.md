@@ -26,7 +26,7 @@ It separates **routing** from **execution**, and keeps every result behind one r
 - **GitHub connect & PR watch** — one repository, an allow-list, `observe` or `auto` mode, open-PR list with **Work on this PR**, and one isolated `git worktree` per pull request.
 - **Review handoff** — a lazy diff panel and a human-confirmed PR comment, plus `hermes superagent diff|comment`.
 - **Tickets for everything else** — deterministic zero-token triage, `superagent_ask/tick/status/run` tools, `/superagent`, and the **Superagent watch** cron blueprint.
-- **A CLI for the same state** — `hermes superagent status|chat|sessions|search|show|stop|models|settings|github|diff|comment|doctor`, all with `--json` and stable exit codes.
+- **A CLI for the same state** — `hermes superagent status|chat|sessions|search|retry|show|stop|models|settings|github|diff|comment|doctor`, all with `--json` and stable exit codes.
 
 ## How it works
 
@@ -190,6 +190,10 @@ hermes superagent settings --json
 hermes superagent search "rollback never ran"
 hermes superagent search "rollback" --archived all --json
 
+# Re-run the last prompt of a failed or cancelled chat
+hermes superagent retry S-0001
+hermes superagent retry S-0001 --detach
+
 # Review what a finished session changed, then comment on its PR
 hermes superagent diff S-0001
 hermes superagent comment S-0001
@@ -290,7 +294,7 @@ The Superagent page (`/superagent`) is chat-first. Everything in the tab is back
 - **Chat housekeeping** — each row grows a `⋯` on hover/focus: **Rename** edits the title inline (Enter saves, Esc cancels, blur saves a change), **Archive** / **Unarchive** files a chat away, and **Delete** asks once (the app's confirm dialog) before removing the row and its transcript. Archived rows are dimmed and tagged, a compact **Show archived** toggle in the rail footer switches to `?archived=all` and is remembered, and an archived chat's header carries an **Archived** pill while its composer is read-only until it is unarchived. Nothing here touches files, worktrees or pull requests.
 - **Transcript (centre)** — the session prompt followed by `chat_messages` and `chat_events` merged in order, so assistant text interleaves with tool calls, errors and result lines. A failed turn shows the stored error.
 - **Composer** — a model picker fed by `/models` (presets plus **Default model**), an optional repo path (defaults to the configured repo) and Enter-to-send / Shift+Enter newline. While a turn is queued or running the composer is disabled and **Stop** cancels the turn; an archived chat is read-only (`Archived — unarchive to continue`).
-- **Chat header** — status, model/provider, tokens, duration, and **Open in Hermes** when `hermes_session_id` is known. A `failed` session puts its stored `error` in the header (prefixed `error:`) instead of leaving the status pill to imply it.
+- **Chat header** — status, model/provider, tokens, duration, and **Open in Hermes** when `hermes_session_id` is known. A `failed` session puts its stored `error` in the header (prefixed `error:`) instead of leaving the status pill to imply it. A `failed` or `cancelled` chat also shows **Retry**, which re-runs its last prompt in place (`POST /chats/{id}/retry`) rather than making you retype it.
 - **Live workers (right)** — every queued or running chat as a card, so parallel workers stay visible without opening each chat. A failed card with no recent event feed shows the first line of the stored error.
 - **Completion toasts** — when a chat moves from `queued`/`running` to `review` or `failed` while the page is mounted, one `host.notify` toast says `<title> finished` (`info`) or `<title> failed` (`error`). The first poll only seeds the status map, so opening the page never replays old completions; `cancelled` is silent.
 - **Status-bar chip** — speaks for chats: `▶ N` while N run and `◆ M` when M sessions sit in `review`/`failed`. Ticket attention is used only while the chats query has no data at all (backend disabled or first paint).
@@ -316,6 +320,7 @@ A chat turn's lifecycle is `queued` → `running` → `review` (or `failed` / `c
 | `POST` | `/chats/{id}/messages` | Append the user message and resume the Hermes session. `409` while a turn is queued/running; `400` when the stored repo is no longer valid; with no `hermes_session_id` a fresh chat is created and `previous_session_id` is returned. |
 | `POST` | `/chats/{id}/model` | Set `{model, provider}` for future turns. `400` when both are empty, `409` while queued/running, `404` for an unknown id. |
 | `POST` | `/chats/{id}/stop` | Cancel a queued/running turn; `409` when nothing is running. |
+| `POST` | `/chats/{id}/retry` | Re-run the last stored user prompt of a `failed`/`cancelled` chat, resuming its Hermes session when one exists. `409` while a turn is live or for any other status (a `review` chat is a result to read, not to repeat), `400` with no stored user message, `404` unknown. Clears the failed attempt's `error`/`tokens`/`duration_ms` and records one `retry` event; it never appends a second copy of the prompt. |
 
 #### Guardrails
 
