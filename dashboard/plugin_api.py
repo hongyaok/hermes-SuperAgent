@@ -920,6 +920,28 @@ def get_chat(session_id: str) -> dict[str, Any]:
     return {"db_exists": True, "session": session}
 
 
+@router.get("/chats/{session_id}/export")
+def export_chat(session_id: str) -> dict[str, Any]:
+    """The transcript as a Markdown document.
+
+    One stored read, rendered by ``sa_chats.session_markdown``: the same text
+    the CLI writes and the desktop saves, so a review comment and a saved file
+    cannot disagree. It never touches git, the network or the GitHub token.
+    """
+    session_id = _check_session_id(session_id)
+    session = _chat_store().get_session(session_id, message_limit=200, event_limit=200)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown chat session {session_id}")
+    markdown = sa_chats.session_markdown(session)
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "filename": f"superagent-{session_id}.md",
+        "markdown": markdown,
+        "length": len(markdown),
+    }
+
+
 @router.patch("/chats/{session_id}")
 def rename_chat(session_id: str, body: dict | None = None) -> dict[str, Any]:
     """Rename one chat. 400 for an empty/oversized title, 404 for an unknown id.

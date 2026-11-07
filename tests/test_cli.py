@@ -996,3 +996,81 @@ def test_retry_without_an_id_is_usage(sa, store, fake_executor, monkeypatch, cap
     )
     assert rc == 2
     assert "usage" in capsys.readouterr().out.lower()
+
+
+# -- export ----------------------------------------------------------------
+
+
+def _export_args(**kwargs):
+    base = dict(superagent_command="export", json=False, session_id="", out="")
+    base.update(kwargs)
+    return types.SimpleNamespace(**base)
+
+
+def _session_with_messages(sa, store, prompt="fix the parser"):
+    chat = sa.sa_chats.ChatStore(store.path)
+    session = chat.create_session(prompt, model="m")
+    chat.add_message(session["id"], "user", prompt)
+    chat.add_message(session["id"], "assistant", "done, **tests** pass")
+    return chat, session["id"]
+
+
+def test_export_prints_markdown(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    _, session_id = _session_with_messages(sa, store)
+
+    rc = sa.sa_cli.run(_export_args(session_id=session_id), object())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.startswith("# fix the parser")
+    assert "### Assistant" in out and "done, **tests** pass" in out
+
+
+def test_export_writes_a_file(sa, store, fake_executor, monkeypatch, capsys, tmp_path):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    _, session_id = _session_with_messages(sa, store)
+    target = tmp_path / "out.md"
+
+    rc = sa.sa_cli.run(_export_args(session_id=session_id, out=str(target)), object())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert str(target) in out
+    assert target.read_text(encoding="utf-8").startswith("# fix the parser")
+
+
+def test_export_to_a_directory_uses_the_session_filename(
+    sa, store, fake_executor, monkeypatch, capsys, tmp_path
+):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    _, session_id = _session_with_messages(sa, store)
+
+    rc = sa.sa_cli.run(_export_args(session_id=session_id, out=str(tmp_path)), object())
+    assert rc == 0
+    assert (tmp_path / f"superagent-{session_id}.md").is_file()
+
+
+def test_export_json_carries_the_markdown(sa, store, fake_executor, monkeypatch, capsys):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+    _, session_id = _session_with_messages(sa, store)
+
+    rc = sa.sa_cli.run(_export_args(session_id=session_id, json=True), object())
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert data["filename"] == f"superagent-{session_id}.md"
+    assert data["length"] == len(data["markdown"])
+    assert "### You" in data["markdown"]
+
+
+def test_export_unknown_session_is_an_error(
+    sa, store, fake_executor, monkeypatch, capsys
+):
+    engine = _engine(sa, store, fake_executor)
+    _patch_engine(sa, monkeypatch, engine)
+
+    rc = sa.sa_cli.run(_export_args(session_id="S-9999"), object())
+    assert rc == 1
+    assert "unknown chat session" in capsys.readouterr().out

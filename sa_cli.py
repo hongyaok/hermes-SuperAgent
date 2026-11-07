@@ -930,6 +930,55 @@ def _retry_chat(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
     return 0
 
 
+def _export_chat(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
+    """`export SESSION`: print or write the transcript as Markdown."""
+    session_id = _session_id_arg(getattr(args, "session_id", ""))
+    if not session_id:
+        print(USAGE)
+        return 2
+    out_path = str(getattr(args, "out", "") or "").strip()
+    try:
+        store = _chat_store(engine)
+        session = store.get_session(session_id, message_limit=200, event_limit=200)
+    except Exception as exc:
+        print(f"error: export failed: {exc}")
+        return 1
+    if session is None:
+        print(f"error: unknown chat session {session_id}")
+        return 1
+
+    markdown = sa_chats.session_markdown(session)
+    filename = f"superagent-{session_id}.md"
+    written = ""
+    if out_path:
+        target = Path(out_path)
+        if target.is_dir():
+            target = target / filename
+        try:
+            target.write_text(markdown, encoding="utf-8")
+        except OSError as exc:
+            print(f"error: cannot write {out_path}: {exc}")
+            return 1
+        written = str(target)
+
+    if want_json:
+        payload: dict[str, Any] = {
+            "ok": True,
+            "session_id": session_id,
+            "filename": filename,
+            "length": len(markdown),
+            "markdown": markdown,
+        }
+        if written:
+            payload["path"] = written
+        print(json.dumps(payload, indent=2, default=str))
+    elif written:
+        print(f"wrote {written} ({len(markdown)} chars)")
+    else:
+        print(markdown, end="" if markdown.endswith("\n") else "\n")
+    return 0
+
+
 def _list_sessions(args: argparse.Namespace, engine: Any, want_json: bool) -> int:
     try:
         limit = int(getattr(args, "limit", 20) or 20)
@@ -1610,6 +1659,13 @@ def setup_cli(subparser: argparse.ArgumentParser) -> None:
         help="Launch the turn and return instead of waiting for it",
     )
     _add_json_flag(retry_p)
+    export_p = subs.add_parser("export", help="Print or write a chat transcript as Markdown")
+    export_p.add_argument("session_id", help="Chat session id (e.g. S-0001)")
+    export_p.add_argument(
+        "--out", default="",
+        help="Write to this file (or directory) instead of stdout",
+    )
+    _add_json_flag(export_p)
     diff_p = subs.add_parser(
         "diff", help="Show git status, stat and patch for a chat session's repository"
     )
@@ -1744,6 +1800,9 @@ def run(args: argparse.Namespace, ctx: Any) -> int:
 
     if command == "retry":
         return _retry_chat(args, engine, want_json)
+
+    if command == "export":
+        return _export_chat(args, engine, want_json)
 
     if command == "ask":
         parts = getattr(args, "request", None)

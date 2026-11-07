@@ -1060,3 +1060,36 @@ def test_retry_unknown_session_is_404(chat_api):
     with pytest.raises(api.HTTPException) as excinfo:
         api.retry_chat("S-9999")
     assert excinfo.value.status_code == 404
+
+
+# -- export ----------------------------------------------------------------
+
+
+def test_export_chat_renders_the_transcript_as_markdown(chat_api):
+    api, _ = chat_api
+    store = api.sa_chats.ChatStore(api._db_path())
+    session = store.create_session(
+        "Fix the parser crash\n\nIt fails on empty input", model="m", provider="p"
+    )
+    store.add_message(session["id"], "user", "Fix the parser crash")
+    store.add_message(session["id"], "assistant", "It was the **recursive** call.")
+
+    body = api.export_chat(session["id"])
+    assert body["ok"] is True
+    assert body["filename"] == f"superagent-{session['id']}.md"
+    assert body["length"] == len(body["markdown"])
+    md = body["markdown"]
+    assert md.startswith("# Fix the parser crash")
+    assert f"- **Session**: `{session['id']}`" in md
+    assert "- **Model**: `m` (p)" in md
+    assert "## Prompt" in md and "> It fails on empty input" in md
+    assert "### You" in md and "### Assistant" in md
+    assert "It was the **recursive** call." in md
+    assert "## Activity" in md and "created" in md
+
+
+def test_export_unknown_session_is_404(chat_api):
+    api, _ = chat_api
+    with pytest.raises(api.HTTPException) as excinfo:
+        api.export_chat("S-9999")
+    assert excinfo.value.status_code == 404
